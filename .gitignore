@@ -19,3 +19,7 @@ __pycache__/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Claude Code (local only)
+CLAUDE.md
+.claude/
