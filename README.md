@@ -8,7 +8,9 @@ The middleman between you and your food decision.
 - Every pick is a real nearby place and traces to your data.
 
 ## Built with
-Muse Spark and Muse Voice Transcribe (Meta Model API), Google Places, Expo, FastAPI, Supabase.
+Muse Spark and Muse Voice Transcribe (Meta Model API), Geoapify Places (OpenStreetMap data), Apple Maps, Expo, FastAPI, Supabase.
+
+Places data © OpenStreetMap contributors, powered by Geoapify.
 
 ## Status
 In development for the Meta Global AI Developer Hackathon. Submission Nov 4, 2026.
