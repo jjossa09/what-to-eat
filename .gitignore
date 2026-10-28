@@ -23,3 +23,7 @@ __pycache__/
 # Claude Code (local only)
 CLAUDE.md
 .claude/
+
+# Backfill data (real meals stay local)
+data/*.csv
+!data/backfill_template.csv
