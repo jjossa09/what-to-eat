@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: SecretStr | None = None
     PLACES_RADIUS_M: int = 5000  # FR-R3 cold-start radius
     PLACES_TIMEOUT_S: float = 4.0  # leaves room for Muse in the ~8 s first round (NFR4)
+    SUPABASE_TIMEOUT_S: float = 2.0  # history reads run alongside the places search
 
     def require(self, name: str) -> str:
         value = getattr(self, name)
