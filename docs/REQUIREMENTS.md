@@ -1,6 +1,6 @@
 # What to eat! Requirements
 
-Version 1.4 | October 28, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
+Version 1.5 | October 28, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
 
 ## Overview
 
@@ -75,7 +75,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 | ID | Requirement | Phase |
 |---|---|---|
 | ML1 | Context features: meal slot (breakfast, lunch, dinner, late), weekday or weekend, companions (live data only for now). | 1 |
-| ML2 | Fixed category list, used by backfill, models, and place mapping: Burgers, Pizza, Mexican, Latin, Chinese, Japanese/Sushi, Korean, Thai, Vietnamese, Indian, Mediterranean, Italian, French, American/Diner, BBQ, Chicken/Wings, Sandwiches, Seafood, Salads/Bowls, Breakfast/Brunch, Coffee/Bakery, Smoothies/Juice, Dessert. Mapping is deterministic in two passes: first the Geoapify catering categories (from OSM cuisine tags), then name-keyword rules and a common-chains list (e.g. "taqueria" to Mexican, "pho" to Vietnamese, Chipotle to Mexican). Only places matching neither go to Other, which is shown but never predicted. | 1 |
+| ML2 | Fixed category list, used by backfill, models, and place mapping: Burgers, Pizza, Mexican, Latin, Chinese, Japanese/Sushi, Korean, Thai, Vietnamese, Indian, Mediterranean, Italian, French, American/Diner, BBQ, Chicken/Wings, Sandwiches, Seafood, Salads/Bowls, Breakfast/Brunch, Coffee/Bakery, Smoothies/Juice, Dessert, Pubs/Bars. Mapping is deterministic. Human-verified exact-name overrides come first. Then two passes: first the Geoapify catering categories (from OSM cuisine tags, plus pub, bar, biergarten, and taproom), then a common-chains list and name-keyword rules (e.g. Chipotle to Mexican, "taqueria" to Mexican, "pho" to Vietnamese). An existing cuisine tag always beats a name keyword. A bare cafe tag with no name match goes to Coffee/Bakery. Only places matching none of these go to Other, which is shown but never predicted. | 1 |
 | ML3 | Layer 1, cuisine model: recency-weighted counts per context. Backs off to broader contexts when data is thin: this companion, then user overall, then quiz prior. Outputs a probability per category plus the number of meals behind it. | 2 |
 | ML4 | Layer 2, place model: return score from visits, recency, and 1-5 star ratings; 1-2 stars drop it sharply. New places are scored on category fit and distance fit. Price fit uses the user's own price data for that place; unknown = half. | 2 |
 | ML5 | Scoring: each real candidate is scored deterministically from ML3, ML4, price fit, and distance fit. OSM has no ratings or price levels, so neither is used. Top 3 = 2 familiar picks + 1 discovery slot (best candidate outside the user's usual categories). Phase 1 uses the quiz prior in place of ML3 and ML4. | 1 |
@@ -155,6 +155,10 @@ The search area should grow more accurate to the user as usage increases. Values
 - OSM cuisine tags are often missing. The name-keyword and chains pass (ML2) reduces this; places matching neither fall to Other and score lower on category fit.
 - Free-tier cold starts can eat into the 8 second budget (NFR4). Cold-start latency is measured at deploy.
 - The radius thresholds (80th percentile, 1 to 25 miles, 8 candidates) and all starting values above are untested guesses, to be tuned after 2 to 3 days of live data.
+
+## Changes from v1.4
+
+- ML2: added Pubs/Bars (24 categories), mapped from the pub, bar, biergarten, and taproom tags. Exact-name overrides run before tags; chains run before keywords; a bare cafe tag falls back to Coffee/Bakery.
 
 ## Changes from v1.3
 
