@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     SUPABASE_URL: str | None = None
     SUPABASE_ANON_KEY: SecretStr | None = None
     SUPABASE_SERVICE_ROLE_KEY: SecretStr | None = None
+    PLACES_RADIUS_M: int = 5000  # FR-R3 cold-start radius
+    PLACES_TIMEOUT_S: float = 4.0  # leaves room for Muse in the ~8 s first round (NFR4)
 
     def require(self, name: str) -> str:
         value = getattr(self, name)
