@@ -1,6 +1,6 @@
 # What to eat! Requirements
 
-Version 1.3 | October 28, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
+Version 1.4 | October 28, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
 
 ## Overview
 
@@ -29,7 +29,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 
 | ID | Requirement | Phase |
 |---|---|---|
-| FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. | 1 |
+| FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 3 chips: Walk, Short drive, Worth the drive. | 1 |
 | FR4 | Exactly 3 questions (3 messages) before the first round of recommendations. The ML6 confidence gate chooses which 3; Muse only phrases them. Answers the models can predict are pre-filled and editable. Cold start (Phase 1): the gate runs on the quiz prior. | 1-2 |
 | FR5 | Free-text answers are parsed by Muse into the same structured answers as quick-reply chips (ML7). | 1 |
 
@@ -89,16 +89,19 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 
 | Item | Starting value |
 |---|---|
-| Meal slot | Breakfast before 11:00; lunch 11:00 to 16:00; dinner 16:00 to 21:00; late after 21:00. |
+| Meal slot | Breakfast 05:00 to 10:59; lunch 11:00 to 15:59; dinner 16:00 to 20:59; late 21:00 to 04:59. Late meals after midnight count on the previous day's local date (and weekday). |
 | Likely visit (FR11) | Within 250 m of the picked place, between pick time and pick + 4 h. |
 | Usual categories (ML5) | Categories with at least 15% of the user's recency-weighted meals. Until data exists: quiz favorites. |
 | Weak prediction (ML6) | Top probability under 0.4, or fewer than 5 meals behind it (matches FR-R3). |
-| Price levels | $ = under $15; $$ = $15 to $30; $$$ = $30 to $60; $$$$ = over $60 (per own meal). |
+| Price levels | $ = under $15; $$ = $15 to $30; $$$ = over $30 to $60; $$$$ = over $60 (per own meal). |
 | Price fit | Compares levels: candidate at or below the budget level = full fit; one level above = half; two or more above = none; unknown = half. A place's known price = the user's most recent price tap or backfill amount for it. |
 | Refinement cap (ML10) | 3 rounds without a pick. |
+| Distance chips (FR3) | Walk = 1,500 m; Short drive = 5,000 m; Worth the drive = 15,000 m. |
+| Cold-start radius (FR-R3) | 5 km. |
 
 ### Data
 
+- meals is the source of truth for the models (backfill and live in one shape); recommendation_events is the funnel log (ML8).
 - Price everywhere means what the user paid for their own meal. Backfilled meals keep the real amount, converted to a level with the table above. Live meals store the session budget level (what the user wanted) and the optional price tap (what it cost). Both are nullable, never guessed.
 - places table: id (OSM type and id if Geoapify returns them, else the Geoapify place_id), name, coordinates, and our ML2 category. Geoapify allows storing results with no limits; attribution is shown wherever they appear (NFR5).
 - Backfill: Juan's last 30 days of eating out, entered as CSV with columns date, meal_slot, place, category, price, companions. Companions are filled only when sure. Missing values stay null, never guessed.
@@ -116,7 +119,7 @@ The search area should grow more accurate to the user as usage increases. Values
 |---|---|---|
 | FR-R1 | Record the straight-line distance from the session location to the chosen place for every confirmed meal. | 1 |
 | FR-R2 | Radius for a new search = the recency-weighted 80th percentile of past travel distances in a similar context (ML1: meal slot, weekday or weekend, companions), clamped between 1 and 25 miles. | 2 |
-| FR-R3 | Cold start: use the quiz answer until 5 confirmed meals exist for that context. | 1-2 |
+| FR-R3 | Cold start: a fixed 5 km radius until 5 confirmed meals exist for that context. | 1-2 |
 | FR-R4 | If fewer than 8 candidates come back, expand the radius by 1.5x, up to two times. | 2 |
 
 ## Non-functional requirements
@@ -134,7 +137,7 @@ The search area should grow more accurate to the user as usage increases. Values
 
 **Mobile:** Expo (React Native, TypeScript). **Backend:** FastAPI (Python, uv) on Vercel Hobby. **Places:** Geoapify Places API (OpenStreetMap data, ODbL). **Map:** Apple Maps via react-native-maps. **Prediction:** deterministic scoring and models in the backend (ML3 to ML6, ML10). **AI:** Muse Spark via Meta Model API for language only (ML7); Muse Voice Transcribe for voice input. **Data and auth:** Supabase (Postgres).
 
-**Tables:** users, taste_profiles, companions, sessions, session_companions, messages, feedback, meals (source = backfill or live), categories, places, recommendation_events.
+**Tables:** profiles (linked to Supabase auth users), taste_profiles, companions, sessions, session_companions, messages, meals (source = backfill or live), meal_companions, categories, places, recommendation_events. Went, stars, and the price tap are funnel events (ML8) and are also kept on the meal; there is no separate feedback table.
 
 ## Phases and deliverables
 
@@ -152,6 +155,15 @@ The search area should grow more accurate to the user as usage increases. Values
 - OSM cuisine tags are often missing. The name-keyword and chains pass (ML2) reduces this; places matching neither fall to Other and score lower on category fit.
 - Free-tier cold starts can eat into the 8 second budget (NFR4). Cold-start latency is measured at deploy.
 - The radius thresholds (80th percentile, 1 to 25 miles, 8 candidates) and all starting values above are untested guesses, to be tuned after 2 to 3 days of live data.
+
+## Changes from v1.3
+
+- Tables: users renamed profiles; meal_companions added (backfill companions, FR14, FR16); feedback table dropped (covered by ML8 events and meals).
+- FR-R3: cold start uses a fixed 5 km radius (the quiz has no distance question).
+- FR3: distance question uses 3 chips: Walk 1,500 m, Short drive 5,000 m, Worth the drive 15,000 m.
+- Meal slots: late = 21:00 to 04:59 on the previous day's date; breakfast starts at 05:00.
+- Price levels: boundaries made exact ($30 is $$, $60 is $$$).
+- Data: meals is the source of truth for the models; recommendation_events is the funnel log.
 
 ## Changes from v1.2
 
