@@ -77,6 +77,19 @@ async def places_search(
     }
 
 
+QuestionKey = Literal["craving", "budget", "distance", "company", "refine", "open"]
+
+
+class TranscriptMessage(BaseModel):
+    """One chat line before this round (messages table; R3 answers)."""
+
+    role: Literal["assistant", "user"]
+    body: str = Field(min_length=1, max_length=200)
+    question_key: QuestionKey | None = None
+    answer: dict[str, str | int | bool | None] | None = Field(default=None, max_length=5)
+    input_mode: Literal["chip", "text", "voice", "prefill"] | None = None
+
+
 class RecommendationsRequest(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
@@ -87,6 +100,8 @@ class RecommendationsRequest(BaseModel):
     exclude_ids: list[str] = Field(default_factory=list, max_length=100)
     session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
+    solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
+    transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=8)
 
     @field_validator("timezone")
     @classmethod
@@ -157,6 +172,7 @@ async def recommendations(
         budget_level=body.budget_level,
         radius_m=body.radius_m,
         search_radius_m=radius,
+        solo=body.solo,
     )
     session_id = str(body.session_id) if body.session_id else None
     try:
@@ -188,15 +204,21 @@ async def recommendations(
     ranking = rank(candidates, context, user_history, merged_ids)
     shown = [pick.scored.place for pick in ranking.top3]
     # The shown places are cached while Muse writes; the events need their rows.
-    reasons, cached = await asyncio.gather(
+    # The transcript is written alongside them.
+    transcript = [m.model_dump() for m in body.transcript]
+    reasons, cached, saved = await asyncio.gather(
         muse.write_reasons(ranking.top3, client=client),
         quietly(funnel.upsert_places(shown, client=client), "places")
+        if ref
+        else asyncio.sleep(0),
+        quietly(funnel.log_messages(user_id, token, ref, transcript, client=client), "messages")
         if ref
         else asyncio.sleep(0),
     )
     logged = bool(
         ref
         and cached
+        and saved
         and await quietly(
             funnel.log_shown(
                 user_id, token, ref, ranking.top3, reasons.lines, reasons.source, client=client

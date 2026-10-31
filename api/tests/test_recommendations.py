@@ -119,7 +119,7 @@ def supabase(self, request: httpx2.Request) -> httpx2.Response:
             return httpx2.Response(200, json=[])
         events = [] if self.last_round is None else [{"round": self.last_round}]
         return httpx2.Response(200, json=[{"id": SESSION_ID, "recommendation_events": events}])
-    if request.method == "POST" and table in ("places", "recommendation_events"):
+    if request.method == "POST" and table in ("places", "recommendation_events", "messages"):
         return httpx2.Response(201)
     raise AssertionError(f"unexpected Supabase call {request.method} {table}")
 
@@ -297,7 +297,7 @@ def test_bad_request(body):
 def test_round_one_creates_session_and_logs_shown():
     up = Upstreams()
     body = post(up, craving="thai", budget_level=2, radius_m=1500,
-                timezone="America/New_York").json()
+                timezone="America/New_York", solo=True).json()
     assert body["logged"] is True
     assert body["session_id"] == SESSION_ID
     assert body["round"] == 1
@@ -307,7 +307,7 @@ def test_round_one_creates_session_and_logs_shown():
     assert row == {"user_id": USER_ID, "timezone": "America/New_York",
                    "local_date": "2026-10-29", "meal_slot": "dinner", "lat": LAT, "lon": LON,
                    "craving_category_id": "thai", "budget_level": 2, "radius_m": 1500,
-                   "search_radius_m": 1500}
+                   "search_radius_m": 1500, "solo": True}
 
     (events,) = writes(up, "recommendation_events")
     rows = json.loads(events.content)
@@ -448,3 +448,73 @@ def test_client_loggers_are_quiet_and_would_otherwise_leak(caplog):
     caplog.set_level(logging.INFO, logger="httpx2")
     post(Upstreams())
     assert "apiKey" in caplog.text
+
+
+
+# Transcript (P1-09)
+
+TRANSCRIPT = [
+    {"role": "assistant", "body": "What are you craving?", "question_key": "craving"},
+    {"role": "user", "body": "Thai", "question_key": "craving",
+     "answer": {"craving": "thai"}, "input_mode": "chip"},
+    {"role": "assistant", "body": "Budget this time?", "question_key": "budget"},
+    {"role": "user", "body": "$$", "question_key": "budget", "answer": {"budget_level": 2},
+     "input_mode": "prefill"},
+    {"role": "assistant", "body": "How far?", "question_key": "distance"},
+    {"role": "user", "body": "Walk", "question_key": "distance", "answer": {"radius_m": 1500},
+     "input_mode": "chip"},
+]
+
+
+def test_transcript_is_saved_as_round_zero():
+    up = Upstreams()
+    body = post(up, transcript=TRANSCRIPT).json()
+    assert body["logged"] is True
+    (insert,) = writes(up, "messages")
+    assert insert.headers["authorization"] == f"Bearer {TOKEN}"
+    rows = json.loads(insert.content)
+    assert len(rows) == 6
+    assert {r["user_id"] for r in rows} == {USER_ID}
+    assert {r["session_id"] for r in rows} == {SESSION_ID}
+    assert {r["round"] for r in rows} == {0}
+    assert [r["role"] for r in rows] == ["assistant", "user"] * 3
+    assert rows[3]["answer"] == {"budget_level": 2}
+    assert rows[3]["input_mode"] == "prefill"
+    assert rows[0]["answer"] is None and rows[0]["input_mode"] is None
+
+
+def test_transcript_on_a_later_round_uses_the_previous_round():
+    up = Upstreams(last_round=1)
+    post(up, session_id=SESSION_ID, transcript=TRANSCRIPT[:2])
+    rows = json.loads(writes(up, "messages")[0].content)
+    assert {r["round"] for r in rows} == {1}
+
+
+def test_no_transcript_makes_no_messages_call():
+    up = Upstreams()
+    assert post(up).json()["logged"] is True
+    assert writes(up, "messages") == []
+
+
+def test_transcript_failure_still_returns_the_round(caplog):
+    caplog.set_level(logging.WARNING)
+    up = Upstreams(fail=["POST messages"])
+    body = post(up, transcript=TRANSCRIPT).json()
+    assert body["logged"] is False
+    assert len(body["picks"]) == 3
+    assert "Funnel messages failed: FunnelUpstreamError" in caplog.text
+    assert "What are you craving?" not in caplog.text
+
+
+@pytest.mark.parametrize("transcript", [
+    [{"role": "system", "body": "x"}],
+    [{"role": "user", "body": ""}],
+    [{"role": "user", "body": "x" * 201}],
+    [{"role": "user", "body": "x", "question_key": "mood"}],
+    [{"role": "user", "body": "x", "input_mode": "telepathy"}],
+    [{"role": "user", "body": "x"}] * 9,
+])
+def test_bad_transcript_is_rejected(transcript):
+    up = Upstreams()
+    assert post(up, transcript=transcript).status_code == 422
+    assert up.requests == []

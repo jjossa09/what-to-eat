@@ -71,7 +71,7 @@ def test_one_call_with_expected_params():
     params = request.url.params
     assert params["categories"] == "catering"
     assert params["filter"] == f"circle:{LON},{LAT},5000"
-    assert params["bias"] == f"proximity:{LON},{LAT}"
+    assert "bias" not in params  # 5 km default is above the proximity cutoff
     assert params["limit"] == "100"
     assert params["apiKey"] == TEST_KEY
 
@@ -282,3 +282,36 @@ def test_route_validation(query):
     upstream = Upstream()
     assert use_upstream(upstream).get(f"/places/search?{query}").status_code == 422
     assert upstream.requests == []
+
+
+# Distance chips: proximity bias only for short radii (P1-10)
+
+
+@pytest.mark.parametrize("radius_m", [1500, places.PROXIMITY_MAX_RADIUS_M])
+def test_short_radius_keeps_proximity_bias(radius_m):
+    upstream = Upstream()
+    result = run_search(upstream, radius_m=radius_m)
+    (request,) = upstream.requests
+    assert request.url.params["bias"] == f"proximity:{LON},{LAT}"
+    assert request.url.params["filter"] == f"circle:{LON},{LAT},{radius_m}"
+    assert result.radius_m == radius_m
+
+
+@pytest.mark.parametrize("radius_m", [places.PROXIMITY_MAX_RADIUS_M + 1, 5000, 15000])
+def test_wide_radius_drops_bias_still_one_call(radius_m):
+    upstream = Upstream()
+    result = run_search(upstream, radius_m=radius_m)
+    (request,) = upstream.requests
+    assert "bias" not in request.url.params
+    assert request.url.params["filter"] == f"circle:{LON},{LAT},{radius_m}"
+    assert request.url.params["limit"] == "100"
+    assert result.radius_m == radius_m
+
+
+def test_wide_radius_results_are_sorted_and_truncation_kept():
+    far = [feature(f"Far {i}", lat=LAT + 0.05 - i * 0.0004, osm_id=i, place_id=f"p{i}")
+           for i in range(places.LIMIT)]
+    result = run_search(Upstream(body=collection(*far)), radius_m=15000)
+    assert result.truncated is True
+    distances = [p.distance_m for p in result.places]
+    assert distances == sorted(distances)
