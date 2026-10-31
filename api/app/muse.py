@@ -24,7 +24,7 @@ from app.scoring import DISCOVERY, Pick
 MUSE_URL = "https://api.meta.ai/v1/chat/completions"
 MODEL = "muse-spark-1.3"  # Standard mode: Contributor mode lets Meta train on our prompts
 REASONING_EFFORT = "minimal"  # lowest above "none"; reasons need no reasoning
-MAX_COMPLETION_TOKENS = 400  # includes reasoning tokens
+MAX_COMPLETION_TOKENS = 1500  # a ceiling that includes reasoning tokens; room for both
 MAX_REASON_CHARS = 90  # R1: one short line on a card
 METERS_PER_MILE = 1609.344
 
@@ -218,15 +218,29 @@ def request_body(picks: tuple[Pick, ...]) -> dict:
 # Output check ----------------------------------------------------------------
 
 
-def check_output(content, ids: list[str]) -> dict[str, str]:
+FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def parse_json(content: str):
+    """The JSON value in content: as is, without a ``` fence, or the outermost {...} span."""
+    text = FENCE.sub("", content.strip())
+    try:
+        return json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(text[start : end + 1])
+
+
+def check_output(content, ids: list[str], finish_reason: str | None = None) -> dict[str, str]:
     """Muse content -> {id: line} for exactly these ids, or RejectedOutput with a code."""
+    if finish_reason == "length":
+        raise RejectedOutput("truncated")
     if not isinstance(content, str):
         raise RejectedOutput("no_content")
-    text = content.strip()
-    # Tolerate a ```json fence around the object.
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
     try:
-        entries = json.loads(text)["reasons"]
+        entries = parse_json(content)["reasons"]
     except (ValueError, KeyError, TypeError):
         raise RejectedOutput("json") from None
     if not isinstance(entries, list) or not all(isinstance(x, dict) for x in entries):
@@ -260,6 +274,15 @@ def parse_usage(body: dict) -> Usage | None:
         prompt_tokens=int(usage.get("prompt_tokens") or 0),
         completion_tokens=int(usage.get("completion_tokens") or 0),
         reasoning_tokens=int(details.get("reasoning_tokens") or 0),
+    )
+
+
+def usage_note(usage: Usage | None) -> str:
+    if usage is None:
+        return "none"
+    return (
+        f"prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
+        f"reasoning={usage.reasoning_tokens}"
     )
 
 
@@ -305,24 +328,30 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
         return fallback()
     try:
         body = response.json()
-        content = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
     except (ValueError, KeyError, IndexError, TypeError):
         logger.warning("Muse returned an unreadable body")
         return fallback()
 
     usage = parse_usage(body) if isinstance(body, dict) else None
-    if usage:
-        logger.info(
-            "Muse usage: prompt=%d completion=%d reasoning=%d",
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reasoning_tokens,
-        )
     ids = [p.scored.place.id for p in picks]
     try:
-        lines = check_output(content, ids)
+        lines = check_output(content, ids, finish_reason)
     except RejectedOutput as e:
-        logger.warning("Muse output rejected: %s", e)
+        # Shape facts only, never the content (it can echo the prompt).
+        text = content.strip() if isinstance(content, str) else ""
+        logger.warning(
+            "Muse output rejected: %s (finish_reason=%s len=%d fence=%s brace=%s usage=%s)",
+            e,
+            finish_reason,
+            len(text),
+            text.startswith("```"),
+            text.startswith("{"),
+            usage_note(usage),
+        )
         return fallback(usage)
+    logger.info("Muse usage: %s", usage_note(usage))
     # Our order, always (R2).
     return Reasons(tuple(lines[i] for i in ids), MUSE, usage)

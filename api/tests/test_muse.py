@@ -46,12 +46,13 @@ PICKS = top3()
 IDS = [p.scored.place.id for p in PICKS]
 
 
-def reply(lines: dict[str, str] | None = None, content=None, usage=True) -> dict:
+def reply(lines: dict[str, str] | None = None, content=None, usage=True,
+          finish_reason="stop") -> dict:
     if content is None:
         lines = lines or {i: f"Good pick {n}." for n, i in enumerate(IDS)}
         content = json.dumps({"reasons": [{"id": i, "line": t} for i, t in lines.items()]})
     body = {"choices": [{"message": {"role": "assistant", "content": content},
-                         "finish_reason": "stop"}]}
+                         "finish_reason": finish_reason}]}
     if usage:
         body["usage"] = {"prompt_tokens": 500, "completion_tokens": 60, "total_tokens": 560,
                          "completion_tokens_details": {"reasoning_tokens": 10}}
@@ -133,6 +134,40 @@ def test_json_fence_is_tolerated():
     inner = json.dumps({"reasons": [{"id": i, "line": "Fine."} for i in IDS]})
     result = run(Meta(reply(content=f"```json\n{inner}\n```")))
     assert result.source == muse.MUSE
+
+
+FENCED_INNER = json.dumps({"reasons": [{"id": i, "line": "Fine."} for i in IDS]})
+
+
+@pytest.mark.parametrize("content", [
+    f"```JSON\n{FENCED_INNER}\n```",
+    f"```\n{FENCED_INNER}\n```",
+    f"Here are the reasons:\n```json\n{FENCED_INNER}\n```",
+    f"{FENCED_INNER}\nDone.",
+])
+def test_fence_and_stray_text_are_tolerated(content):
+    result = run(Meta(reply(content=content)))
+    assert result.source == muse.MUSE
+    assert result.lines == ("Fine.",) * 3
+
+
+def test_truncated_output_is_rejected(caplog):
+    caplog.set_level(logging.DEBUG)
+    cut = FENCED_INNER[: len(FENCED_INNER) // 2]
+    result = run(Meta(reply(content=cut, finish_reason="length")))
+    assert_templates(result)
+    assert "rejected: truncated" in caplog.text
+    assert "finish_reason=length" in caplog.text
+
+
+def test_length_stop_rejects_even_parseable_output():
+    assert_templates(run(Meta(reply(finish_reason="length"))))
+
+
+def test_max_completion_tokens_leaves_room_for_reasoning():
+    meta = Meta()
+    run(meta)
+    assert json.loads(meta.requests[0].content)["max_completion_tokens"] == 1500
 
 
 def test_no_picks_makes_no_call():
@@ -279,3 +314,15 @@ def test_logs_never_hold_key_prompt_or_output(caplog):
     assert "Place node/1" not in caplog.text
     assert "one-line reason" not in caplog.text
     assert "rejected: health_term" in caplog.text
+
+
+def test_json_rejection_logs_shape_and_usage_not_content(caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = '```json\n{"reasons": [{"id": "x", "line": "secret output line"'
+    run(Meta(reply(content=secret)))
+    assert "secret output line" not in caplog.text
+    assert "rejected: json" in caplog.text
+    assert "finish_reason=stop" in caplog.text
+    assert f"len={len(secret)}" in caplog.text
+    assert "fence=True brace=False" in caplog.text
+    assert "prompt=500 completion=60 reasoning=10" in caplog.text
