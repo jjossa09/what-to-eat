@@ -428,3 +428,23 @@ def test_bad_session_id_is_rejected():
     up = Upstreams()
     assert post(up, session_id="not-a-uuid").status_code == 422
     assert up.requests == []
+
+
+# Logging (P1-18)
+
+
+def test_info_logging_never_logs_the_geoapify_key_url(caplog):
+    caplog.set_level(logging.DEBUG)  # root at DEBUG; the client loggers keep their own level
+    post(Upstreams())
+    assert "Recommendations round in" in caplog.text  # INFO lines do get through
+    assert "apiKey" not in caplog.text
+    assert "test-geoapify-key" not in caplog.text
+
+
+def test_client_loggers_are_quiet_and_would_otherwise_leak(caplog):
+    # Guards the test above: with httpx2 at INFO, the request URL (and key) would be logged.
+    assert logging.getLogger("httpx2").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore2").getEffectiveLevel() == logging.WARNING
+    caplog.set_level(logging.INFO, logger="httpx2")
+    post(Upstreams())
+    assert "apiKey" in caplog.text

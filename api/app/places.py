@@ -23,8 +23,6 @@ OSM_TYPES = {"n": "node", "w": "way", "r": "relation", "node": "node", "way": "w
              "relation": "relation"}
 
 logger = logging.getLogger(__name__)
-# httpx2 logs each request URL at INFO, and the URL contains the key.
-logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 
 class PlacesError(Exception):
