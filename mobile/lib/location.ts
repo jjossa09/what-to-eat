@@ -14,3 +14,15 @@ export async function getPosition(): Promise<LocationResult> {
     return { ok: false, reason: 'unavailable' };
   }
 }
+
+/** The position only if permission was already granted; never shows the permission prompt. */
+export async function getPositionIfAllowed(): Promise<Position | null> {
+  try {
+    const { status } = await Location.getForegroundPermissionsAsync();
+    if (status !== 'granted') return null;
+    const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+    return { lat: fix.coords.latitude, lon: fix.coords.longitude };
+  } catch {
+    return null;
+  }
+}
