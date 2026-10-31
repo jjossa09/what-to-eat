@@ -1,5 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import {
   BUDGETS,
@@ -10,6 +10,7 @@ import {
   saveTasteQuiz,
 } from '../lib/profile';
 import { colors, radii, type } from '../theme';
+import PressScale from './PressScale';
 import { Chip, Dots, GlassCard, GlassScreen, PrimaryButton, TextLink } from './ui';
 
 // Taste quiz (P1-08, FR1, FR2). One question per screen (R1). Saved once at the end.
@@ -205,13 +206,9 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
             autoCapitalize="words"
             maxLength={MAX_NAME}
           />
-          <Pressable
-            onPress={addCompanion}
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.add, pressed && styles.pressed]}
-          >
+          <PressScale onPress={addCompanion} accessibilityRole="button" style={styles.add}>
             <Text style={styles.addText}>Add</Text>
-          </Pressable>
+          </PressScale>
         </View>
         {companions.length > 0 && (
           <View style={styles.wrap}>
@@ -309,9 +306,6 @@ const styles = StyleSheet.create({
     color: colors.onAccent,
     fontSize: 15,
     fontWeight: '600',
-  },
-  pressed: {
-    opacity: 0.7,
   },
   spinner: {
     marginTop: 6,

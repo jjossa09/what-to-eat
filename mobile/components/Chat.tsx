@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Linking, ScrollView, type ScrollViewInstance, StyleSheet, Text, View } from 'react-native';
 
 import {
@@ -10,10 +10,11 @@ import {
   type RoundRequest,
   type TranscriptMessage,
 } from '../lib/api';
-import { getPosition, type LocationResult } from '../lib/location';
+import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { type Category, loadCategories, loadTastePrior, type TastePrior } from '../lib/profile';
-import { colors, emojiFor, radii, type } from '../theme';
-import { Chip, GlassCard, GlassScreen } from './ui';
+import { colors, radii, type } from '../theme';
+import ResultCards from './ResultCards';
+import { Chip, GlassScreen } from './ui';
 
 // Chat (P1-09) with the fixed Phase 1 questions (P1-10): craving, budget, distance.
 // Company is not asked: it comes from the quiz prior (mostly_solo). One question per message (R1).
@@ -51,12 +52,6 @@ const PROBLEM_TEXT: Record<Problem, string> = {
   load: "Couldn't load.",
 };
 
-const METERS_PER_MILE = 1609.344;
-const OSM_COPYRIGHT = 'https://www.openstreetmap.org/copyright';
-
-function miles(meters: number): string {
-  return `${Math.max(0.1, meters / METERS_PER_MILE).toFixed(1)} mi`;
-}
 
 type ChatProps = {
   userId: string;
@@ -74,6 +69,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [showAll, setShowAll] = useState(false);
   const [picks, setPicks] = useState<Pick[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [round, setRound] = useState<number | null>(null);
+  const [user, setUser] = useState<Position | null>(null);
+  // The cards render right after this bubble, so later lines (confirmations) follow them.
+  const [cardsAfter, setCardsAfter] = useState<number | null>(null);
 
   const transcript = useRef<TranscriptMessage[]>([]);
   const answers = useRef<{ craving: string | null; budget: number; radius: Radius }>({
@@ -85,10 +84,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const nextId = useRef(0);
   const scroll = useRef<ScrollViewInstance>(null);
 
-  function say(role: Bubble['role'], text: string) {
+  function say(role: Bubble['role'], text: string): number {
     nextId.current += 1;
     const id = nextId.current;
     setBubbles((prev) => [...prev, { id, role, text }]);
+    return id;
   }
 
   function ask(key: keyof typeof QUESTIONS) {
@@ -162,7 +162,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       return;
     }
     try {
-      const round = await getRecommendations({
+      const result = await getRecommendations({
         lat: where.position.lat,
         lon: where.position.lon,
         local_time: localTimeIso(),
@@ -175,13 +175,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         exclude_ids: [],
         transcript: sessionId ? [] : transcript.current,
       });
-      if (!round.logged && __DEV__) console.warn('Round not logged');
-      if (round.session_id) setSessionId(round.session_id);
-      setPicks(round.picks);
-      say('assistant', round.picks.length ? 'Here are 3 spots.' : 'No spots nearby.');
+      if (!result.logged && __DEV__) console.warn('Round not logged');
+      if (result.session_id) setSessionId(result.session_id);
+      setRound(result.session_id ? result.round : null);
+      setUser(where.position);
+      setPicks(result.picks);
+      const id = say('assistant', result.picks.length ? 'Here are 3 spots.' : 'No spots nearby.');
+      setCardsAfter(result.picks.length ? id : null);
       setStep('results');
     } catch (e) {
-      setProblem(e instanceof ApiError ? e.kind : 'network');
+      const kind = e instanceof ApiError ? e.kind : 'network';
+      setProblem(kind === 'conflict' || kind === 'notfound' ? 'server' : kind);
       setStep('error');
     }
   }
@@ -266,35 +270,26 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       >
         {!categories && step !== 'error' && <ActivityIndicator style={styles.spinner} />}
         {bubbles.map((b) => (
-          <View key={b.id} style={[styles.bubble, b.role === 'user' ? styles.mine : styles.theirs]}>
-            <Text style={[styles.bubbleText, b.role === 'user' && styles.mineText]}>{b.text}</Text>
-          </View>
+          <Fragment key={b.id}>
+            <View style={[styles.bubble, b.role === 'user' ? styles.mine : styles.theirs]}>
+              <Text style={[styles.bubbleText, b.role === 'user' && styles.mineText]}>{b.text}</Text>
+            </View>
+            {b.id === cardsAfter && (
+              <ResultCards
+                key={b.id}
+                picks={picks}
+                user={user}
+                sessionId={sessionId}
+                round={round}
+                onSay={(text) => say('assistant', text)}
+              />
+            )}
+          </Fragment>
         ))}
         {step === 'loading' && (
           <View style={[styles.bubble, styles.theirs]}>
             <Text style={styles.bubbleText}>Finding spots…</Text>
           </View>
-        )}
-        {step === 'results' && picks.length > 0 && (
-          <GlassCard>
-            {picks.map((p) => (
-              <View key={p.id} style={styles.pick}>
-                <View style={styles.pickTop}>
-                  <Text style={styles.pickName} numberOfLines={1}>
-                    {emojiFor(p.category)} {p.name}
-                  </Text>
-                  <Text style={styles.pickDistance}>{miles(p.distance_m)}</Text>
-                </View>
-                <Text style={styles.pickReason}>{p.reason}</Text>
-              </View>
-            ))}
-            <Text style={styles.attribution}>
-              Powered by Geoapify ·{' '}
-              <Text style={styles.link} onPress={() => Linking.openURL(OSM_COPYRIGHT)}>
-                © OpenStreetMap contributors
-              </Text>
-            </Text>
-          </GlassCard>
         )}
       </ScrollView>
       {controls && <View style={[styles.controls, { marginBottom: bottom }]}>{controls}</View>}
@@ -332,35 +327,6 @@ const styles = StyleSheet.create({
   },
   mineText: {
     color: colors.textInverse,
-  },
-  pick: {
-    gap: 2,
-  },
-  pickTop: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  pickName: {
-    flex: 1,
-    fontSize: 16,
-    fontWeight: '600',
-    color: colors.text,
-  },
-  pickDistance: {
-    fontSize: 15,
-    color: colors.textSecondary,
-  },
-  pickReason: {
-    fontSize: 15,
-    color: colors.text,
-  },
-  attribution: {
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
-  link: {
-    textDecorationLine: 'underline',
   },
   controls: {
     paddingTop: 12,
