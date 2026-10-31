@@ -1,9 +1,10 @@
 import type { Session } from '@supabase/supabase-js';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import AuthScreen from './components/AuthScreen';
+import Chat from './components/Chat';
 import Quiz from './components/Quiz';
 import { GlassScreen, PrimaryButton } from './components/ui';
 import { hasTasteProfile } from './lib/profile';
@@ -99,13 +100,10 @@ export default function App() {
   }
 
   return (
-    <View style={styles.container}>
-      <Text>What to eat!</Text>
-      <Pressable style={styles.signOut} onPress={() => supabase.auth.signOut()}>
-        <Text style={styles.signOutText}>Sign out</Text>
-      </Pressable>
-      <StatusBar style="auto" />
-    </View>
+    <>
+      <Chat userId={session.user.id} />
+      <StatusBar style="dark" />
+    </>
   );
 }
 
@@ -125,13 +123,5 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: '#6b6b76',
     textAlign: 'center',
-  },
-  signOut: {
-    position: 'absolute',
-    bottom: 48,
-    padding: 8,
-  },
-  signOutText: {
-    color: '#666',
   },
 });

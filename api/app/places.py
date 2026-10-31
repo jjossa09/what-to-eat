@@ -18,6 +18,10 @@ PLACES_URL = "https://api.geoapify.com/v2/places"
 LIMIT = 100
 # Includes pub, bar, biergarten, and taproom, which the ML2 mapper sends to Pubs/Bars.
 CATEGORIES = "catering"
+# 100 nearest places cover only ~2.5 km in a dense area, so wider chips would get the same
+# places as Walk. Above this radius, no proximity bias: the results come from the whole circle
+# (still one call, still sorted by distance here).
+PROXIMITY_MAX_RADIUS_M = 3000
 EARTH_RADIUS_M = 6_371_000
 OSM_TYPES = {"n": "node", "w": "way", "r": "relation", "node": "node", "way": "way",
              "relation": "relation"}
@@ -116,10 +120,11 @@ async def search(
     params = {
         "categories": CATEGORIES,
         "filter": f"circle:{lon},{lat},{radius_m}",
-        "bias": f"proximity:{lon},{lat}",
         "limit": LIMIT,
         "apiKey": api_key,
     }
+    if radius_m <= PROXIMITY_MAX_RADIUS_M:
+        params["bias"] = f"proximity:{lon},{lat}"
     # Exceptions are re-raised without their message or cause: both can include the URL.
     try:
         response = await client.get(PLACES_URL, params=params, timeout=settings.PLACES_TIMEOUT_S)

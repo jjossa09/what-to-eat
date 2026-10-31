@@ -61,6 +61,7 @@ class NewSession:
     budget_level: int | None
     radius_m: int | None
     search_radius_m: int
+    solo: bool | None = None
 
 
 # REST plumbing ---------------------------------------------------------------
@@ -150,6 +151,7 @@ async def open_round(
             "budget_level": new.budget_level,
             "radius_m": new.radius_m,
             "search_radius_m": new.search_radius_m,
+            "solo": new.solo,
         }
         rows = await _send(client, "POST", "sessions", headers, params={"select": "id"},
                            json=row, prefer="return=representation")
@@ -231,6 +233,29 @@ async def log_shown(
         for pick, reason in zip(picks, reasons, strict=True)
     ]
     await _send(client, "POST", "recommendation_events", _user_headers(token), json=rows)
+
+
+async def log_messages(
+    user_id: str, token: str, ref: RoundRef, transcript: list[dict],
+    *, client: httpx2.AsyncClient,
+) -> None:
+    """The chat before this round, in one insert. Round 0 = the 3 questions before round 1."""
+    if not transcript:
+        return
+    rows = [
+        {
+            "user_id": user_id,
+            "session_id": ref.session_id,
+            "round": ref.round - 1,
+            "role": m["role"],
+            "body": m["body"],
+            "question_key": m.get("question_key"),
+            "answer": m.get("answer"),
+            "input_mode": m.get("input_mode"),
+        }
+        for m in transcript
+    ]
+    await _send(client, "POST", "messages", _user_headers(token), json=rows)
 
 
 # Decisions -------------------------------------------------------------------
