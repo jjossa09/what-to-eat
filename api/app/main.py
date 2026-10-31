@@ -5,12 +5,14 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
-from app import history, muse, places
+from app import funnel, history, muse, places
 from app.auth import current_auth, current_user
 from app.categories import CATEGORY_IDS, OTHER
 from app.config import get_settings
@@ -81,6 +83,18 @@ class RecommendationsRequest(BaseModel):
     budget_level: int | None = Field(default=None, ge=1, le=4)
     radius_m: Literal[1500, 5000, 15000] | None = None  # FR3 distance chips
     exclude_ids: list[str] = Field(default_factory=list, max_length=100)
+    session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
+    timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
+
+    @field_validator("timezone")
+    @classmethod
+    def known_timezone(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                ZoneInfo(value)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError("unknown timezone") from None
+        return value
 
     @field_validator("craving")
     @classmethod
@@ -88,6 +102,27 @@ class RecommendationsRequest(BaseModel):
         if value is not None and (value not in CATEGORY_IDS or value == OTHER):
             raise ValueError("unknown category")
         return value
+
+
+def offset_zone(local: datetime) -> str:
+    """Fallback session timezone when the app sends none: the UTC offset, e.g. 'UTC-04:00'."""
+    offset = local.utcoffset()
+    if offset is None:
+        return "unknown"
+    minutes = int(offset.total_seconds()) // 60
+    sign = "-" if minutes < 0 else "+"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours:02d}:{mins:02d}"
+
+
+async def quietly(coro, what: str):
+    """Runs a logging write. On any failure: logs the error type only and returns None."""
+    try:
+        result = await coro
+    except Exception as e:
+        logger.warning("Funnel %s failed: %s", what, type(e).__name__)
+        return None
+    return True if result is None else result
 
 
 async def load_history(user_id: str, token: str, client: httpx2.AsyncClient) -> History | None:
@@ -109,15 +144,31 @@ async def recommendations(
     started = time.perf_counter()
     user_id, token = auth
     radius = body.radius_m or get_settings().PLACES_RADIUS_M
+    slot, local_date, is_weekend = meal_context(body.local_time)
+    new_session = funnel.NewSession(
+        timezone=body.timezone or offset_zone(body.local_time),
+        local_date=local_date,
+        meal_slot=slot,
+        lat=body.lat,
+        lon=body.lon,
+        craving=body.craving,
+        budget_level=body.budget_level,
+        radius_m=body.radius_m,
+        search_radius_m=radius,
+    )
+    session_id = str(body.session_id) if body.session_id else None
     try:
-        result, loaded = await asyncio.gather(
+        result, loaded, ref = await asyncio.gather(
             places.search(body.lat, body.lon, radius, client=client),
             load_history(user_id, token, client),
+            quietly(
+                funnel.open_round(user_id, token, session_id, new_session, client=client),
+                "session",
+            ),
         )
     except places.PlacesError as e:
         raise places_error(e) from None
 
-    slot, local_date, is_weekend = meal_context(body.local_time)
     context = Context(
         lat=body.lat,
         lon=body.lon,
@@ -133,7 +184,24 @@ async def recommendations(
     user_history = loaded or History()
     candidates, merged_ids = merge_candidates(result.places, user_history, context)
     ranking = rank(candidates, context, user_history, merged_ids)
-    reasons = await muse.write_reasons(ranking.top3, client=client)
+    shown = [pick.scored.place for pick in ranking.top3]
+    # The shown places are cached while Muse writes; the events need their rows.
+    reasons, cached = await asyncio.gather(
+        muse.write_reasons(ranking.top3, client=client),
+        quietly(funnel.upsert_places(shown, client=client), "places")
+        if ref
+        else asyncio.sleep(0),
+    )
+    logged = bool(
+        ref
+        and cached
+        and await quietly(
+            funnel.log_shown(
+                user_id, token, ref, ranking.top3, reasons.lines, reasons.source, client=client
+            ),
+            "shown",
+        )
+    )
 
     logger.info(
         "Recommendations round in %d ms (reasons: %s)",
@@ -141,6 +209,9 @@ async def recommendations(
         reasons.source,
     )
     return {
+        "session_id": ref.session_id if ref else session_id,
+        "round": ref.round if ref else None,
+        "logged": logged,
         "history_used": loaded is not None,
         "reasons_source": reasons.source,
         "cold_start": ranking.cold_start,
@@ -162,3 +233,108 @@ async def recommendations(
             for pick, reason in zip(ranking.top3, reasons.lines, strict=True)
         ],
     }
+
+
+# Funnel events (P1-15, ML8) --------------------------------------------------
+
+
+class EventRequest(BaseModel):
+    round: int = Field(ge=1, le=100)
+    place_id: str = Field(min_length=1, max_length=200)
+
+
+class InterestedRequest(EventRequest):
+    kind: Literal["card", "directions"]
+
+
+class RejectedRequest(EventRequest):
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("reason")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason is blank")
+        return value
+
+
+def funnel_error(e: funnel.FunnelError) -> HTTPException:
+    if isinstance(e, funnel.NotFound):
+        return HTTPException(status.HTTP_404_NOT_FOUND, "Not found in this session")
+    if isinstance(e, funnel.Conflict):
+        return HTTPException(status.HTTP_409_CONFLICT, "Session already has an outcome")
+    if isinstance(e, funnel.FunnelNotConfigured):
+        return HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Logging is not configured")
+    logger.warning("Funnel event failed: %s", type(e).__name__)
+    return HTTPException(status.HTTP_502_BAD_GATEWAY, "Logging failed")
+
+
+async def shown_event(
+    session_id: UUID, body: EventRequest, event: str, fields: dict,
+    auth: tuple[str, str], client: httpx2.AsyncClient,
+) -> dict:
+    """Logs an event on a card that was shown in this session and round (R2)."""
+    user_id, token = auth
+    sid = str(session_id)
+    try:
+        await funnel.find_shown(user_id, token, sid, body.round, body.place_id, client=client)
+        await funnel.log_event(user_id, token, sid, body.round, body.place_id, event, fields,
+                               client=client)
+    except funnel.FunnelError as e:
+        raise funnel_error(e) from None
+    return {"logged": True}
+
+
+@app.post("/sessions/{session_id}/interested")
+async def interested(
+    session_id: UUID,
+    body: InterestedRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    return await shown_event(session_id, body, "interested", {"interest_kind": body.kind},
+                             auth, client)
+
+
+@app.post("/sessions/{session_id}/rejected")
+async def rejected(
+    session_id: UUID,
+    body: RejectedRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    return await shown_event(session_id, body, "rejected", {"reject_reason": body.reason},
+                             auth, client)
+
+
+@app.post("/sessions/{session_id}/picked")
+async def picked(
+    session_id: UUID,
+    body: EventRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    """Final choice (FR9): the picked event, the live meal, and outcome = 'picked'."""
+    user_id, token = auth
+    try:
+        await funnel.log_pick(user_id, token, str(session_id), body.round, body.place_id,
+                              client=client)
+    except funnel.FunnelError as e:
+        raise funnel_error(e) from None
+    return {"logged": True}
+
+
+@app.post("/sessions/{session_id}/none")
+async def none(
+    session_id: UUID,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    """No pick: outcome = 'none' and ended_at. 409 if the session already has an outcome."""
+    user_id, token = auth
+    try:
+        await funnel.close_session(user_id, token, str(session_id), "none", client=client)
+    except funnel.FunnelError as e:
+        raise funnel_error(e) from None
+    return {"logged": True}
