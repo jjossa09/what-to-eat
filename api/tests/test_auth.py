@@ -76,6 +76,17 @@ def test_expired_token():
     assert get_me({"Authorization": f"Bearer {token}"}).status_code == 401
 
 
+def test_iat_slightly_in_future_passes():
+    # Clock skew: the token was issued a few seconds "ahead" of this server's clock.
+    token = make_token(iat=int(time.time()) + 5)
+    assert get_me({"Authorization": f"Bearer {token}"}).status_code == 200
+
+
+def test_iat_far_in_future_fails():
+    token = make_token(iat=int(time.time()) + 60)
+    assert get_me({"Authorization": f"Bearer {token}"}).status_code == 401
+
+
 def test_wrong_audience():
     token = make_token(aud="anon")
     assert get_me({"Authorization": f"Bearer {token}"}).status_code == 401
