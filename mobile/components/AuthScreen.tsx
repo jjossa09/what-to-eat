@@ -1,7 +1,9 @@
 import { useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { supabase } from '../lib/supabase';
+import { colors, radii, spacing, type } from '../theme';
+import { GlassCard, GlassScreen, PrimaryButton, TextLink } from './ui';
 
 export default function AuthScreen() {
   const [email, setEmail] = useState('');
@@ -29,41 +31,45 @@ export default function AuthScreen() {
   }
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>What to eat!</Text>
-      <TextInput
-        style={styles.input}
-        placeholder="Email"
-        value={email}
-        onChangeText={setEmail}
-        autoCapitalize="none"
-        autoComplete="email"
-        keyboardType="email-address"
-        textContentType="emailAddress"
-      />
-      <TextInput
-        style={styles.input}
-        placeholder="Password"
-        value={password}
-        onChangeText={setPassword}
-        secureTextEntry
-        autoComplete="password"
-        textContentType="password"
-      />
-      {error && <Text style={styles.error}>{error}</Text>}
-      {busy ? (
-        <ActivityIndicator style={styles.spinner} />
-      ) : (
-        <>
-          <Pressable style={styles.button} onPress={() => submit('signIn')}>
-            <Text style={styles.buttonText}>Sign in</Text>
-          </Pressable>
-          <Pressable style={styles.link} onPress={() => submit('signUp')}>
-            <Text style={styles.linkText}>Create account</Text>
-          </Pressable>
-        </>
-      )}
-    </View>
+    <GlassScreen>
+      <View style={styles.container}>
+        <Text style={styles.title}>What to eat!</Text>
+        <GlassCard>
+          <TextInput
+            style={styles.input}
+            placeholder="Email"
+            placeholderTextColor={colors.textSecondary}
+            value={email}
+            onChangeText={setEmail}
+            autoCapitalize="none"
+            autoComplete="email"
+            keyboardType="email-address"
+            textContentType="emailAddress"
+          />
+          <TextInput
+            style={styles.input}
+            placeholder="Password"
+            placeholderTextColor={colors.textSecondary}
+            value={password}
+            onChangeText={setPassword}
+            secureTextEntry
+            autoComplete="password"
+            textContentType="password"
+          />
+          {error && <Text style={styles.error}>{error}</Text>}
+          {busy ? (
+            <ActivityIndicator style={styles.spinner} />
+          ) : (
+            <>
+              <PrimaryButton label="Sign in" onPress={() => submit('signIn')} />
+              <View style={styles.center}>
+                <TextLink label="Create account" onPress={() => submit('signUp')} />
+              </View>
+            </>
+          )}
+        </GlassCard>
+      </View>
+    </GlassScreen>
   );
 }
 
@@ -71,47 +77,32 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     justifyContent: 'center',
-    padding: 24,
-    gap: 12,
-    backgroundColor: '#fff',
+    gap: spacing.lg,
   },
   title: {
-    fontSize: 28,
-    fontWeight: '600',
+    fontSize: type.title,
+    fontWeight: '700',
     textAlign: 'center',
-    marginBottom: 12,
+    color: colors.text,
   },
   input: {
+    backgroundColor: colors.glassStrong,
     borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 10,
-    padding: 14,
-    fontSize: 16,
+    borderColor: colors.hairline,
+    borderRadius: radii.pill,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.lg,
+    fontSize: type.body,
+    color: colors.text,
   },
   error: {
-    color: '#c0392b',
+    color: colors.error,
     textAlign: 'center',
   },
   spinner: {
     marginVertical: 14,
   },
-  button: {
-    backgroundColor: '#111',
-    borderRadius: 10,
-    padding: 14,
+  center: {
     alignItems: 'center',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  link: {
-    padding: 8,
-    alignItems: 'center',
-  },
-  linkText: {
-    fontSize: 15,
-    color: '#333',
   },
 });
