@@ -51,6 +51,12 @@ export const map = {
   miniHeight: 160,
   fitPadding: 40,
   startDelta: 0.03, // about 3 km across
+  // "Search this area" (P1-23)
+  moveFraction: 0.3, // center moved more than 30% of the searched span
+  zoomRatio: 1.5, // or the span changed by 1.5x or more
+  minSearchRadiusM: 500,
+  maxSearchRadiusM: 15000,
+  maxPins: 300,
 };
 
 export const radii = {
