@@ -1,5 +1,5 @@
 import { type NavigationProp, type ParamListBase, useFocusEffect, useNavigation } from '@react-navigation/native';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Linking, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -9,14 +9,26 @@ import PressScale from '../components/PressScale';
 import { Chip, GlassCard, GlassScreen, PrimaryButton, useTabBarSpace } from '../components/ui';
 import type { Place } from '../lib/api';
 import { getPosition, type Position } from '../lib/location';
-import { directionsUrl, nearbyPlaces } from '../lib/places';
+import {
+  cachedSearch,
+  directionsUrl,
+  distanceM,
+  mergePlaces,
+  nearbyPlaces,
+  type Region,
+  regionMoved,
+  regionSearch,
+  searchArea,
+} from '../lib/places';
 import { loadCategories } from '../lib/profile';
 import { colors, emojiFor, map, radii, spacing, type } from '../theme';
 
 // Map tab (P1-13): Apple Map centered on the user with nearby places as emoji pins. One search
-// when the tab opens, reused until the user moves about 500 m.
+// when the tab opens, reused until the user moves about 500 m. "Search this area" (P1-23): after
+// a meaningful pan or zoom, one tap searches the visible region; never on every pan.
 
 type Problem = 'denied' | 'nofix' | 'places';
+type AreaSearch = 'hidden' | 'ready' | 'searching' | 'failed';
 
 const PROBLEM_TEXT: Record<Problem, string> = {
   denied: 'Location is off.',
@@ -39,6 +51,15 @@ export default function MapScreen() {
   const [selected, setSelected] = useState<Place | null>(null);
   const [problem, setProblem] = useState<Problem | null>(null);
   const [names, setNames] = useState<Map<string, string>>(new Map());
+  const [area, setArea] = useState<AreaSearch>('hidden');
+  // The region of the last search (or cache hit) and the region in view now.
+  const searched = useRef<Region | null>(null);
+  const visible = useRef<Region | null>(null);
+  const selectedId = useRef<string | null>(null); // read by merges; never dropped by the cap
+
+  useEffect(() => {
+    selectedId.current = selected?.id ?? null;
+  }, [selected]);
 
   useEffect(() => {
     loadCategories()
@@ -57,7 +78,8 @@ export default function MapScreen() {
     try {
       const found = await nearbyPlaces(where.position);
       if (!isLive()) return;
-      setPlaces(found);
+      // Merged, so returning to the tab keeps the pins from area searches.
+      setPlaces((shown) => mergePlaces(shown, found, where.position, selectedId.current));
       setProblem(null);
     } catch {
       if (isLive()) setProblem('places');
@@ -77,6 +99,45 @@ export default function MapScreen() {
   function retry() {
     setProblem(null);
     load();
+  }
+
+  function merge(found: Place[], region: Region) {
+    const center = { lat: region.latitude, lon: region.longitude };
+    setPlaces((shown) => mergePlaces(shown, found, center, selectedId.current));
+    searched.current = region;
+  }
+
+  function onRegionChangeComplete(region: Region) {
+    visible.current = region;
+    if (area === 'searching') return;
+    const ref = searched.current;
+    if (!ref) {
+      searched.current = region; // the opening view counts as searched (the nearby search)
+      return;
+    }
+    if (!regionMoved(ref, region)) {
+      setArea('hidden');
+      return;
+    }
+    const hit = cachedSearch(regionSearch(region));
+    if (hit) {
+      merge(hit, region); // already searched this area: no call
+      setArea('hidden');
+    } else {
+      setArea('ready');
+    }
+  }
+
+  async function searchThisArea() {
+    const region = visible.current;
+    if (!region || area === 'searching') return;
+    setArea('searching');
+    try {
+      merge(await searchArea(regionSearch(region)), region);
+      setArea('hidden');
+    } catch {
+      setArea('failed');
+    }
   }
 
   if (!user) {
@@ -110,6 +171,7 @@ export default function MapScreen() {
           longitudeDelta: map.startDelta,
         }}
         showsUserLocation
+        onRegionChangeComplete={onRegionChangeComplete}
         onPress={(e) => {
           // A pin tap also reaches the map on iOS; only a tap on the map itself closes the card.
           if (e.nativeEvent.action !== 'marker-press') setSelected(null);
@@ -137,6 +199,23 @@ export default function MapScreen() {
             <Chip label="Try again" onPress={retry} />
           </View>
         )}
+        {area === 'ready' && (
+          <PressScale style={styles.pill} onPress={searchThisArea} accessibilityRole="button">
+            <Text style={styles.searchText}>Search this area</Text>
+          </PressScale>
+        )}
+        {area === 'searching' && (
+          <View style={styles.pill}>
+            <ActivityIndicator />
+            <Text style={styles.searchText}>Searching…</Text>
+          </View>
+        )}
+        {area === 'failed' && (
+          <View style={styles.pill}>
+            <Text style={styles.problemText}>Couldn&apos;t load places.</Text>
+            <Chip label="Try again" onPress={searchThisArea} />
+          </View>
+        )}
       </View>
 
       <View style={[styles.bottom, { bottom: space }]} pointerEvents="box-none">
@@ -149,7 +228,10 @@ export default function MapScreen() {
                   {selected.name}
                 </Text>
                 <Text style={styles.meta}>
-                  {`${names.get(selected.category) ?? selected.category} · ${miles(selected.distance_m)}`}
+                  {`${names.get(selected.category) ?? selected.category} · ${miles(
+                    // From the user: an area search measures distance_m from the map center.
+                    distanceM(user, { lat: selected.lat, lon: selected.lon }),
+                  )}`}
                 </Text>
               </View>
             </View>
@@ -204,6 +286,11 @@ const styles = StyleSheet.create({
   problemText: {
     fontSize: type.small,
     color: colors.error,
+  },
+  searchText: {
+    fontSize: type.small,
+    fontWeight: '600',
+    color: colors.text,
   },
   bottom: {
     position: 'absolute',
