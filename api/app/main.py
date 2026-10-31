@@ -16,8 +16,10 @@ from app import funnel, history, muse, places
 from app.auth import current_auth, current_user
 from app.categories import CATEGORY_IDS, OTHER
 from app.config import get_settings
+from app.logs import configure_logging
 from app.scoring import Context, History, meal_context, merge_candidates, rank
 
+configure_logging()
 app = FastAPI(title="What to eat! API")
 logger = logging.getLogger(__name__)
 
