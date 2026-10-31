@@ -1,7 +1,7 @@
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import type { ReactNode } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View, type ViewStyle } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { blur, colors, dock, radii, spacing, type } from '../theme';
@@ -100,9 +100,9 @@ export function PrimaryButton({ label, onPress, disabled = false, busy = false }
 
 export function TextLink({ label, onPress }: { label: string; onPress: () => void }) {
   return (
-    <Pressable onPress={onPress} accessibilityRole="button" style={styles.link} hitSlop={12}>
+    <PressScale onPress={onPress} accessibilityRole="button" style={styles.link} hitSlop={12}>
       <Text style={styles.linkText}>{label}</Text>
-    </Pressable>
+    </PressScale>
   );
 }
 

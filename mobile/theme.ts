@@ -43,6 +43,16 @@ export const motion = {
   release: { stiffness: 300, damping: 22, mass: 1 },
 };
 
+// Maps (P1-13): emoji pins, the chat's mini map, the Map tab's starting zoom.
+export const map = {
+  pinSize: 36,
+  pinEmojiSize: 18,
+  pinBorder: 2,
+  miniHeight: 160,
+  fitPadding: 40,
+  startDelta: 0.03, // about 3 km across
+};
+
 export const radii = {
   card: 28,
   bubble: 20,

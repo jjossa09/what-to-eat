@@ -9,7 +9,7 @@ import pytest
 from app import muse
 from app.config import get_settings
 from app.places import Candidate
-from app.scoring import Context, History, QuizPrior, rank
+from app.scoring import Context, History, PastMeal, QuizPrior, StoredPlace, rank
 
 LAT, LON = 33.95, -84.55
 TEST_KEY = "LLM_1_test-meta-key"
@@ -326,3 +326,70 @@ def test_json_rejection_logs_shape_and_usage_not_content(caplog):
     assert f"len={len(secret)}" in caplog.text
     assert "fence=True brace=False" in caplog.text
     assert "prompt=500 completion=60 reasoning=10" in caplog.text
+
+
+
+# Honesty: no past-visit claims for places the user has never been to (P1-13)
+
+PAST_VISIT_LINES = ["Your familiar Thai spot.", "Your usual pick nearby.", "Try it again tonight.",
+                    "Head back for dinner.", "Worth a return trip.", "A regular stop for you.",
+                    "Your go-to for Thai."]
+
+
+def visited_picks():
+    """Top 3 where node/1 has two past meals (visits > 0); the others are unvisited."""
+    stored = StoredPlace(id="node/1", name="Place node/1", lat=LAT + 400 / M_PER_DEG, lon=LON,
+                         geoapify_categories=(), address="1 Main St")
+    meals = tuple(PastMeal(place=stored, eaten_on=date(2026, 10, d), source="backfill",
+                           category_id="thai", price_level=None) for d in (20, 25))
+    context = Context(lat=LAT, lon=LON, local_date=date(2026, 10, 29), meal_slot="dinner",
+                      is_weekend=False, search_radius_m=5000)
+    history = History(prior=QuizPrior(favorites=frozenset({"thai", "pizza"})), meals=meals)
+    candidates = [cand("node/1", "thai", 400), cand("node/2", "pizza", 800),
+                  cand("node/3", "mexican", 1200), cand("node/4", "burgers", 3000)]
+    return rank(candidates, context, history).top3
+
+
+def test_evidence_has_no_slot_or_ranking_labels():
+    meta = Meta()
+    run(meta)
+    picks = json.loads(json.loads(meta.requests[0].content)["messages"][1]["content"])["picks"]
+    for pick in picks:
+        assert "slot" not in pick
+        assert not {"familiar", "discovery"} & set(pick["signals"])
+        assert pick["visited_before"] is False
+        assert pick["visits"] == 0
+
+
+def test_prompt_states_the_never_visited_rule():
+    assert "If visited_before is false" in muse.SYSTEM_PROMPT
+    assert "familiar" in muse.SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("bad", PAST_VISIT_LINES)
+def test_past_visit_claim_on_unvisited_place_uses_templates(bad, caplog):
+    caplog.set_level(logging.WARNING)
+    assert_templates(run(Meta(reply({IDS[0]: bad, IDS[1]: "B.", IDS[2]: "C."}))))
+    assert "rejected: past_visit_claim" in caplog.text
+
+
+def test_past_visit_wording_is_fine_for_a_visited_place():
+    picks = visited_picks()
+    ids = [p.scored.place.id for p in picks]
+    visited = next(p for p in picks if p.scored.evidence.visits > 0)
+    lines = {i: ("You're back again, 0.2 mi away." if i == visited.scored.place.id else "New spot.")
+             for i in ids}
+    result = run(Meta(reply(lines)), picks=picks)
+    assert result.source == muse.MUSE
+    meta = Meta(reply(lines))
+    run(meta, picks=picks)
+    sent = json.loads(json.loads(meta.requests[0].content)["messages"][1]["content"])["picks"]
+    by_id = {p["id"]: p for p in sent}
+    assert by_id[visited.scored.place.id]["visited_before"] is True
+
+
+def test_templates_never_claim_a_past_visit_for_unvisited_places():
+    for picks in (PICKS, top3(craving="mexican"), visited_picks()):
+        for pick in picks:
+            if pick.scored.evidence.visits == 0:
+                assert not muse.PAST_VISIT_TERMS.search(muse.template_reason(pick))

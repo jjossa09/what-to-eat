@@ -68,9 +68,19 @@ HEALTH_TERMS = re.compile(
     re.IGNORECASE,
 )
 
+# Implies a past visit. Rejected for a place the user has never been to (visits = 0).
+PAST_VISIT_TERMS = re.compile(
+    r"\b(familiar|usual\w*|again|back|return\w*|regular\w*|go-to)\b", re.IGNORECASE
+)
+
+# Ranking labels, not facts: never sent to Muse (the slot name is withheld too).
+RANKING_SIGNALS = frozenset({"familiar", "discovery"})
+
 SYSTEM_PROMPT = (
     "You write the one-line reason shown under each restaurant pick in a food app. "
     "Use only the evidence given; never invent menus, dishes, ratings, hours, or prices. "
+    "If visited_before is false, the user has never been there: never imply they have "
+    "(no familiar, usual, again, back, return, regular, go-to). "
     "Do not repeat the place name. No health, nutrition, calorie, or diet claims. "
     f"Each reason is one plain sentence of at most {MAX_REASON_CHARS} characters. "
     'Reply with JSON only: {"reasons": [{"id": "<pick id>", "line": "<reason>"}]}, '
@@ -189,14 +199,14 @@ def pick_evidence(pick: Pick) -> dict:
     return {
         "id": place.id,
         "name": place.name,
-        "slot": pick.slot,
         "category": CATEGORY_LABELS.get(e.category) if e.category != OTHER else None,
         "distance": format_distance(e.distance_m),
         "craving": CATEGORY_LABELS.get(e.craving) if e.craving else None,
+        "visited_before": e.visits > 0,
         "visits": e.visits,
         "days_since_last_visit": e.last_visit_days,
         "price": price_note(price),
-        "signals": list(e.reasons),
+        "signals": [r for r in e.reasons if r not in RANKING_SIGNALS],
     }
 
 
@@ -233,7 +243,12 @@ def parse_json(content: str):
         return json.loads(text[start : end + 1])
 
 
-def check_output(content, ids: list[str], finish_reason: str | None = None) -> dict[str, str]:
+def check_output(
+    content,
+    ids: list[str],
+    finish_reason: str | None = None,
+    never_visited: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     """Muse content -> {id: line} for exactly these ids, or RejectedOutput with a code."""
     if finish_reason == "length":
         raise RejectedOutput("truncated")
@@ -261,6 +276,8 @@ def check_output(content, ids: list[str], finish_reason: str | None = None) -> d
             raise RejectedOutput("length")
         if HEALTH_TERMS.search(line):
             raise RejectedOutput("health_term")
+        if entry["id"] in never_visited and PAST_VISIT_TERMS.search(line):
+            raise RejectedOutput("past_visit_claim")
         lines[entry["id"]] = line
     return lines
 
@@ -338,7 +355,8 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
     usage = parse_usage(body) if isinstance(body, dict) else None
     ids = [p.scored.place.id for p in picks]
     try:
-        lines = check_output(content, ids, finish_reason)
+        never_visited = frozenset(p.scored.place.id for p in picks if p.scored.evidence.visits == 0)
+        lines = check_output(content, ids, finish_reason, never_visited)
     except RejectedOutput as e:
         # Shape facts only, never the content (it can echo the prompt).
         text = content.strip() if isinstance(content, str) else ""
