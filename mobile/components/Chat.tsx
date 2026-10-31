@@ -12,8 +12,8 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult } from '../lib/location';
 import { type Category, loadCategories, loadTastePrior, type TastePrior } from '../lib/profile';
-import { supabase } from '../lib/supabase';
-import { Chip, colors, GlassCard, GlassScreen, TextLink } from './ui';
+import { colors, emojiFor, radii, type } from '../theme';
+import { Chip, GlassCard, GlassScreen } from './ui';
 
 // Chat (P1-09) with the fixed Phase 1 questions (P1-10): craving, budget, distance.
 // Company is not asked: it comes from the quiz prior (mostly_solo). One question per message (R1).
@@ -58,7 +58,14 @@ function miles(meters: number): string {
   return `${Math.max(0.1, meters / METERS_PER_MILE).toFixed(1)} mi`;
 }
 
-export default function Chat({ userId }: { userId: string }) {
+type ChatProps = {
+  userId: string;
+  onSignOut: () => void;
+  /** Space kept clear for the floating tab bar. */
+  bottom: number;
+};
+
+export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [categories, setCategories] = useState<Category[] | null>(null);
   const [prior, setPrior] = useState<TastePrior | null>(null);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
@@ -181,7 +188,7 @@ export default function Chat({ userId }: { userId: string }) {
 
   function retry() {
     if (problem === 'auth') {
-      supabase.auth.signOut();
+      onSignOut();
     } else if (problem === 'load') {
       setProblem(null);
       setStep('craving');
@@ -250,13 +257,11 @@ export default function Chat({ userId }: { userId: string }) {
   }
 
   return (
-    <GlassScreen>
-      <View style={styles.header}>
-        <TextLink label="Sign out" onPress={() => supabase.auth.signOut()} />
-      </View>
+    <GlassScreen tabBar>
       <ScrollView
         ref={scroll}
-        contentContainerStyle={styles.thread}
+        // Without chips below, the thread scrolls behind the tab bar and ends above it.
+        contentContainerStyle={[styles.thread, !controls && { paddingBottom: bottom }]}
         onContentSizeChange={() => scroll.current?.scrollToEnd({ animated: true })}
       >
         {!categories && step !== 'error' && <ActivityIndicator style={styles.spinner} />}
@@ -276,7 +281,7 @@ export default function Chat({ userId }: { userId: string }) {
               <View key={p.id} style={styles.pick}>
                 <View style={styles.pickTop}>
                   <Text style={styles.pickName} numberOfLines={1}>
-                    {p.name}
+                    {emojiFor(p.category)} {p.name}
                   </Text>
                   <Text style={styles.pickDistance}>{miles(p.distance_m)}</Text>
                 </View>
@@ -292,17 +297,12 @@ export default function Chat({ userId }: { userId: string }) {
           </GlassCard>
         )}
       </ScrollView>
-      {controls && <View style={styles.controls}>{controls}</View>}
+      {controls && <View style={[styles.controls, { marginBottom: bottom }]}>{controls}</View>}
     </GlassScreen>
   );
 }
 
 const styles = StyleSheet.create({
-  header: {
-    alignItems: 'flex-end',
-    marginTop: -24,
-    marginBottom: 8,
-  },
   thread: {
     gap: 10,
     paddingBottom: 16,
@@ -314,7 +314,7 @@ const styles = StyleSheet.create({
     maxWidth: '80%',
     paddingVertical: 10,
     paddingHorizontal: 14,
-    borderRadius: 20,
+    borderRadius: radii.bubble,
   },
   theirs: {
     alignSelf: 'flex-start',
@@ -324,14 +324,14 @@ const styles = StyleSheet.create({
   },
   mine: {
     alignSelf: 'flex-end',
-    backgroundColor: colors.ink,
+    backgroundColor: colors.text,
   },
   bubbleText: {
-    fontSize: 16,
-    color: colors.ink,
+    fontSize: type.body,
+    color: colors.text,
   },
   mineText: {
-    color: '#fff',
+    color: colors.textInverse,
   },
   pick: {
     gap: 2,
@@ -345,19 +345,19 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 16,
     fontWeight: '600',
-    color: colors.ink,
+    color: colors.text,
   },
   pickDistance: {
     fontSize: 15,
-    color: colors.muted,
+    color: colors.textSecondary,
   },
   pickReason: {
     fontSize: 15,
-    color: colors.ink,
+    color: colors.text,
   },
   attribution: {
     fontSize: 12,
-    color: colors.muted,
+    color: colors.textSecondary,
   },
   link: {
     textDecorationLine: 'underline',

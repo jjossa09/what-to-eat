@@ -1,27 +1,57 @@
+import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import type { ReactNode } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View, type ViewStyle } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-// Minimal glass look (R1): a soft gradient behind frosted white cards and pill chips.
-export const colors = {
-  ink: '#111',
-  muted: '#6b6b76',
-  error: '#c0392b',
-  gradient: ['#FDE7D9', '#ECE6FB', '#DCEFF8'] as const,
-  glass: 'rgba(255,255,255,0.55)',
-  glassBorder: 'rgba(255,255,255,0.85)',
+import { blur, colors, dock, radii, spacing, type } from '../theme';
+import PressScale from './PressScale';
+
+// Shared glass pieces (R1, P1-22). Colors come only from theme.ts.
+
+/** Distance from the screen bottom to the floating tab bar's bottom edge. */
+export function useDockBottom(): number {
+  return Math.max(useSafeAreaInsets().bottom, dock.bottomInset);
+}
+
+/** Bottom padding that keeps content clear of the floating tab bar. */
+export function useTabBarSpace(): number {
+  return useDockBottom() + dock.height + spacing.md;
+}
+
+type ScreenProps = {
+  children: ReactNode;
+  /** Tab screens: content runs to the bottom and scrolls behind the floating tab bar. */
+  tabBar?: boolean;
 };
 
-export function GlassScreen({ children }: { children: ReactNode }) {
+export function GlassScreen({ children, tabBar = false }: ScreenProps) {
+  const insets = useSafeAreaInsets();
   return (
-    <LinearGradient colors={colors.gradient} style={styles.screen}>
+    <LinearGradient
+      colors={colors.gradient}
+      style={[
+        styles.screen,
+        { paddingTop: insets.top + spacing.lg, paddingBottom: tabBar ? 0 : insets.bottom + spacing.lg },
+      ]}
+    >
       {children}
     </LinearGradient>
   );
 }
 
-export function GlassCard({ children }: { children: ReactNode }) {
-  return <View style={styles.card}>{children}</View>;
+export function GlassCard({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+  return (
+    <View style={[styles.card, style]}>
+      <BlurView intensity={blur.intensity} tint={blur.tint} style={StyleSheet.absoluteFill} />
+      <View style={styles.cardFill} />
+      <View style={styles.cardBody}>{children}</View>
+    </View>
+  );
+}
+
+export function ScreenTitle({ children }: { children: ReactNode }) {
+  return <Text style={styles.screenTitle}>{children}</Text>;
 }
 
 type ChipProps = {
@@ -35,21 +65,16 @@ type ChipProps = {
 
 export function Chip({ label, selected = false, onPress, onRemove, wide = false, detail }: ChipProps) {
   return (
-    <Pressable
+    <PressScale
       onPress={onPress ?? onRemove}
       accessibilityRole="button"
       accessibilityState={{ selected }}
-      style={({ pressed }) => [
-        styles.chip,
-        wide && styles.chipWide,
-        selected && styles.chipSelected,
-        pressed && styles.pressed,
-      ]}
+      style={[styles.chip, wide && styles.chipWide, selected && styles.chipSelected]}
     >
       <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{label}</Text>
       {detail && <Text style={[styles.chipDetail, selected && styles.chipTextSelected]}>{detail}</Text>}
       {onRemove && <Text style={[styles.chipText, selected && styles.chipTextSelected]}> ×</Text>}
-    </Pressable>
+    </PressScale>
   );
 }
 
@@ -57,18 +82,19 @@ type ButtonProps = { label: string; onPress: () => void; disabled?: boolean; bus
 
 export function PrimaryButton({ label, onPress, disabled = false, busy = false }: ButtonProps) {
   return (
-    <Pressable
+    <PressScale
       onPress={onPress}
       disabled={disabled || busy}
       accessibilityRole="button"
-      style={({ pressed }) => [
-        styles.button,
-        (disabled || busy) && styles.buttonDisabled,
-        pressed && styles.pressed,
-      ]}
+      accessibilityState={{ disabled: disabled || busy }}
+      style={[styles.button, (disabled || busy) && styles.buttonDisabled]}
     >
-      {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>{label}</Text>}
-    </Pressable>
+      {busy ? (
+        <ActivityIndicator color={colors.onAccent} />
+      ) : (
+        <Text style={styles.buttonText}>{label}</Text>
+      )}
+    </PressScale>
   );
 }
 
@@ -93,77 +119,84 @@ export function Dots({ step, total }: { step: number; total: number }) {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    paddingTop: 72,
-    paddingHorizontal: 20,
-    paddingBottom: 40,
+    paddingHorizontal: spacing.xl,
   },
   card: {
-    backgroundColor: colors.glass,
-    borderColor: colors.glassBorder,
+    borderRadius: radii.card,
     borderWidth: 1,
-    borderRadius: 28,
-    padding: 20,
-    gap: 16,
-    shadowColor: '#000',
+    borderColor: colors.glassBorder,
+    overflow: 'hidden',
+    shadowColor: colors.shadow,
     shadowOpacity: 0.06,
     shadowRadius: 24,
     shadowOffset: { width: 0, height: 8 },
+  },
+  cardFill: {
+    ...StyleSheet.absoluteFill,
+    backgroundColor: colors.glass,
+  },
+  cardBody: {
+    padding: spacing.xl,
+    gap: spacing.lg,
+  },
+  screenTitle: {
+    fontSize: type.title,
+    fontWeight: '700',
+    color: colors.text,
+    marginBottom: spacing.md,
   },
   chip: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 10,
     paddingHorizontal: 14,
-    borderRadius: 999,
-    backgroundColor: 'rgba(255,255,255,0.7)',
+    borderRadius: radii.pill,
+    backgroundColor: colors.glassStrong,
     borderWidth: 1,
-    borderColor: 'rgba(17,17,17,0.08)',
+    borderColor: colors.hairline,
   },
   chipWide: {
     justifyContent: 'space-between',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
+    paddingVertical: spacing.lg,
+    paddingHorizontal: spacing.xl,
   },
   chipSelected: {
-    backgroundColor: colors.ink,
-    borderColor: colors.ink,
+    backgroundColor: colors.accent,
+    borderColor: colors.accent,
   },
   chipText: {
-    fontSize: 15,
-    color: colors.ink,
+    fontSize: type.small,
+    color: colors.text,
     fontWeight: '500',
   },
   chipDetail: {
-    fontSize: 15,
-    color: colors.muted,
+    fontSize: type.small,
+    color: colors.textSecondary,
   },
   chipTextSelected: {
-    color: '#fff',
-  },
-  pressed: {
-    opacity: 0.7,
+    color: colors.onAccent,
   },
   button: {
-    backgroundColor: colors.ink,
-    borderRadius: 999,
-    paddingVertical: 16,
+    backgroundColor: colors.accent,
+    borderRadius: radii.pill,
+    paddingVertical: spacing.lg,
     alignItems: 'center',
   },
   buttonDisabled: {
     opacity: 0.35,
   },
   buttonText: {
-    color: '#fff',
-    fontSize: 16,
+    color: colors.onAccent,
+    fontSize: type.body,
     fontWeight: '600',
   },
   link: {
     alignSelf: 'flex-start',
-    paddingVertical: 4,
+    paddingVertical: spacing.xs,
   },
   linkText: {
-    fontSize: 15,
-    color: colors.muted,
+    fontSize: type.small,
+    color: colors.textSecondary,
   },
   dots: {
     flexDirection: 'row',
@@ -174,9 +207,9 @@ const styles = StyleSheet.create({
     width: 6,
     height: 6,
     borderRadius: 3,
-    backgroundColor: 'rgba(17,17,17,0.15)',
+    backgroundColor: colors.dot,
   },
   dotOn: {
-    backgroundColor: colors.ink,
+    backgroundColor: colors.accent,
   },
 });

@@ -12,6 +12,13 @@ export type QuizAnswers = {
 
 export const MAX_FAVORITES = 5;
 
+export const BUDGETS: { level: QuizAnswers['budget']; label: string; detail: string }[] = [
+  { level: 1, label: '$', detail: 'Under $15' },
+  { level: 2, label: '$$', detail: '$15 to 30' },
+  { level: 3, label: '$$$', detail: '$30 to 60' },
+  { level: 4, label: '$$$$', detail: 'Over $60' },
+];
+
 /** True if the signed-in user already has a taste profile (RLS returns only their row). */
 export async function hasTasteProfile(userId: string): Promise<boolean> {
   const { data, error } = await supabase
@@ -66,4 +73,33 @@ export async function saveTasteQuiz(answers: QuizAnswers): Promise<void> {
     p_companions: answers.mostlySolo ? [] : answers.companions,
   });
   if (error) throw error;
+}
+
+/** The user's display name, or null if not set yet (asked once after the quiz). */
+export async function loadDisplayName(userId: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('display_name')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  const name = data?.display_name?.trim();
+  return name ? name : null;
+}
+
+/** Saves the display name. The database function trims it and checks 1 to 40 characters. */
+export async function setDisplayName(name: string): Promise<void> {
+  const { error } = await supabase.rpc('set_display_name', { p_name: name });
+  if (error) throw error;
+}
+
+/** Companion names, oldest first. */
+export async function loadCompanions(userId: string): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('companions')
+    .select('name')
+    .eq('user_id', userId)
+    .order('created_at');
+  if (error) throw error;
+  return (data ?? []).map((row) => row.name as string);
 }

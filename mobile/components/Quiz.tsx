@@ -1,19 +1,20 @@
 import { type ReactNode, useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
-import { type Category, loadCategories, MAX_FAVORITES, type QuizAnswers, saveTasteQuiz } from '../lib/profile';
-import { Chip, colors, Dots, GlassCard, GlassScreen, PrimaryButton, TextLink } from './ui';
+import {
+  BUDGETS,
+  type Category,
+  loadCategories,
+  MAX_FAVORITES,
+  type QuizAnswers,
+  saveTasteQuiz,
+} from '../lib/profile';
+import { colors, radii, type } from '../theme';
+import { Chip, Dots, GlassCard, GlassScreen, PrimaryButton, TextLink } from './ui';
 
 // Taste quiz (P1-08, FR1, FR2). One question per screen (R1). Saved once at the end.
 
 type Budget = QuizAnswers['budget'];
-
-const BUDGETS: { level: Budget; label: string; detail: string }[] = [
-  { level: 1, label: '$', detail: 'Under $15' },
-  { level: 2, label: '$$', detail: '$15 to 30' },
-  { level: 3, label: '$$$', detail: '$30 to 60' },
-  { level: 4, label: '$$$$', detail: 'Over $60' },
-];
 
 const MAX_COMPANIONS = 20;
 const MAX_NAME = 40;
@@ -195,7 +196,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
           <TextInput
             style={styles.input}
             placeholder="Name"
-            placeholderTextColor={colors.muted}
+            placeholderTextColor={colors.textSecondary}
             value={name}
             onChangeText={setName}
             onSubmitEditing={addCompanion}
@@ -266,13 +267,13 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   title: {
-    fontSize: 24,
+    fontSize: type.title,
     fontWeight: '600',
-    color: colors.ink,
+    color: colors.text,
   },
   hint: {
     fontSize: 15,
-    color: colors.muted,
+    color: colors.textSecondary,
     textAlign: 'left',
   },
   wrap: {
@@ -289,23 +290,23 @@ const styles = StyleSheet.create({
   },
   input: {
     flex: 1,
-    backgroundColor: 'rgba(255,255,255,0.8)',
-    borderRadius: 999,
+    backgroundColor: colors.glassStrong,
+    borderRadius: radii.pill,
     borderWidth: 1,
-    borderColor: 'rgba(17,17,17,0.08)',
+    borderColor: colors.hairline,
     paddingVertical: 12,
     paddingHorizontal: 16,
     fontSize: 16,
-    color: colors.ink,
+    color: colors.text,
   },
   add: {
     justifyContent: 'center',
     paddingHorizontal: 18,
-    borderRadius: 999,
-    backgroundColor: colors.ink,
+    borderRadius: radii.pill,
+    backgroundColor: colors.accent,
   },
   addText: {
-    color: '#fff',
+    color: colors.onAccent,
     fontSize: 15,
     fontWeight: '600',
   },
