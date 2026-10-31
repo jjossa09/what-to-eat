@@ -18,6 +18,8 @@ export const colors = {
   starEmpty: 'rgba(31,26,23,0.18)',
   dot: 'rgba(31,26,23,0.15)',
   transparent: 'transparent',
+  scrim: 'rgba(31,26,23,0.28)', // dims the app behind the feedback pop-up
+  accentSoft: 'rgba(242,85,44,0.12)', // warm tint behind the pop-up's emoji
 };
 
 export const blur = {

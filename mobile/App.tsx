@@ -11,6 +11,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import AuthScreen from './components/AuthScreen';
 import Chat from './components/Chat';
 import DockBackground from './components/Dock';
+import FeedbackPrompt from './components/FeedbackPrompt';
 import PressScale from './components/PressScale';
 import NameStep from './components/NameStep';
 import Quiz from './components/Quiz';
@@ -90,6 +91,8 @@ function HomeTabs({ userId }: { userId: string }) {
           {() => <ProfileScreen userId={userId} onSignOut={signOut} />}
         </Tab.Screen>
       </Tab.Navigator>
+      {/* Went? + stars on app open (P1-17) */}
+      <FeedbackPrompt userId={userId} />
     </NavigationContainer>
   );
 }
