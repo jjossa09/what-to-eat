@@ -19,13 +19,31 @@ if TYPE_CHECKING:
     from app.funnel import ShownCard
 
 ANYTHING = "anything"
-RADII = (1500, 5000, 15000)  # FR3 distance chips: Walk, Short drive, Worth the drive
+# FR3 distance chips (P1-19): Close to me, I don't mind. Closer / farther step between them.
+CLOSE_M, DONT_MIND_M = 15000, 35000
+RADII = (CLOSE_M, DONT_MIND_M)
+# Sessions saved before P1-19 used Walk 1500, Short drive 5000, Worth the drive 15000.
+LEGACY_RADII = (1500, 5000)
 MIN_BUDGET, MAX_BUDGET = 1, 4
 DEFAULT_BUDGET = 2
 CRAVINGS: tuple[str, ...] = tuple(c for c in CATEGORY_IDS if c != OTHER)
 
 Budget = Literal[1, 2, 3, 4, "cheaper", "pricier"]
-Distance = Literal[1500, 5000, 15000, "closer", "farther"]
+Distance = Literal[15000, 35000, "closer", "farther"]
+DistanceLevel = Literal["close", "dont_mind"]
+
+
+def radius_level(radius_m: int | None) -> DistanceLevel | None:
+    """Any stored radius as a chip level: old 1500 / 5000 / 15000 rows read as Close to me."""
+    if radius_m is None:
+        return None
+    return "close" if radius_m <= CLOSE_M else "dont_mind"
+
+
+def chip_radius(radius_m: int | None) -> int | None:
+    """A request's radius (current chips or a legacy one) as a current chip radius."""
+    level = radius_level(radius_m)
+    return None if level is None else (CLOSE_M if level == "close" else DONT_MIND_M)
 
 
 def known_categories(values: list[str]) -> list[str]:
@@ -88,7 +106,7 @@ def step_budget(level: int | None, delta: int) -> int:
 
 
 def step_radius(radius: int | None, delta: int, default: int) -> int:
-    base = radius if radius in RADII else min(RADII, key=lambda r: abs(r - default))
+    base = chip_radius(radius if radius is not None else default)
     i = RADII.index(base) + delta
     return RADII[max(0, min(len(RADII) - 1, i))]
 

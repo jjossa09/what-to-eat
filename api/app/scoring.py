@@ -12,10 +12,12 @@ from datetime import date, datetime, timedelta
 
 from app.categories import OTHER, map_category
 from app.places import Candidate, distance_m
+from app.refine import radius_level
 from app.scoring_rules import (
-    CLOSE_FIT,
+    CLOSE_M,
     CRAVING_MATCH_FIT,
     CRAVING_OTHER_FACTOR,
+    DONT_MIND_WEIGHTS,
     FAVORITE_FIT,
     MEAL_SLOT_STARTS,
     NON_FAVORITE_FIT,
@@ -291,16 +293,18 @@ def score_candidate(
 
     radius = context.radius_m or context.search_radius_m
     d_fit = distance_fit(place.distance_m, radius)
-    if d_fit >= CLOSE_FIT:
+    if place.distance_m <= CLOSE_M:
         reasons.append("close")
     elif place.distance_m > radius:
         reasons.append("beyond_radius")
 
+    # "I don't mind" the distance (P1-19): distance weighs less, category more.
+    w = DONT_MIND_WEIGHTS if radius_level(context.radius_m) == "dont_mind" else WEIGHTS
     score = round(
-        WEIGHTS["category"] * cat_fit
-        + WEIGHTS["return"] * ret
-        + WEIGHTS["price"] * p_fit
-        + WEIGHTS["distance"] * d_fit,
+        w["category"] * cat_fit
+        + w["return"] * ret
+        + w["price"] * p_fit
+        + w["distance"] * d_fit,
         SCORE_DIGITS,
     )
     evidence = Evidence(

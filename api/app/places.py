@@ -108,7 +108,12 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
 
 
 async def search(
-    lat: float, lon: float, radius_m: int | None = None, *, client: httpx2.AsyncClient
+    lat: float,
+    lon: float,
+    radius_m: int | None = None,
+    *,
+    bias: bool = False,
+    client: httpx2.AsyncClient,
 ) -> SearchResult:
     """Exactly one Geoapify Places call. Returns named places, nearest first, deduped."""
     settings = get_settings()
@@ -123,7 +128,10 @@ async def search(
         "limit": LIMIT,
         "apiKey": api_key,
     }
-    if radius_m <= PROXIMITY_MAX_RADIUS_M:
+    # Recommendations (bias=True, P1-19): always the nearest 100, so picks are the same for
+    # the same spot (unbiased results come back in no set order). The Map tab's area
+    # searches stay unbiased above PROXIMITY_MAX_RADIUS_M, to spread pins over the view.
+    if bias or radius_m <= PROXIMITY_MAX_RADIUS_M:
         params["bias"] = f"proximity:{lon},{lat}"
     # Exceptions are re-raised without their message or cause: both can include the URL.
     try:

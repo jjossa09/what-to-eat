@@ -19,7 +19,7 @@ from app.scoring import (
     rank,
     return_score,
 )
-from app.scoring_rules import WEIGHTS
+from app.scoring_rules import CLOSE_M, DONT_MIND_WEIGHTS, WEIGHTS
 
 LAT, LON = 33.95, -84.55
 TODAY = date(2026, 10, 29)
@@ -113,6 +113,33 @@ def test_distance_fit():
     assert distance_fit(0, 5000) == 1.0
     assert distance_fit(2500, 5000) == 0.5
     assert distance_fit(6000, 5000) == 0.0
+
+
+def test_dont_mind_weights_sum_to_one_and_lower_distance():
+    assert sum(DONT_MIND_WEIGHTS.values()) == pytest.approx(1.0)
+    assert DONT_MIND_WEIGHTS["distance"] < WEIGHTS["distance"]
+    assert DONT_MIND_WEIGHTS["category"] > WEIGHTS["category"]
+
+
+def test_dont_mind_shrinks_the_distance_gap():
+    # Same category at 1 km and 10 km: about 0.12 apart at Close to me, about 0.02 at
+    # I don't mind (lower weight and a flatter fit over 35 km).
+    places = [cand("near", "thai", 1000), cand("far", "thai", 10000)]
+
+    def gap(radius):
+        r = rank(places, ctx(radius_m=radius, search_radius_m=radius), History())
+        score = {s.place.id: s.score for s in r.ranked}
+        return score["near"] - score["far"]
+
+    assert gap(15000) == pytest.approx(0.12, abs=0.005)
+    assert gap(35000) == pytest.approx(0.0206, abs=0.002)
+
+
+def test_close_reason_is_a_fixed_distance():
+    places = [cand("a", "thai", CLOSE_M), cand("b", "pizza", CLOSE_M + 1)]
+    r = rank(places, ctx(radius_m=35000, search_radius_m=35000), History())
+    reasons = {s.place.id: s.evidence.reasons for s in r.ranked}
+    assert "close" in reasons["a"] and "close" not in reasons["b"]
 
 
 # Cold start: no history, no quiz.

@@ -47,10 +47,10 @@ class Upstream:
         return httpx2.Response(self.status, content=content)
 
 
-def run_search(upstream: Upstream, radius_m=None) -> places.SearchResult:
+def run_search(upstream: Upstream, radius_m=None, bias=False) -> places.SearchResult:
     async def go():
         async with httpx2.AsyncClient(transport=httpx2.MockTransport(upstream)) as client:
-            return await places.search(LAT, LON, radius_m, client=client)
+            return await places.search(LAT, LON, radius_m, bias=bias, client=client)
 
     return asyncio.run(go())
 
@@ -284,7 +284,16 @@ def test_route_validation(query):
     assert upstream.requests == []
 
 
-# Distance chips: proximity bias only for short radii (P1-10)
+# Proximity bias: always for recommendations (P1-19); the Map tab only for short radii (P1-10)
+
+
+@pytest.mark.parametrize("radius_m", [15000, 35000])
+def test_recommendation_search_is_nearest_first_at_any_radius(radius_m):
+    upstream = Upstream()
+    run_search(upstream, radius_m=radius_m, bias=True)
+    (request,) = upstream.requests
+    assert request.url.params["bias"] == f"proximity:{LON},{LAT}"
+    assert request.url.params["limit"] == "100"  # still one call, at most 5 credits
 
 
 @pytest.mark.parametrize("radius_m", [1500, places.PROXIMITY_MAX_RADIUS_M])
