@@ -9,6 +9,7 @@ import { colors, emojiFor, map, spacing, type } from '../theme';
 // Default provider: Apple Maps on iOS (react-native-maps, included in Expo Go).
 
 export const OSM_COPYRIGHT = 'https://www.openstreetmap.org/copyright';
+export const GEOAPIFY = 'https://www.geoapify.com/';
 
 export type MapPlace = { id: string; name: string; lat: number; lon: number; category: string };
 
@@ -20,11 +21,18 @@ export function EmojiPin({ category, selected = false }: { category: string; sel
   );
 }
 
-/** "Powered by Geoapify · © OpenStreetMap contributors" (NFR5), the OSM part linked. */
-export function Attribution({ style }: { style?: object }) {
+/**
+ * "Powered by Geoapify · © OpenStreetMap contributors" (NFR5), both linked: the free plan asks
+ * for a Geoapify link, OSM for one to its copyright page. quiet: smaller and centered, once
+ * under the chat's results. Stays legible (OSM: "easily readable").
+ */
+export function Attribution({ style, quiet = false }: { style?: object; quiet?: boolean }) {
   return (
-    <Text style={[styles.attribution, style]}>
-      Powered by Geoapify ·{' '}
+    <Text style={[styles.attribution, quiet && styles.quiet, style]}>
+      <Text style={styles.link} onPress={() => Linking.openURL(GEOAPIFY)}>
+        Powered by Geoapify
+      </Text>
+      {' · '}
       <Text style={styles.link} onPress={() => Linking.openURL(OSM_COPYRIGHT)}>
         © OpenStreetMap contributors
       </Text>
@@ -119,6 +127,10 @@ const styles = StyleSheet.create({
   attribution: {
     fontSize: type.caption,
     color: colors.textSecondary,
+  },
+  quiet: {
+    fontSize: type.fine,
+    textAlign: 'center',
   },
   link: {
     textDecorationLine: 'underline',

@@ -118,12 +118,15 @@ export type RoundResponse = {
 };
 
 export type ParseResponse = {
-  status: 'ok' | 'not_sure';
+  /** chat: small talk or off-topic; answer is null and reply holds one short line. */
+  status: 'ok' | 'not_sure' | 'chat';
   answer: Change | null;
   source: 'muse' | 'none';
+  /** chat only: may hold a {name} placeholder the app fills in (the name never leaves the app). */
+  reply: string | null;
 };
 
-/** Typed text -> the same change a chip gives, or not sure. One Muse call on the server. */
+/** Typed text -> the same change a chip gives, not sure, or a chat line. One Muse call. */
 export function parseAnswer(questionKey: QuestionKey, text: string): Promise<ParseResponse> {
   return request<ParseResponse>('POST', '/answers/parse', { question_key: questionKey, text });
 }

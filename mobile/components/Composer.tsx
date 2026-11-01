@@ -5,6 +5,7 @@ import { colors, radii, spacing, type } from '../theme';
 import PressScale from './PressScale';
 
 // One-line chat input (P1-21, P1-14): typed answers go to Muse for parsing, never as is.
+// Always shown in the chat (P1-19); disabled while a round loads or after an error.
 
 const MAX_TEXT = 200; // matches the API's limit
 
@@ -12,11 +13,12 @@ type Props = {
   placeholder: string;
   onSend: (text: string) => void;
   busy?: boolean;
+  disabled?: boolean;
 };
 
-export default function Composer({ placeholder, onSend, busy = false }: Props) {
+export default function Composer({ placeholder, onSend, busy = false, disabled = false }: Props) {
   const [text, setText] = useState('');
-  const ready = text.trim().length > 0 && !busy;
+  const ready = text.trim().length > 0 && !busy && !disabled;
 
   function send() {
     if (!ready) return;
@@ -27,7 +29,7 @@ export default function Composer({ placeholder, onSend, busy = false }: Props) {
   return (
     <View style={styles.row}>
       <TextInput
-        style={styles.input}
+        style={[styles.input, disabled && styles.inputOff]}
         placeholder={placeholder}
         placeholderTextColor={colors.textSecondary}
         value={text}
@@ -36,7 +38,7 @@ export default function Composer({ placeholder, onSend, busy = false }: Props) {
         submitBehavior="submit"
         returnKeyType="send"
         maxLength={MAX_TEXT}
-        editable={!busy}
+        editable={!busy && !disabled}
       />
       <PressScale
         onPress={send}
@@ -67,6 +69,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     fontSize: type.body,
     color: colors.text,
+  },
+  inputOff: {
+    opacity: 0.6,
   },
   send: {
     justifyContent: 'center',

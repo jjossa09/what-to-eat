@@ -439,12 +439,14 @@ async def parse_answer(
     user_id: str = Depends(current_user),
     client: httpx2.AsyncClient = Depends(get_http_client),
 ) -> dict:
-    """Typed text -> the same change a chip gives, or not sure. One Muse call, never 5xx."""
+    """Typed text -> the same change a chip gives, not sure, or a chat line (small talk).
+    One Muse call, never 5xx."""
     parsed = await parse_text(body.question_key, body.text, client=client)
     return {
         "status": parsed.status,
         "answer": parsed.change.model_dump() if parsed.change else None,
         "source": parsed.source,
+        "reply": parsed.reply,
     }
 
 

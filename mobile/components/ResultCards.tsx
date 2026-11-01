@@ -137,7 +137,8 @@ export default function ResultCards({
           <TextLink label="None of these" onPress={none} />
         </View>
       )}
-      <Attribution />
+      {/* Once under the results: only the latest round shows it. */}
+      {!readOnly && <Attribution quiet />}
     </View>
   );
 }
