@@ -30,25 +30,40 @@ export const blur = {
   tint: 'light' as const,
 };
 
-// Shared glass frame (P1-19): the map's "What to eat?!" button now, the meal detail card later.
-// Apple-style, like the dock (P1-22): Liquid Glass on iOS 26+, else a blur with the glass tint.
-// The accent gradient sits under the glass and again as a soft rim that fades into the body
-// (no hard stroke, no outer ring). Both run bottom to top (the background runs top to bottom).
+// Shared glass frame (P1-19, P1-24): the map's "What to eat?!" button and the meal detail card.
+// The interior is fully clear glass (Liquid Glass "clear" on iOS 26+, else a light blur with no
+// tint). The accent gradient lives only in the rim: strong at the edge, fading to transparent
+// within rim.width inward; nothing red under the center. Bottom to top (the background runs
+// top to bottom).
 export const frame = {
   gradient: [colors.accentLight, colors.accent, colors.accentDark] as const, // bottom to top
   start: { x: 0.5, y: 1 },
   end: { x: 0.5, y: 0 },
-  underOpacity: 0.4, // the gradient behind the glass
-  glassStyle: 'regular' as const, // Liquid Glass (expo-glass-effect)
-  blurIntensity: blur.intensity, // fallback below iOS 26, as the dock
-  // The rim: stacked bands from the edge inward, each fainter, so it feathers into the body.
-  rim: { width: 9, bands: 6, edgeOpacity: 0.9, innerOpacity: 0.05 },
+  glassStyle: 'clear' as const, // Liquid Glass (expo-glass-effect: 'clear' | 'regular' | 'none')
+  blurIntensity: 20, // fallback below iOS 26: a BlurView with no tint layer
+  // Rim bands from the edge inward; opacity = edgeOpacity * (1 - i / bands) ^ falloff.
+  rim: { width: 11, bands: 12, edgeOpacity: 0.9, falloff: 2 },
   shadowOpacity: 0.18,
   shadowRadius: 14,
   shadowOffsetY: 6,
   fabSize: 92,
   fabTextSize: 15,
   fabLineHeight: 17,
+};
+
+// Meal detail card (P1-24): a centered square that zooms out of the tapped row.
+export const mealCard = {
+  maxSize: 380, // the square's side, at most; else the screen width minus the side gutters
+  openSpring: { stiffness: 260, damping: 26, mass: 1 },
+  closeMs: 220,
+  fadeMs: 180, // Reduce Motion: a fade instead of the zoom
+  swipeCloseDy: 120, // drag down this far, or...
+  swipeCloseVy: 1.0, // ...flick this fast, to close
+  emojiSize: 34,
+  // Behind the card: a light blur of the screen, no darkening, so the clear glass card stands
+  // out the way the map button does over the map.
+  backdropBlur: 14,
+  backdropTint: 'light' as const,
 };
 
 // Chat scroll indicator (P1-19): thicker than the native one, at the screen's right edge.
