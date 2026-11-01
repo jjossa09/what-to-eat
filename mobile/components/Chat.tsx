@@ -11,6 +11,7 @@ import {
   type TranscriptMessage,
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
+import { remindAfterPick } from '../lib/notify';
 import { type Category, loadCategories, loadTastePrior, type TastePrior } from '../lib/profile';
 import { colors, radii, type } from '../theme';
 import ResultCards from './ResultCards';
@@ -282,6 +283,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                 sessionId={sessionId}
                 round={round}
                 onSay={(text) => say('assistant', text)}
+                onPicked={() => remindAfterPick(userId)}
               />
             )}
           </Fragment>

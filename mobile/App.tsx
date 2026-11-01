@@ -16,6 +16,7 @@ import PressScale from './components/PressScale';
 import NameStep from './components/NameStep';
 import Quiz from './components/Quiz';
 import { GlassScreen, PrimaryButton, useDockBottom, useTabBarSpace } from './components/ui';
+import { clearReminder } from './lib/notify';
 import { hasTasteProfile, loadDisplayName } from './lib/profile';
 import { supabase } from './lib/supabase';
 import MapScreen from './screens/MapScreen';
@@ -43,6 +44,7 @@ const navTheme = {
 };
 
 const signOut = () => {
+  clearReminder(); // no reminder for this user after sign-out (P1-16)
   supabase.auth.signOut();
 };
 
