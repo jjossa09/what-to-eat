@@ -50,12 +50,23 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
   }
 }
 
+export type QuestionKey = 'craving' | 'budget' | 'distance' | 'refine' | 'open';
+
+/** What one answer changes (chips or Muse-parsed text). Steps apply on the server. */
+export type Change = {
+  craving: string | null; // category id or 'anything'; null = not mentioned
+  exclude_categories: string[];
+  budget: 1 | 2 | 3 | 4 | 'cheaper' | 'pricier' | null;
+  distance: 1500 | 5000 | 15000 | 'closer' | 'farther' | null;
+  something_else: boolean;
+};
+
 export type TranscriptMessage = {
   role: 'assistant' | 'user';
   body: string;
-  question_key?: 'craving' | 'budget' | 'distance' | 'company';
-  answer?: Record<string, string | number | boolean | null>;
-  input_mode?: 'chip' | 'prefill';
+  question_key?: QuestionKey | 'company';
+  answer?: Record<string, string | number | boolean | null | string[]>;
+  input_mode?: 'chip' | 'text' | 'prefill';
 };
 
 export type RoundRequest = {
@@ -66,6 +77,9 @@ export type RoundRequest = {
   craving: string | null;
   budget_level: number;
   radius_m: 1500 | 5000 | 15000;
+  exclude_categories: string[];
+  /** A follow-up's change; the server applies it to the answers above. */
+  refine?: Partial<Change>;
   solo: boolean | null;
   session_id?: string;
   exclude_ids: string[];
@@ -85,12 +99,34 @@ export type Pick = {
   reason: string;
 };
 
+export type RoundAnswers = {
+  craving: string | null;
+  budget_level: number | null;
+  radius_m: number | null;
+  exclude_categories: string[];
+};
+
 export type RoundResponse = {
   session_id: string | null;
   round: number | null;
   logged: boolean;
+  /** Round 4 without a pick: the best cards already shown (ML10); can be fewer than 3. */
+  best_so_far: boolean;
+  /** The answers this round ran with; the next round continues from them. */
+  answers: RoundAnswers;
   picks: Pick[];
 };
+
+export type ParseResponse = {
+  status: 'ok' | 'not_sure';
+  answer: Change | null;
+  source: 'muse' | 'none';
+};
+
+/** Typed text -> the same change a chip gives, or not sure. One Muse call on the server. */
+export function parseAnswer(questionKey: QuestionKey, text: string): Promise<ParseResponse> {
+  return request<ParseResponse>('POST', '/answers/parse', { question_key: questionKey, text });
+}
 
 export function getRecommendations(body: RoundRequest): Promise<RoundResponse> {
   return request<RoundResponse>('POST', '/recommendations', body);

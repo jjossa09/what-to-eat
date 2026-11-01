@@ -196,6 +196,12 @@ def test_hard_nos_and_rejected_places_are_never_shown():
     assert len(r.top3) == 2
 
 
+def test_excluded_categories_are_never_shown():
+    places = [cand("p", "pizza", 50), cand("b", "burgers", 60), cand("t", "thai", 70)]
+    r = rank(places, ctx(exclude_categories=frozenset({"burgers"})), History())
+    assert {s.place.id for s in r.ranked} == {"p", "t"}
+
+
 def test_fewer_than_three_candidates():
     assert rank([], ctx(), History()).top3 == ()
     assert top_ids(rank([cand("only", "thai", 10)], ctx(), History())) == ["only"]

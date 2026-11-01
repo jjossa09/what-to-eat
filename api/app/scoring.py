@@ -86,6 +86,7 @@ class Context:
     budget_level: int | None = None  # 1-4, overrides the quiz budget
     radius_m: int | None = None  # distance chip: 1500, 5000, 15000
     exclude_ids: frozenset[str] = frozenset()  # rejected earlier in this session (ML10)
+    exclude_categories: frozenset[str] = frozenset()  # ruled out in the chat ("not burgers")
 
 
 def meal_context(local: datetime) -> tuple[str, date, bool]:
@@ -333,13 +334,16 @@ def rank(
     history: History,
     merged_ids: frozenset[str] = frozenset(),
 ) -> Ranking:
-    """Hard no's and rejected places are dropped, the rest scored, top 3 = 2 familiar + 1
-    discovery (ML5). A craving answer makes the craved category the familiar one."""
+    """Hard no's, excluded categories, and rejected places are dropped, the rest scored,
+    top 3 = 2 familiar + 1 discovery (ML5). A craving answer makes the craved category the
+    familiar one."""
     stats = place_stats(history, context.local_date)
     allowed = [
         c
         for c in candidates
-        if c.category not in history.prior.hard_nos and c.id not in context.exclude_ids
+        if c.category not in history.prior.hard_nos
+        and c.category not in context.exclude_categories
+        and c.id not in context.exclude_ids
     ]
     ranked = tuple(
         sorted(

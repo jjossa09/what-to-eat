@@ -12,12 +12,15 @@ import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
-from app import funnel, history, muse, places
+from app import funnel, history, muse, places, refine
+from app.answers import QuestionKey as ParseKey
+from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
 from app.categories import CATEGORY_IDS, OTHER
 from app.config import get_settings
 from app.logs import configure_logging
-from app.scoring import Context, History, meal_context, merge_candidates, rank
+from app.refine import Change
+from app.scoring import Context, History, meal_context, merge_candidates, place_stats, rank
 
 configure_logging()
 app = FastAPI(title="What to eat! API")
@@ -25,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 # FR-R2 upper clamp: 25 miles.
 MAX_RADIUS_M = 40_234
+# ML10: after 3 rounds without a pick, round 4 is the best options so far.
+CAP_ROUND = 4
 
 
 async def get_places_client() -> AsyncIterator[httpx2.AsyncClient]:
@@ -86,7 +91,9 @@ class TranscriptMessage(BaseModel):
     role: Literal["assistant", "user"]
     body: str = Field(min_length=1, max_length=200)
     question_key: QuestionKey | None = None
-    answer: dict[str, str | int | bool | None] | None = Field(default=None, max_length=5)
+    answer: dict[str, str | int | bool | list[str] | None] | None = Field(
+        default=None, max_length=5
+    )
     input_mode: Literal["chip", "text", "voice", "prefill"] | None = None
 
 
@@ -98,6 +105,9 @@ class RecommendationsRequest(BaseModel):
     budget_level: int | None = Field(default=None, ge=1, le=4)
     radius_m: Literal[1500, 5000, 15000] | None = None  # FR3 distance chips
     exclude_ids: list[str] = Field(default_factory=list, max_length=100)
+    # Current answers from the chat ("not burgers"); a follow-up's change is in refine.
+    exclude_categories: list[str] = Field(default_factory=list, max_length=len(refine.CRAVINGS))
+    refine: Change | None = None  # a follow-up (chip or parsed text), applied here
     session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
     solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
@@ -119,6 +129,14 @@ class RecommendationsRequest(BaseModel):
         if value is not None and (value not in CATEGORY_IDS or value == OTHER):
             raise ValueError("unknown category")
         return value
+
+    @field_validator("exclude_categories")
+    @classmethod
+    def known_excludes(cls, values: list[str]) -> list[str]:
+        return refine.known_categories(values)
+
+    def answered_open_question(self) -> bool:
+        return any(m.role == "user" and m.question_key == "open" for m in self.transcript)
 
 
 def offset_zone(local: datetime) -> str:
@@ -157,10 +175,20 @@ async def recommendations(
     auth: tuple[str, str] = Depends(current_auth),
     client: httpx2.AsyncClient = Depends(get_http_client),
 ) -> dict:
-    """One round (FR7, NFR4): places + history in parallel, merge, rank, one Muse call."""
+    """One round (FR7, NFR4): places + history in parallel, merge, rank, one Muse call.
+
+    Later rounds (P1-14, ML10) apply the follow-up's change, skip every place already shown,
+    and log the previous round's cards as rejected. Round 4 without a pick is the best so far.
+    """
     started = time.perf_counter()
     user_id, token = auth
-    radius = body.radius_m or get_settings().PLACES_RADIUS_M
+    default_radius = get_settings().PLACES_RADIUS_M
+    current = refine.Answers(body.craving, body.budget_level, body.radius_m,
+                             tuple(body.exclude_categories))
+    applied = (refine.apply(body.refine, current, default_radius) if body.refine
+               else refine.Applied(current, ()))
+    answers = applied.answers
+    radius = answers.radius_m or default_radius
     slot, local_date, is_weekend = meal_context(body.local_time)
     new_session = funnel.NewSession(
         timezone=body.timezone or offset_zone(body.local_time),
@@ -168,25 +196,38 @@ async def recommendations(
         meal_slot=slot,
         lat=body.lat,
         lon=body.lon,
-        craving=body.craving,
-        budget_level=body.budget_level,
-        radius_m=body.radius_m,
+        craving=answers.craving,
+        budget_level=answers.budget_level,
+        radius_m=answers.radius_m,
         search_radius_m=radius,
         solo=body.solo,
     )
     session_id = str(body.session_id) if body.session_id else None
+    opening = quietly(
+        funnel.open_round(user_id, token, session_id, new_session, client=client), "session"
+    )
     try:
-        result, loaded, ref = await asyncio.gather(
-            places.search(body.lat, body.lon, radius, client=client),
-            load_history(user_id, token, client),
-            quietly(
-                funnel.open_round(user_id, token, session_id, new_session, client=client),
-                "session",
-            ),
-        )
+        if session_id is None:
+            result, loaded, ref = await asyncio.gather(
+                places.search(body.lat, body.lon, radius, client=client),
+                load_history(user_id, token, client),
+                opening,
+            )
+        else:
+            # The session read decides the round (and whether it is the cap) before searching.
+            loaded, ref = await asyncio.gather(load_history(user_id, token, client), opening)
+            if ref and ref.closed:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Session already has an outcome")
+            if ref and ref.round == CAP_ROUND and not body.answered_open_question():
+                return await best_so_far_round(
+                    body, user_id, token, ref, applied, new_session, loaded, started,
+                    client=client,
+                )
+            result = await places.search(body.lat, body.lon, radius, client=client)
     except places.PlacesError as e:
         raise places_error(e) from None
 
+    shown_before = frozenset(c.place_id for c in ref.shown) if ref else frozenset()
     context = Context(
         lat=body.lat,
         lon=body.lon,
@@ -194,24 +235,25 @@ async def recommendations(
         meal_slot=slot,
         is_weekend=is_weekend,
         search_radius_m=result.radius_m,
-        craving=body.craving,
-        budget_level=body.budget_level,
-        radius_m=body.radius_m,
-        exclude_ids=frozenset(body.exclude_ids),
+        craving=answers.craving,
+        budget_level=answers.budget_level,
+        radius_m=answers.radius_m,
+        exclude_ids=frozenset(body.exclude_ids) | shown_before,
+        exclude_categories=frozenset(answers.exclude_categories),
     )
     user_history = loaded or History()
     candidates, merged_ids = merge_candidates(result.places, user_history, context)
     ranking = rank(candidates, context, user_history, merged_ids)
     shown = [pick.scored.place for pick in ranking.top3]
     # The shown places are cached while Muse writes; the events need their rows.
-    # The transcript is written alongside them.
-    transcript = [m.model_dump() for m in body.transcript]
-    reasons, cached, saved = await asyncio.gather(
+    # The transcript and a later round's follow-up writes go alongside them.
+    reasons, cached, saved, followed = await asyncio.gather(
         muse.write_reasons(ranking.top3, client=client),
         quietly(funnel.upsert_places(shown, client=client), "places")
         if ref
         else asyncio.sleep(0),
-        quietly(funnel.log_messages(user_id, token, ref, transcript, client=client), "messages")
+        log_transcript(user_id, token, ref, body, client) if ref else asyncio.sleep(0),
+        log_follow_up(user_id, token, ref, new_session, applied.tags, client)
         if ref
         else asyncio.sleep(0),
     )
@@ -219,6 +261,7 @@ async def recommendations(
         ref
         and cached
         and saved
+        and followed
         and await quietly(
             funnel.log_shown(
                 user_id, token, ref, ranking.top3, reasons.lines, reasons.source, client=client
@@ -241,6 +284,8 @@ async def recommendations(
         "cold_start": ranking.cold_start,
         "radius_m": result.radius_m,
         "truncated": result.truncated,
+        "best_so_far": False,
+        "answers": answers_out(answers),
         "picks": [
             {
                 "rank": pick.rank,
@@ -256,6 +301,150 @@ async def recommendations(
             }
             for pick, reason in zip(ranking.top3, reasons.lines, strict=True)
         ],
+    }
+
+
+def answers_out(answers: refine.Answers) -> dict:
+    """The answers this round ran with, so the app continues from them."""
+    return {
+        "craving": answers.craving,
+        "budget_level": answers.budget_level,
+        "radius_m": answers.radius_m,
+        "exclude_categories": list(answers.exclude_categories),
+    }
+
+
+async def log_transcript(
+    user_id: str, token: str, ref: funnel.RoundRef, body: RecommendationsRequest,
+    client: httpx2.AsyncClient,
+):
+    transcript = [m.model_dump() for m in body.transcript]
+    return await quietly(
+        funnel.log_messages(user_id, token, ref, transcript, client=client), "messages"
+    )
+
+
+async def log_follow_up(
+    user_id: str, token: str, ref: funnel.RoundRef, new: funnel.NewSession,
+    tags: tuple[str, ...], client: httpx2.AsyncClient,
+) -> bool:
+    """Later rounds: the session's current answers, and the previous round's cards as
+    rejected with what changed (never the user's text). True when both were written."""
+    if ref.round == 1:
+        return True
+    previous = ref.round - 1
+    results = await asyncio.gather(
+        quietly(funnel.update_answers(user_id, token, ref.session_id, new, client=client),
+                "answers"),
+        quietly(funnel.log_rejected(user_id, token, ref.session_id, previous,
+                                    ref.shown_in(previous), refine.reject_reason(tags),
+                                    client=client),
+                "rejected"),
+    )
+    return all(results)
+
+
+async def best_so_far_round(
+    body: RecommendationsRequest, user_id: str, token: str, ref: funnel.RoundRef,
+    applied: refine.Applied, new: funnel.NewSession, loaded: History | None, started: float,
+    *, client: httpx2.AsyncClient,
+) -> dict:
+    """The cap (ML10): the best cards already shown that still fit the current answers.
+
+    No places search and no Muse call: the cards and their reasons were shown before (R2).
+    Fewer than 3 can fit; none means the app goes straight to the open question.
+    """
+    answers = applied.answers
+    user_history = loaded or History()
+    known = {pid: s.price_level for pid, s in place_stats(user_history, new.local_date).items()}
+    budget = answers.budget_level or user_history.prior.budget_level
+    best = refine.best_so_far(ref.shown, answers, new.search_radius_m, body.lat, body.lon,
+                              known, budget)
+    cards = [
+        {
+            "place_id": card.place_id,
+            "rank": rank_,
+            "slot": card.slot,
+            "score": card.score,
+            "pick_reason": card.pick_reason or best_reason(meters),
+            "reasons_source": card.reasons_source if card.pick_reason else muse.TEMPLATE,
+        }
+        for rank_, (card, meters) in enumerate(best, start=1)
+    ]
+    saved, followed = await asyncio.gather(
+        log_transcript(user_id, token, ref, body, client),
+        log_follow_up(user_id, token, ref, new, applied.tags, client),
+    )
+    logged = bool(
+        saved
+        and followed
+        and await quietly(funnel.log_shown_rows(user_id, token, ref, cards, client=client),
+                          "shown")
+    )
+    logger.info(
+        "Best-so-far round in %d ms (%d cards)", (time.perf_counter() - started) * 1000, len(best)
+    )
+    return {
+        "session_id": ref.session_id,
+        "round": ref.round,
+        "logged": logged,
+        "history_used": loaded is not None,
+        "reasons_source": "stored",
+        "cold_start": False,
+        "radius_m": new.search_radius_m,
+        "truncated": False,
+        "best_so_far": True,
+        "answers": answers_out(answers),
+        "picks": [
+            {
+                "rank": row["rank"],
+                "slot": card.slot,
+                "id": card.place_id,
+                "name": card.name,
+                "lat": card.lat,
+                "lon": card.lon,
+                "distance_m": meters,
+                "category": card.category,
+                "address": card.address,
+                "reason": row["pick_reason"],
+            }
+            for row, (card, meters) in zip(cards, best, strict=True)
+        ],
+    }
+
+
+def best_reason(meters: int) -> str:
+    return f"One of your best so far, {muse.format_distance(meters)} away."
+
+
+# Answer parsing (P1-21 FR5, P1-14) --------------------------------------------
+
+
+class ParseRequest(BaseModel):
+    question_key: ParseKey
+    text: str = Field(min_length=1, max_length=200)
+
+    @field_validator("text")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("text is blank")
+        return value
+
+
+@app.post("/answers/parse")
+async def parse_answer(
+    body: ParseRequest,
+    user_id: str = Depends(current_user),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    """Typed text -> the same change a chip gives, or not sure. One Muse call, never 5xx."""
+    parsed = await parse_text(body.question_key, body.text, client=client)
+    return {
+        "status": parsed.status,
+        "answer": parsed.change.model_dump() if parsed.change else None,
+        "source": parsed.source,
     }
 
 
