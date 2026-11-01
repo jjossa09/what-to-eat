@@ -214,10 +214,20 @@ def test_same_inputs_same_top3():
     assert [p["id"] for p in first] == [p["id"] for p in second]
 
 
-def test_chip_radius_is_searched():
+@pytest.mark.parametrize("chip", [15000, 35000])
+def test_chip_radius_is_searched_nearest_first(chip):
     up = Upstreams()
-    assert post(up, radius_m=1500).json()["radius_m"] == 1500
-    assert "1500" in up.requests[0].url.params["filter"]
+    assert post(up, radius_m=chip).json()["radius_m"] == chip
+    params = up.requests[0].url.params
+    assert str(chip) in params["filter"]
+    assert params["bias"] == f"proximity:{LON},{LAT}"  # both levels: the nearest 100
+
+
+@pytest.mark.parametrize("legacy", [1500, 5000])
+def test_legacy_radius_reads_as_close_to_me(legacy):
+    up = Upstreams()
+    assert post(up, radius_m=legacy).json()["answers"]["radius_m"] == 15000
+    assert "15000" in up.requests[0].url.params["filter"]
 
 
 def test_craving_makes_it_familiar():
@@ -303,7 +313,7 @@ def test_bad_request(body):
 
 def test_round_one_creates_session_and_logs_shown():
     up = Upstreams()
-    body = post(up, craving="thai", budget_level=2, radius_m=1500,
+    body = post(up, craving="thai", budget_level=2, radius_m=15000,
                 timezone="America/New_York", solo=True).json()
     assert body["logged"] is True
     assert body["session_id"] == SESSION_ID
@@ -313,8 +323,8 @@ def test_round_one_creates_session_and_logs_shown():
     row = json.loads(session.content)
     assert row == {"user_id": USER_ID, "timezone": "America/New_York",
                    "local_date": "2026-10-29", "meal_slot": "dinner", "lat": LAT, "lon": LON,
-                   "craving_category_id": "thai", "budget_level": 2, "radius_m": 1500,
-                   "search_radius_m": 1500, "solo": True}
+                   "craving_category_id": "thai", "budget_level": 2, "radius_m": 15000,
+                   "search_radius_m": 15000, "solo": True}
 
     (events,) = writes(up, "recommendation_events")
     rows = json.loads(events.content)
@@ -469,7 +479,8 @@ TRANSCRIPT = [
     {"role": "user", "body": "$$", "question_key": "budget", "answer": {"budget_level": 2},
      "input_mode": "prefill"},
     {"role": "assistant", "body": "How far?", "question_key": "distance"},
-    {"role": "user", "body": "Walk", "question_key": "distance", "answer": {"radius_m": 1500},
+    {"role": "user", "body": "Close to me", "question_key": "distance",
+     "answer": {"radius_m": 15000},
      "input_mode": "chip"},
 ]
 
@@ -544,7 +555,7 @@ ROUND_1 = [shown_event(1, "node/1", 0.9, "thai", 33.953),
 
 
 def follow_up(up: Upstreams, **body):
-    base = {"session_id": SESSION_ID, "budget_level": 2, "radius_m": 5000}
+    base = {"session_id": SESSION_ID, "budget_level": 2, "radius_m": 35000}
     return post(up, **{**base, **body})
 
 
@@ -583,10 +594,10 @@ def test_follow_up_logs_previous_round_as_rejected_with_tags():
 def test_cheaper_steps_the_budget_down_and_updates_the_session():
     up = Upstreams(shown=ROUND_1)
     body = follow_up(up, craving="thai", refine={"budget": "cheaper"}).json()
-    assert body["answers"] == {"craving": "thai", "budget_level": 1, "radius_m": 5000,
+    assert body["answers"] == {"craving": "thai", "budget_level": 1, "radius_m": 35000,
                                "exclude_categories": []}
     assert session_patch(up) == {"craving_category_id": "thai", "budget_level": 1,
-                                 "radius_m": 5000, "search_radius_m": 5000}
+                                 "radius_m": 35000, "search_radius_m": 35000}
 
 
 def test_cheaper_stops_at_one_dollar():
@@ -597,9 +608,9 @@ def test_cheaper_stops_at_one_dollar():
 def test_closer_searches_the_next_smaller_radius():
     up = Upstreams(shown=ROUND_1)
     body = follow_up(up, refine={"distance": "closer"}).json()
-    assert body["answers"]["radius_m"] == 1500
+    assert body["answers"]["radius_m"] == 15000
     places_call = next(r for r in up.requests if r.url.host == "api.geoapify.com")
-    assert "1500" in places_call.url.params["filter"]
+    assert "15000" in places_call.url.params["filter"]
 
 
 def test_not_a_category_drops_it():
@@ -625,7 +636,7 @@ def test_something_else_drops_the_craving():
 def test_something_else_with_anything_keeps_settings_and_shows_new_places():
     up = Upstreams(shown=[shown_event(1, "node/1", 0.9, "thai", 33.953)])
     body = follow_up(up, craving=None, refine={"something_else": True}).json()
-    assert body["answers"] == {"craving": None, "budget_level": 2, "radius_m": 5000,
+    assert body["answers"] == {"craving": None, "budget_level": 2, "radius_m": 35000,
                                "exclude_categories": []}
     ids = [p["id"] for p in body["picks"]]
     assert "node/1" not in ids and len(ids) == 3
@@ -676,7 +687,7 @@ THREE_ROUNDS = [
     *ROUND_1,
     shown_event(2, "node/50", 0.85, "thai", 33.98, reason="Far but good."),
     shown_event(2, "node/6", 0.4, "pizza", 33.954),
-    shown_event(3, "node/7", 0.7, "korean", 33.97),  # ~2.2 km: past a walk
+    shown_event(3, "node/7", 0.7, "korean", 34.10),  # ~16.7 km: past Close to me
     shown_event(3, "node/8", 0.3, "indian", 33.958),
 ]
 
@@ -702,9 +713,9 @@ def test_round_four_shows_best_so_far_without_places_or_muse():
 
 
 def test_best_so_far_filters_by_current_answers():
-    # Not thai drops node/1 and node/50; a walk (1500 m) drops node/7.
+    # Not thai drops node/1 and node/50; Close to me (15 km) drops node/7.
     up = Upstreams(shown=THREE_ROUNDS)
-    body = follow_up(up, radius_m=1500, refine={"exclude_categories": ["thai"]}).json()
+    body = follow_up(up, radius_m=15000, refine={"exclude_categories": ["thai"]}).json()
     assert [p["id"] for p in body["picks"]] == ["node/2", "node/3", "node/6"]
 
 
@@ -717,7 +728,7 @@ def test_best_so_far_drops_known_prices_above_budget():
 
 def test_best_so_far_fewer_than_three_shows_what_is_left():
     up = Upstreams(shown=THREE_ROUNDS)
-    body = follow_up(up, radius_m=1500, refine={"exclude_categories": ["thai", "pizza"]}).json()
+    body = follow_up(up, radius_m=15000, refine={"exclude_categories": ["thai", "pizza"]}).json()
     assert body["best_so_far"] is True
     assert [p["id"] for p in body["picks"]] == ["node/3", "node/8"]
     assert [r["rank"] for r in shown_inserts(up)] == [1, 2]

@@ -22,22 +22,27 @@ export const colors = {
   accentSoft: 'rgba(242,85,44,0.12)', // warm tint behind the pop-up's emoji
   accentDark: '#B23A17', // text on light glass over a map (about 9:1 on white)
   accentLight: '#FF8A5C',
-  veil: '#FFFFFF', // the glass frame's white veil (opacity in frame.veil)
-  ring: '#FFFFFF', // thin outer ring around floating glass
   scrollThumb: 'rgba(31,26,23,0.32)',
 };
 
+export const blur = {
+  intensity: 40,
+  tint: 'light' as const,
+};
+
 // Shared glass frame (P1-19): the map's "What to eat?!" button now, the meal detail card later.
-// Accent gradient on the border only, running bottom to top (the background runs top to
-// bottom). The glass is a blur plus a white radial veil: strongest at the edge, light inside.
+// Apple-style, like the dock (P1-22): Liquid Glass on iOS 26+, else a blur with the glass tint.
+// The accent gradient sits under the glass and again as a soft rim that fades into the body
+// (no hard stroke, no outer ring). Both run bottom to top (the background runs top to bottom).
 export const frame = {
   gradient: [colors.accentLight, colors.accent, colors.accentDark] as const, // bottom to top
   start: { x: 0.5, y: 1 },
   end: { x: 0.5, y: 0 },
-  borderWidth: 3.5,
-  blurIntensity: 30,
-  veil: { center: 0.12, mid: 0.3, edge: 0.78, midOffset: 0.6 }, // white opacity by radius
-  ringWidth: 1.5,
+  underOpacity: 0.4, // the gradient behind the glass
+  glassStyle: 'regular' as const, // Liquid Glass (expo-glass-effect)
+  blurIntensity: blur.intensity, // fallback below iOS 26, as the dock
+  // The rim: stacked bands from the edge inward, each fainter, so it feathers into the body.
+  rim: { width: 9, bands: 6, edgeOpacity: 0.9, innerOpacity: 0.05 },
   shadowOpacity: 0.18,
   shadowRadius: 14,
   shadowOffsetY: 6,
@@ -54,11 +59,6 @@ export const scrollBar = {
   fadeInMs: 120,
   fadeOutMs: 300,
   holdMs: 700, // visible this long after scrolling stops
-};
-
-export const blur = {
-  intensity: 40,
-  tint: 'light' as const,
 };
 
 // Floating tab bar (iOS 26 dock style): a capsule inset from the screen edges.
@@ -79,6 +79,15 @@ export const motion = {
   release: { stiffness: 300, damping: 22, mass: 1 },
   // One small bounce when the Map tab opens (the "What to eat?!" button).
   bounce: { scale: 1.08, upMs: 140, settle: { stiffness: 260, damping: 14, mass: 1 } },
+};
+
+// "…" bubble while a typed message is parsed (P1-19): three dots pulsing in turn.
+export const typing = {
+  dotSize: 7,
+  gap: 5,
+  stepMs: 180, // delay between dots
+  pulseMs: 360, // one fade up or down
+  dimOpacity: 0.3,
 };
 
 // Maps (P1-13): emoji pins, the chat's mini map, the Map tab's starting zoom.

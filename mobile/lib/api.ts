@@ -57,7 +57,7 @@ export type Change = {
   craving: string | null; // category id or 'anything'; null = not mentioned
   exclude_categories: string[];
   budget: 1 | 2 | 3 | 4 | 'cheaper' | 'pricier' | null;
-  distance: 1500 | 5000 | 15000 | 'closer' | 'farther' | null;
+  distance: 15000 | 35000 | 'closer' | 'farther' | null; // Close to me, I don't mind (P1-19)
   something_else: boolean;
 };
 
@@ -76,7 +76,7 @@ export type RoundRequest = {
   timezone?: string;
   craving: string | null;
   budget_level: number;
-  radius_m: 1500 | 5000 | 15000;
+  radius_m: 15000 | 35000;
   exclude_categories: string[];
   /** A follow-up's change; the server applies it to the answers above. */
   refine?: Partial<Change>;

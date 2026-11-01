@@ -1,6 +1,6 @@
 # What to eat! Requirements
 
-Version 1.5 | October 28, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
+Version 1.6 | November 1, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
 
 ## Overview
 
@@ -29,7 +29,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 
 | ID | Requirement | Phase |
 |---|---|---|
-| FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 3 chips: Walk, Short drive, Worth the drive. | 1 |
+| FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 2 chips: Close to me, I don't mind. | 1 |
 | FR4 | Exactly 3 questions (3 messages) before the first round of recommendations. The ML6 confidence gate chooses which 3; Muse only phrases them. Answers the models can predict are pre-filled and editable. Cold start (Phase 1): the gate runs on the quiz prior. | 1-2 |
 | FR5 | Free-text answers are parsed by Muse into the same structured answers as quick-reply chips (ML7). | 1 |
 
@@ -96,7 +96,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 | Price levels | $ = under $15; $$ = $15 to $30; $$$ = over $30 to $60; $$$$ = over $60 (per own meal). |
 | Price fit | Compares levels: candidate at or below the budget level = full fit; one level above = half; two or more above = none; unknown = half. A place's known price = the user's most recent price tap or backfill amount for it. |
 | Refinement cap (ML10) | 3 rounds without a pick. |
-| Distance chips (FR3) | Walk = 1,500 m; Short drive = 5,000 m; Worth the drive = 15,000 m. |
+| Distance chips (FR3) | Close to me = 15,000 m; I don't mind = 35,000 m (distance weight 0.08 instead of 0.20, category 0.52). Sessions saved with 1,500 / 5,000 / 15,000 read as Close to me. |
 | Cold-start radius (FR-R3) | 5 km. |
 
 ### Data
@@ -155,6 +155,10 @@ The search area should grow more accurate to the user as usage increases. Values
 - OSM cuisine tags are often missing. The name-keyword and chains pass (ML2) reduces this; places matching neither fall to Other and score lower on category fit.
 - Free-tier cold starts can eat into the 8 second budget (NFR4). Cold-start latency is measured at deploy.
 - The radius thresholds (80th percentile, 1 to 25 miles, 8 candidates) and all starting values above are untested guesses, to be tuned after 2 to 3 days of live data.
+
+## Changes from v1.5
+
+- FR3: distance chips are Close to me (15 km) and I don't mind (35 km); recommendations always search nearest first.
 
 ## Changes from v1.4
 

@@ -38,6 +38,7 @@ import { colors, radii, spacing, type } from '../theme';
 import Composer from './Composer';
 import ResultCards from './ResultCards';
 import ScrollWithBar from './ScrollWithBar';
+import TypingBubble from './TypingBubble';
 import { Chip, GlassScreen } from './ui';
 
 // Chat (P1-09) with the fixed Phase 1 questions (P1-10): craving, budget, distance.
@@ -48,11 +49,14 @@ import { Chip, GlassScreen } from './ui';
 // P1-19: the composer is always there. After a pick or None of these, typed text is the craving
 // of a new search (budget and distance asked again, preselected). Small talk gets one short
 // line back from the same parse call; {name} in it is filled in here, never sent to Muse.
+// Round 2: the user's bubble shows at once, with "…" until a typed reply comes back ("Finding
+// spots…" for rounds). Errors are a line in the thread under the user's bubble. Distance is
+// two chips: Close to me (15 km) and I don't mind (35 km).
 
 type Step = 'craving' | 'budget' | 'distance' | 'loading' | 'results' | 'error';
 type FirstKey = 'craving' | 'budget' | 'distance';
 type Problem = 'denied' | 'nofix' | 'network' | 'server' | 'auth' | 'load';
-type Bubble = { id: number; role: 'assistant' | 'user'; text: string };
+type Bubble = { id: number; role: 'assistant' | 'user'; text: string; error?: boolean };
 type Radius = RoundRequest['radius_m'];
 type Round = { bubbleId: number; picks: Pick[]; sessionId: string | null; round: number | null };
 type Answers = { craving: string | null; budget: number; radius: Radius; exclude: string[] };
@@ -71,17 +75,24 @@ const BUDGETS = [
   { level: 4, label: '$$$$' },
 ] as const;
 
+const CLOSE: Radius = 15000;
 const DISTANCES: { radius: Radius; label: string }[] = [
-  { radius: 1500, label: 'Walk' },
-  { radius: 5000, label: 'Short drive' },
-  { radius: 15000, label: 'Worth the drive' },
+  { radius: CLOSE, label: 'Close to me' },
+  { radius: 35000, label: "I don't mind" },
 ];
 
-const FOLLOW_UPS: { label: string; change: Partial<Change> }[] = [
-  { label: 'Cheaper', change: { budget: 'cheaper' } },
-  { label: 'Closer', change: { distance: 'closer' } },
-  { label: 'Something else', change: { something_else: true } },
-];
+type FollowUp = { label: string; change: Partial<Change> };
+const CHEAPER: FollowUp = { label: 'Cheaper', change: { budget: 'cheaper' } };
+const CLOSER: FollowUp = { label: 'Closer', change: { distance: 'closer' } };
+const FARTHER: FollowUp = { label: "I don't mind the distance", change: { distance: 'farther' } };
+const SOMETHING_ELSE: FollowUp = { label: 'Something else', change: { something_else: true } };
+
+/** Follow-up chips: an empty round only offers going farther (or something else at 35 km). */
+function followUps(radius: Radius, empty: boolean): FollowUp[] {
+  const close = radius === CLOSE;
+  if (empty) return [close ? FARTHER : SOMETHING_ELSE];
+  return [CHEAPER, close ? FARTHER : CLOSER, SOMETHING_ELSE];
+}
 
 const NOT_SURE = "Didn't catch that. Tap one below.";
 
@@ -127,6 +138,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [user, setUser] = useState<Position | null>(null);
   const [decided, setDecided] = useState(false);
   const [parsing, setParsing] = useState(false);
+  // The last round's radius and whether it came back empty: decides the follow-up chips.
+  const [lastRound, setLastRound] = useState<{ radius: Radius; empty: boolean }>({ radius: CLOSE, empty: false });
+  // A typed message that couldn't reach the server: "Try again" resends it (bubble stays).
+  const [unsent, setUnsent] = useState<{ text: string; problem: Problem } | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [keyboard, setKeyboard] = useState(false);
   // Pre-selected chips for later questions, from a typed answer that covered them (FR4).
@@ -134,7 +149,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   // Unsent chat lines: sent with the next round, then cleared (R3).
   const transcript = useRef<TranscriptMessage[]>([]);
-  const answers = useRef<Answers>({ craving: null, budget: 2, radius: 1500, exclude: [] });
+  const answers = useRef<Answers>({ craving: null, budget: 2, radius: CLOSE, exclude: [] });
   const sessionId = useRef<string | null>(null);
   const shownIds = useRef<string[]>([]);
   const pendingChange = useRef<Partial<Change> | undefined>(undefined);
@@ -145,10 +160,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const nextId = useRef(0);
   const scroll = useRef<ScrollViewInstance>(null);
 
-  function say(role: Bubble['role'], text: string): number {
+  function say(role: Bubble['role'], text: string, error = false): number {
     nextId.current += 1;
     const id = nextId.current;
-    setBubbles((prev) => [...prev, { id, role, text }]);
+    setBubbles((prev) => [...prev, { id, role, text, error }]);
     return id;
   }
 
@@ -164,7 +179,9 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     mode: 'chip' | 'text' | 'prefill',
     body: string = shown,
   ) {
-    say('user', shown);
+    // Typed text is already on screen (sent at once); only chips add their bubble here.
+    if (mode !== 'text') say('user', shown);
+    setUnsent(null);
     transcript.current.push({ role: 'user', body, question_key: key, answer: value, input_mode: mode });
   }
 
@@ -186,6 +203,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       })
       .catch(() => {
         if (!live) return;
+        nextId.current += 1;
+        setBubbles([{ id: nextId.current, role: 'assistant', text: PROBLEM_TEXT.load, error: true }]);
         setProblem('load');
         setStep('error');
       });
@@ -251,7 +270,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     });
   }
 
-  /** A parsed first answer: echoed as the matching chip. */
+  /** A parsed first answer: the typed bubble stays; the answer is logged like its chip. */
   function typedFirst(key: FirstKey, a: Change, text: string) {
     prefill(key, a);
     if (key === 'craving') {
@@ -268,7 +287,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     } else if (key === 'distance' && typeof a.distance === 'number') {
       const radius = a.distance;
       answers.current.radius = radius;
-      record('distance', DISTANCES.find((d) => d.radius === radius)?.label ?? 'Walk', a, 'text', text);
+      record('distance', DISTANCES.find((d) => d.radius === radius)?.label ?? 'Close to me', a, 'text', text);
       fetchRound();
     }
   }
@@ -284,6 +303,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseFollowUp(change: Partial<Change>, label: string) {
     if (busy.current) return;
+    setUnsent(null);
     followUp(change, label, 'chip');
   }
 
@@ -303,25 +323,40 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     setStep('craving');
   }
 
-  async function sendText(text: string) {
+  /** Typed text: the bubble shows now, "…" until the parse comes back. */
+  function sendText(text: string) {
     if (busy.current) return;
+    say('user', text);
+    parseText(text);
+  }
+
+  async function parseText(text: string) {
+    if (busy.current) return;
+    setUnsent(null);
     const fresh = step === 'results' && decided; // the text is a new search's craving
     const first: FirstKey | null = fresh ? 'craving' : isFirst(step) ? step : null;
     const key: QuestionKey = first ?? (nextIsOpen.current ? 'open' : 'refine');
     busy.current = true;
     setParsing(true);
     let result: ParseResponse | null = null;
+    let failed: Problem | null = null;
     try {
       result = await parseAnswer(key, text);
-    } catch {
-      result = null; // offline or a server error: same as not sure, the chips still work
+    } catch (e) {
+      const kind = e instanceof ApiError ? e.kind : 'network';
+      failed = kind === 'auth' ? 'auth' : 'network';
     } finally {
       busy.current = false;
       setParsing(false);
     }
+    if (failed) {
+      // The bubble stays; the error line goes under it, and Try again resends the text.
+      say('assistant', PROBLEM_TEXT[failed], true);
+      setUnsent({ text, problem: failed });
+      return;
+    }
     // Small talk: one line back, the question and its chips stay. Not an answer, not logged.
     if (result?.status === 'chat' && result.reply) {
-      say('user', text);
       say('assistant', withName(result.reply, name));
       return;
     }
@@ -331,7 +366,6 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       // Not sure, but it may have answered later questions (FR4 prefill).
       const partial = result?.status === 'not_sure' ? result.answer : null;
       if (partial && first) prefill(first, partial);
-      say('user', text);
       say('assistant', NOT_SURE);
       return;
     }
@@ -356,8 +390,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     if (!where.ok) {
       location.current = null; // the next try asks again
       busy.current = false;
-      setProblem(where.reason === 'denied' ? 'denied' : 'nofix');
-      setStep('error');
+      fail(where.reason === 'denied' ? 'denied' : 'nofix');
       return;
     }
     try {
@@ -390,6 +423,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       shownIds.current = [...shownIds.current, ...result.picks.map((p) => p.id)];
       setUser(where.position);
       setDecided(false);
+      setLastRound({ radius: answers.current.radius, empty: !result.best_so_far && result.picks.length === 0 });
       const line = roundLine(result, firstOfSearch.current);
       firstOfSearch.current = false;
       const id = line ? say('assistant', line) : null;
@@ -404,11 +438,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       setStep('results');
     } catch (e) {
       const kind = e instanceof ApiError ? e.kind : 'network';
-      setProblem(kind === 'conflict' || kind === 'notfound' ? 'server' : kind);
-      setStep('error');
+      fail(kind === 'conflict' || kind === 'notfound' ? 'server' : kind);
     } finally {
       busy.current = false;
     }
+  }
+
+  /** A failed step: the error line in the thread, the fix as chips below. */
+  function fail(kind: Problem) {
+    say('assistant', PROBLEM_TEXT[kind], true);
+    setProblem(kind);
+    setStep('error');
   }
 
   function retry() {
@@ -425,10 +465,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           if (quiz.budget) answers.current.budget = quiz.budget;
           ask('craving');
         })
-        .catch(() => {
-          setProblem('load');
-          setStep('error');
-        });
+        .catch(() => fail('load'));
     } else {
       fetchRound(pendingChange.current);
     }
@@ -467,7 +504,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       />
     ));
   } else if (step === 'results' && !decided) {
-    chips = FOLLOW_UPS.map((f) => (
+    chips = followUps(lastRound.radius, lastRound.empty).map((f) => (
       <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label)} />
     ));
   } else if (step === 'error' && problem) {
@@ -478,6 +515,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       </>
     );
   }
+
+  // A typed message that failed to send: its fix comes first, the step's chips still work.
+  const resend = unsent && (
+    <Chip
+      key="resend"
+      label={unsent.problem === 'auth' ? 'Sign in' : 'Try again'}
+      onPress={unsent.problem === 'auth' ? onSignOut : () => parseText(unsent.text)}
+    />
+  );
 
   const placeholder =
     step === 'results' ? (decided ? 'Craving something else?' : 'Or type what to change') : 'Or type it';
@@ -503,7 +549,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
             return (
               <Fragment key={b.id}>
                 <View style={[styles.bubble, b.role === 'user' ? styles.mine : styles.theirs]}>
-                  <Text style={[styles.bubbleText, b.role === 'user' && styles.mineText]}>{b.text}</Text>
+                  <Text
+                    style={[styles.bubbleText, b.role === 'user' && styles.mineText, b.error && styles.errorText]}
+                  >
+                    {b.text}
+                  </Text>
                 </View>
                 {r && (
                   <ResultCards
@@ -521,6 +571,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               </Fragment>
             );
           })}
+          {parsing && <TypingBubble />}
           {step === 'loading' && (
             <View style={[styles.bubble, styles.theirs]}>
               <Text style={styles.bubbleText}>Finding spots…</Text>
@@ -533,8 +584,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           onPress={Keyboard.dismiss}
           style={[styles.controls, { marginBottom: keyboard ? spacing.sm : bottom }]}
         >
-          {step === 'error' && problem && <Text style={styles.problemText}>{PROBLEM_TEXT[problem]}</Text>}
-          {chips && <View style={styles.chips}>{chips}</View>}
+          {(resend || chips) && (
+            <View style={styles.chips}>
+              {resend}
+              {chips}
+            </View>
+          )}
           <Composer placeholder={placeholder} onSend={sendText} busy={parsing} disabled={composerOff} />
         </Pressable>
       </KeyboardAvoidingView>
@@ -589,8 +644,7 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: spacing.sm,
   },
-  problemText: {
-    fontSize: type.small,
+  errorText: {
     color: colors.error,
   },
 });

@@ -83,16 +83,16 @@ def endpoint(meta: Meta, authed=True, **body):
 def test_spicy_cheap_close_fills_budget_and_distance_but_not_a_guessed_craving():
     # "Spicy" names no category: the craving question is not answered by it.
     # The budget and distance it did give come back to pre-fill those questions.
-    meta = Meta(output(budget="1", distance="walk"))
+    meta = Meta(output(budget="1", distance="close"))
     result = parse(meta, "craving", "something spicy, cheap, close by")
     assert result.status == answers.NOT_SURE
-    assert result.change == refine.Change(budget=1, distance=1500)
+    assert result.change == refine.Change(budget=1, distance=15000)
 
 
 def test_one_message_can_fill_all_three():
-    result = parse(Meta(output(craving="thai", budget="1", distance="walk")))
+    result = parse(Meta(output(craving="thai", budget="1", distance="close")))
     assert result.status == answers.OK and result.source == muse.MUSE
-    assert result.change == refine.Change(craving="thai", budget=1, distance=1500)
+    assert result.change == refine.Change(craving="thai", budget=1, distance=15000)
 
 
 @pytest.mark.parametrize("key, out, expected", [
@@ -100,9 +100,9 @@ def test_one_message_can_fill_all_three():
     ("craving", output(craving="anything", exclude=["burgers"]),
      refine.Change(craving="anything", exclude_categories=["burgers"])),
     ("budget", output(budget="3"), refine.Change(budget=3)),
-    ("distance", output(distance="worth_the_drive"), refine.Change(distance=15000)),
-    ("distance", output(distance="short_drive", budget="2"),
-     refine.Change(distance=5000, budget=2)),
+    ("distance", output(distance="dont_mind"), refine.Change(distance=35000)),
+    ("distance", output(distance="close", budget="2"),
+     refine.Change(distance=15000, budget=2)),
 ])
 def test_first_questions(key, out, expected):
     assert parse(Meta(out), key).change == expected

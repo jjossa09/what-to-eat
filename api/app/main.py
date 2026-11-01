@@ -103,7 +103,9 @@ class RecommendationsRequest(BaseModel):
     local_time: datetime  # the device's local time; sets the meal slot and date
     craving: str | None = None  # ML2 category id
     budget_level: int | None = Field(default=None, ge=1, le=4)
-    radius_m: Literal[1500, 5000, 15000] | None = None  # FR3 distance chips
+    # FR3 distance chips: 15000 Close to me, 35000 I don't mind. Legacy 1500 / 5000 (before
+    # P1-19) are still accepted and read as Close to me.
+    radius_m: Literal[1500, 5000, 15000, 35000] | None = None
     exclude_ids: list[str] = Field(default_factory=list, max_length=100)
     # Current answers from the chat ("not burgers"); a follow-up's change is in refine.
     exclude_categories: list[str] = Field(default_factory=list, max_length=len(refine.CRAVINGS))
@@ -183,7 +185,7 @@ async def recommendations(
     started = time.perf_counter()
     user_id, token = auth
     default_radius = get_settings().PLACES_RADIUS_M
-    current = refine.Answers(body.craving, body.budget_level, body.radius_m,
+    current = refine.Answers(body.craving, body.budget_level, refine.chip_radius(body.radius_m),
                              tuple(body.exclude_categories))
     applied = (refine.apply(body.refine, current, default_radius) if body.refine
                else refine.Applied(current, ()))
@@ -209,7 +211,7 @@ async def recommendations(
     try:
         if session_id is None:
             result, loaded, ref = await asyncio.gather(
-                places.search(body.lat, body.lon, radius, client=client),
+                places.search(body.lat, body.lon, radius, bias=True, client=client),
                 load_history(user_id, token, client),
                 opening,
             )
@@ -223,7 +225,7 @@ async def recommendations(
                     body, user_id, token, ref, applied, new_session, loaded, started,
                     client=client,
                 )
-            result = await places.search(body.lat, body.lon, radius, client=client)
+            result = await places.search(body.lat, body.lon, radius, bias=True, client=client)
     except places.PlacesError as e:
         raise places_error(e) from None
 

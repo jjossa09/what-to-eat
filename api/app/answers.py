@@ -34,9 +34,8 @@ MAX_REPLY_CHARS = 80
 
 BUDGETS = {"1": 1, "2": 2, "3": 3, "4": 4, "cheaper": "cheaper", "pricier": "pricier"}
 DISTANCES = {
-    "walk": 1500,
-    "short_drive": 5000,
-    "worth_the_drive": 15000,
+    "close": 15000,
+    "dont_mind": 35000,
     "closer": "closer",
     "farther": "farther",
 }
@@ -45,7 +44,7 @@ RELATIVE = frozenset({"cheaper", "pricier", "closer", "farther"})
 QUESTIONS = {
     "craving": "What are you craving?",
     "budget": "Budget this time? ($ to $$$$)",
-    "distance": "How far? (walk, short drive, worth the drive)",
+    "distance": "How far? (close to me, or I don't mind)",
     "refine": "Follow-up after seeing 3 restaurant picks: what should change?",
     "open": "Follow-up after the best picks so far: what would make it right?",
 }
@@ -86,8 +85,8 @@ SYSTEM_PROMPT = (
     "exclude: categories they rule out (not burgers, no pizza). "
     'budget: "1" to "4" for $ to $$$$ (cheap is "1"), "cheaper" or "pricier" for a step '
     'from now, else "none". '
-    'distance: "walk", "short_drive", "worth_the_drive", or "closer"/"farther" for a step '
-    'from now, else "none". '
+    'distance: "close" (nearby, walking, a short drive), "dont_mind" (any distance, worth '
+    'the drive), or "closer"/"farther" for a step from now, else "none". '
     "something_else: true only if they want different options without saying what. "
     "understood: false if the message does not answer the question. Never guess. "
     'intent: "answer" if it answers anything above; "small_talk" for greetings, thanks, or '

@@ -27,8 +27,17 @@ CRAVING_OTHER_FACTOR = 0.25
 PRICE_FIT_BY_LEVELS_ABOVE: tuple[float, ...] = (1.0, 0.5, 0.0)  # 0, 1, 2 or more above
 PRICE_FIT_UNKNOWN = 0.5  # no known price for the place, or no budget
 
-# Distance fit = max(0, 1 - distance / radius). "close" reason at or above this fit.
-CLOSE_FIT = 0.7
+# "I don't mind" (P1-19, 35 km): distance counts less and category more; still sums to 1.
+DONT_MIND_WEIGHTS: dict[str, float] = {
+    "category": 0.52,
+    "return": 0.25,
+    "price": 0.15,
+    "distance": 0.08,
+}
+
+# Distance fit = max(0, 1 - distance / radius). The "close" reason is a fixed distance, so a
+# 35 km radius never calls 10 km close.
+CLOSE_M = 3000
 
 # Meal slots by local start hour (REQUIREMENTS, Meal slot). Late runs past midnight and
 # counts on the previous day's local date.
