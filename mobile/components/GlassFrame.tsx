@@ -7,14 +7,12 @@ import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
 import { useReduceTransparency } from '../lib/accessibility';
 import { blur, colors, frame } from '../theme';
 
-// Shared glass frame (P1-19): the map's "What to eat?!" button, and later the meal detail card,
+// Shared glass frame (P1-19, P1-24): the map's "What to eat?!" button and the meal detail card,
 // so both share one style. Apple-style, like the dock (P1-22). Back to front, clipped to the
 // shape:
-//   1. the accent gradient (bottom to top) at low opacity, under the glass;
-//   2. the glass: Liquid Glass on iOS 26+, else a BlurView with the glass tint (the dock's
-//      fallback), which both pick up the gradient beneath;
-//   3. a soft rim: the same gradient in stacked bands from the edge inward, each fainter, so it
-//      fades into the body with no hard line.
+//   1. fully clear glass: Liquid Glass "clear" on iOS 26+, else a light BlurView with no tint;
+//   2. the rim: the accent gradient (bottom to top) in stacked bands from the edge inward,
+//      fading to transparent within rim.width. Nothing red under the center.
 // Reduce Transparency: a plain frosted fill under the rim. Values in theme.ts (frame).
 
 // Checked once, as in the dock: isGlassEffectAPIAvailable guards iOS 26 betas without the API.
@@ -29,18 +27,15 @@ type Props = {
   style?: ViewStyle;
 };
 
-/** Rim bands, outermost first: inset, width, and opacity (eased from the edge inward). */
+/** Rim bands, outermost first: inset, width, and opacity (eased to about 0 at rim.width). */
 function rimBands() {
-  const { width, bands, edgeOpacity, innerOpacity } = frame.rim;
+  const { width, bands, edgeOpacity, falloff } = frame.rim;
   const step = width / bands;
-  return Array.from({ length: bands }, (_, i) => {
-    const t = bands === 1 ? 0 : i / (bands - 1);
-    return {
-      inset: i * step + step / 2,
-      width: step,
-      opacity: edgeOpacity * Math.pow(innerOpacity / edgeOpacity, t),
-    };
-  });
+  return Array.from({ length: bands }, (_, i) => ({
+    inset: i * step + step / 2,
+    width: step,
+    opacity: edgeOpacity * Math.pow(1 - i / bands, falloff),
+  }));
 }
 
 const BANDS = rimBands();
@@ -74,23 +69,10 @@ export default function GlassFrame({ children, shape, size, radius = 0, style }:
       <View style={clip}>
         {reduce ? (
           <View style={[StyleSheet.absoluteFill, styles.solid]} />
+        ) : LIQUID_GLASS ? (
+          <GlassView glassEffectStyle={frame.glassStyle} style={[StyleSheet.absoluteFill, { borderRadius: r }]} />
         ) : (
-          <>
-            {box.w > 0 && (
-              <Svg width={box.w} height={box.h} style={StyleSheet.absoluteFill}>
-                <Defs>{gradient(`under${id}`)}</Defs>
-                <Rect width={box.w} height={box.h} fill={`url(#under${id})`} opacity={frame.underOpacity} />
-              </Svg>
-            )}
-            {LIQUID_GLASS ? (
-              <GlassView glassEffectStyle={frame.glassStyle} style={[StyleSheet.absoluteFill, { borderRadius: r }]} />
-            ) : (
-              <>
-                <BlurView intensity={frame.blurIntensity} tint={blur.tint} style={StyleSheet.absoluteFill} />
-                <View style={[StyleSheet.absoluteFill, styles.tint]} />
-              </>
-            )}
-          </>
+          <BlurView intensity={frame.blurIntensity} tint={blur.tint} style={StyleSheet.absoluteFill} />
         )}
         {box.w > 0 && (
           <Svg width={box.w} height={box.h} style={StyleSheet.absoluteFill} pointerEvents="none">
@@ -127,9 +109,6 @@ const styles = StyleSheet.create({
   },
   clip: {
     overflow: 'hidden',
-  },
-  tint: {
-    backgroundColor: colors.glass,
   },
   solid: {
     backgroundColor: colors.glassStrong,

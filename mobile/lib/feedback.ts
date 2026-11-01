@@ -1,3 +1,4 @@
+import { resumePlan } from './feedbackPlan';
 import { getPositionIfAllowed } from './location';
 import { distanceM } from './places';
 import { supabase } from './supabase';
@@ -21,6 +22,7 @@ export type PendingMeal = {
   placeName: string;
   pickedAt: Date;
   categoryId: string | null; // the place's category at pick time; pre-selects "What did you have?"
+  askPrice: boolean; // false when a price is already saved (e.g. from the meal card's Edit, P1-24)
 };
 
 /**
@@ -41,6 +43,8 @@ type Row = {
   went: boolean | null;
   category_id: string | null;
   ate_at: string | null;
+  stars: number | null;
+  price_tap: number | null;
   places: { name: string; lat: number | null; lon: number | null } | null;
 };
 
@@ -59,7 +63,7 @@ type Pending = {
 async function latestPending(userId: string): Promise<Pending | null> {
   const { data, error } = await supabase
     .from('meals')
-    .select('id,picked_at,went,category_id,ate_at,places(name,lat,lon)')
+    .select('id,picked_at,went,category_id,ate_at,stars,price_tap,places(name,lat,lon)')
     .eq('user_id', userId)
     .eq('source', 'live')
     .or('went.is.null,and(went.eq.true,stars.is.null)')
@@ -70,12 +74,19 @@ async function latestPending(userId: string): Promise<Pending | null> {
   if (error) throw error;
   const row = data?.[0];
   if (!row || !row.places) return null;
+  const plan = resumePlan({
+    went: row.went,
+    ateAnswered: row.ate_at !== null,
+    stars: row.stars,
+    priceTap: row.price_tap,
+  });
   return {
     meal: {
       id: row.id,
       placeName: row.places.name,
       pickedAt: new Date(row.picked_at),
       categoryId: row.category_id,
+      askPrice: plan.kind === 'food' || plan.kind === 'stars' ? plan.askPrice : true,
     },
     went: row.went,
     ateAnswered: row.ate_at !== null,
@@ -106,6 +117,7 @@ export async function checkFeedback(
 }
 
 async function startFor(pending: Pending, ageH: number): Promise<FeedbackStart> {
+  // Steps already answered anywhere (the prompt or the meal card's Edit) are skipped.
   if (pending.went === true) {
     return { kind: pending.ateAnswered ? 'resumeStars' : 'resumeFood', meal: pending.meal };
   }

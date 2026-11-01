@@ -133,11 +133,12 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   }, [step, meal, close]);
 
   // One tap on a star: the stars fill, then the price step follows (Back returns to change it).
+  // With a price already saved (meal card Edit, P1-24), the star tap finishes instead.
   useEffect(() => {
-    if (step !== 'stars' || stars === 0) return;
+    if (step !== 'stars' || stars === 0 || meal?.askPrice === false) return;
     const timer = setTimeout(() => setStep('price'), STAR_ADVANCE_MS);
     return () => clearTimeout(timer);
-  }, [step, stars]);
+  }, [step, stars, meal]);
 
   // "Did you go?" and "I didn't go": saved right away.
   async function saveWent(went: boolean) {
@@ -162,8 +163,9 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   }
 
   // Finish: food, stars, then the price if one was tapped. A retry continues where it stopped.
-  async function finish(priceTap: number | null) {
-    if (!meal || saving || !category || stars === 0) return;
+  // chosen: the star just tapped, when finishing straight from the stars step.
+  async function finish(priceTap: number | null, chosen: number = stars) {
+    if (!meal || saving || !category || chosen === 0) return;
     tapHaptic();
     setSaving(true);
     setRetry(null);
@@ -174,13 +176,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         saved.current.food = true;
       }
       if (!saved.current.stars) {
-        await saveFeedback(meal.id, { stars });
+        await saveFeedback(meal.id, { stars: chosen });
         saved.current.stars = true;
       }
       if (priceTap !== null) await saveFeedback(meal.id, { priceTap });
       setStep('thanks');
     } catch {
-      setRetry(() => () => finish(priceTap));
+      setRetry(() => () => finish(priceTap, chosen));
     } finally {
       setSaving(false);
     }
@@ -284,6 +286,8 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
             onPress={() => {
               tapHaptic();
               setStars(n);
+              // Price already saved: no price step, the star finishes (after the fill shows).
+              if (!meal.askPrice) setTimeout(() => finish(null, n), STAR_ADVANCE_MS);
             }}
             accessibilityRole="button"
             accessibilityLabel={`${n} star${n > 1 ? 's' : ''}`}

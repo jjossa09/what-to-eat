@@ -1,12 +1,16 @@
 import { useFocusEffect } from '@react-navigation/native';
-import { useCallback, useState } from 'react';
+import { type ComponentRef, useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, FlatList, StyleSheet, Text, View } from 'react-native';
 
+import MealCard, { type Rect } from '../components/MealCard';
+import PressScale from '../components/PressScale';
 import { GlassCard, GlassScreen, PrimaryButton, ScreenTitle, useTabBarSpace } from '../components/ui';
 import { loadMeals, type Meal, mealLine } from '../lib/meals';
+import { loadCategories } from '../lib/profile';
 import { colors, emojiFor, spacing, type } from '../theme';
 
-// The user's meals, newest first (P1-22). Reloads each time the tab is opened.
+// The user's meals, newest first (P1-22). Reloads each time the tab is opened. A tap on a row
+// opens its detail card (P1-24), which zooms out of the row's exact position.
 
 function Stars({ count }: { count: number }) {
   return (
@@ -20,10 +24,46 @@ function Stars({ count }: { count: number }) {
   );
 }
 
+function MealRow({ meal, onOpen }: { meal: Meal; onOpen: (meal: Meal, from: Rect) => void }) {
+  const ref = useRef<ComponentRef<typeof View>>(null);
+  return (
+    <View ref={ref} collapsable={false}>
+      <PressScale
+        onPress={() =>
+          ref.current?.measureInWindow((x, y, width, height) => onOpen(meal, { x, y, width, height }))
+        }
+        accessibilityRole="button"
+        accessibilityHint="Opens the meal's details"
+      >
+        <GlassCard>
+          <View style={styles.row}>
+            <Text style={styles.emoji}>{emojiFor(meal.category)}</Text>
+            <View style={styles.rowText}>
+              <Text style={styles.name} numberOfLines={1}>
+                {meal.placeName}
+              </Text>
+              <Text style={styles.meta}>{mealLine(meal)}</Text>
+            </View>
+            {meal.stars !== null && <Stars count={meal.stars} />}
+          </View>
+        </GlassCard>
+      </PressScale>
+    </View>
+  );
+}
+
 export default function MealsScreen({ userId }: { userId: string }) {
   const space = useTabBarSpace();
   const [meals, setMeals] = useState<Meal[] | null>(null);
   const [failed, setFailed] = useState(false);
+  const [open, setOpen] = useState<{ id: string; from: Rect } | null>(null);
+  const [names, setNames] = useState<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    loadCategories()
+      .then((rows) => setNames(new Map(rows.map((c) => [c.id, c.name]))))
+      .catch(() => undefined); // the card then shows the dish only
+  }, []);
 
   const fetchMeals = useCallback(
     (isLive: () => boolean = () => true) =>
@@ -47,6 +87,8 @@ export default function MealsScreen({ userId }: { userId: string }) {
     }, [fetchMeals]),
   );
 
+  const openMeal = open ? (meals ?? []).find((m) => m.id === open.id) : undefined;
+
   let content;
   if (failed && !meals) {
     content = (
@@ -66,20 +108,7 @@ export default function MealsScreen({ userId }: { userId: string }) {
         keyExtractor={(m) => m.id}
         contentContainerStyle={[styles.list, { paddingBottom: space }]}
         showsVerticalScrollIndicator={false}
-        renderItem={({ item }) => (
-          <GlassCard>
-            <View style={styles.row}>
-              <Text style={styles.emoji}>{emojiFor(item.category)}</Text>
-              <View style={styles.rowText}>
-                <Text style={styles.name} numberOfLines={1}>
-                  {item.placeName}
-                </Text>
-                <Text style={styles.meta}>{mealLine(item)}</Text>
-              </View>
-              {item.stars !== null && <Stars count={item.stars} />}
-            </View>
-          </GlassCard>
-        )}
+        renderItem={({ item }) => <MealRow meal={item} onOpen={(m, from) => setOpen({ id: m.id, from })} />}
       />
     );
   }
@@ -88,6 +117,17 @@ export default function MealsScreen({ userId }: { userId: string }) {
     <GlassScreen tabBar>
       <ScreenTitle>Meals</ScreenTitle>
       {content}
+      {open && openMeal && (
+        <MealCard
+          meal={openMeal}
+          from={open.from}
+          categoryName={(id) => (id ? (names.get(id) ?? null) : null)}
+          onClose={() => setOpen(null)}
+          onSaved={async () => {
+            await fetchMeals();
+          }}
+        />
+      )}
     </GlassScreen>
   );
 }

@@ -98,6 +98,21 @@ export function PrimaryButton({ label, onPress, disabled = false, busy = false }
   );
 }
 
+/** The quieter partner of PrimaryButton: same height and shape, glass fill (P1-24). */
+export function SecondaryButton({ label, onPress, disabled = false }: Omit<ButtonProps, 'busy'>) {
+  return (
+    <PressScale
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
+      style={[styles.button, styles.buttonSecondary, disabled && styles.buttonDisabled]}
+    >
+      <Text style={[styles.buttonText, styles.buttonSecondaryText]}>{label}</Text>
+    </PressScale>
+  );
+}
+
 export function TextLink({ label, onPress }: { label: string; onPress: () => void }) {
   return (
     <PressScale onPress={onPress} accessibilityRole="button" style={styles.link} hitSlop={12}>
@@ -184,6 +199,14 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.35,
+  },
+  buttonSecondary: {
+    backgroundColor: colors.glassStrong,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.hairline,
+  },
+  buttonSecondaryText: {
+    color: colors.text,
   },
   buttonText: {
     color: colors.onAccent,
