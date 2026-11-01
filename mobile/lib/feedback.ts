@@ -11,6 +11,7 @@ export const FEEDBACK_CONFIG = {
   likelyVisitWindowH: 4, // ...between pick time and pick + 4 h
   askAfterH: 1, // otherwise ask "Did you go?" no sooner than this after the pick...
   askUntilH: 48, // ...and no later than this
+  notifyAfterH: 2, // FR10 (P1-16): the reminder fires this long after the app last went to the background
 };
 
 const HOUR_MS = 3_600_000;
@@ -83,12 +84,28 @@ async function latestPending(userId: string): Promise<Pending | null> {
   };
 }
 
-/** FR11 on app open: a likely visit (near, in the window), a question, or nothing. */
-export async function checkFeedback(userId: string, now: Date = new Date()): Promise<FeedbackStart> {
+/** The latest live pick with no "Did you go?" answer yet (went = null), for the reminder (P1-16). */
+export async function pendingPick(userId: string): Promise<PendingMeal | null> {
   const pending = await latestPending(userId);
-  if (!pending) return { kind: 'none' };
+  return pending && pending.went === null ? pending.meal : null;
+}
+
+/**
+ * FR11 on app open: a likely visit (near, in the window), a question, or nothing. Also returns
+ * the unanswered pick (went = null, inside the 48 h window), so the reminder cache stays current.
+ */
+export async function checkFeedback(
+  userId: string,
+  now: Date = new Date(),
+): Promise<{ start: FeedbackStart; unanswered: PendingMeal | null }> {
+  const pending = await latestPending(userId);
+  if (!pending) return { start: { kind: 'none' }, unanswered: null };
   const ageH = (now.getTime() - pending.meal.pickedAt.getTime()) / HOUR_MS;
-  if (ageH < 0 || ageH > FEEDBACK_CONFIG.askUntilH) return { kind: 'none' };
+  if (ageH < 0 || ageH > FEEDBACK_CONFIG.askUntilH) return { start: { kind: 'none' }, unanswered: null };
+  return { start: await startFor(pending, ageH), unanswered: pending.went === null ? pending.meal : null };
+}
+
+async function startFor(pending: Pending, ageH: number): Promise<FeedbackStart> {
   if (pending.went === true) {
     return { kind: pending.ateAnswered ? 'resumeStars' : 'resumeFood', meal: pending.meal };
   }

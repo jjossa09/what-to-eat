@@ -18,6 +18,7 @@ import {
   type PendingMeal,
   saveFeedback,
 } from '../lib/feedback';
+import { cachePending, onForeground, reschedule, stopReminder } from '../lib/notify';
 import { BUDGETS, type Category, loadCategories } from '../lib/profile';
 import { colors, emojiFor, radii, spacing, type } from '../theme';
 import PressScale from './PressScale';
@@ -27,6 +28,8 @@ import { Chip, Dots, GlassCard, PrimaryButton, TextLink } from './ui';
 // open and on return to the foreground. "Did you go?" is saved at once. The food, stars, and
 // price are held on the device while the user moves forward and Back, then saved in that order
 // when they finish (price tap or Skip). If the app closes first, the next open resumes.
+// It also drives the P1-16 reminder: refreshes its cache on each check, reschedules when the app
+// goes to the background, and stops it once "Did you go?" is answered or on "Not now".
 
 type Step = 'went' | 'food' | 'stars' | 'price' | 'thanks';
 
@@ -84,7 +87,10 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     };
     if (start.kind === 'likely') {
       saveFeedback(start.meal.id, { went: true })
-        .then(() => show('food', true))
+        .then(() => {
+          stopReminder(start.meal.id);
+          show('food', true);
+        })
         .catch(() => show('went', false)); // could not record the visit: ask instead
     } else if (start.kind === 'resumeFood') {
       show('food', true);
@@ -98,15 +104,24 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   const check = useCallback(() => {
     if (open.current) return;
     checkFeedback(userId)
-      .then(present)
+      .then(({ start, unanswered }) => {
+        cachePending(unanswered);
+        present(start);
+      })
       .catch(() => undefined); // a failed check never interrupts the app; the next open retries
   }, [userId, present]);
 
-  // On open, and each time the app comes back to the foreground.
+  // On open, and each time the app comes back to the foreground. Going to the background is the
+  // reminder's "activity" (FR10): it is rescheduled from the cache, with no network call.
   useEffect(() => {
     check();
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') check();
+      if (state === 'active') {
+        onForeground();
+        check();
+      } else if (state === 'background') {
+        reschedule();
+      }
     });
     return () => sub.remove();
   }, [check]);
@@ -132,6 +147,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     setRetry(null);
     try {
       await saveFeedback(meal.id, { went });
+      stopReminder(meal.id);
       if (went) {
         setFirst('food');
         setStep('food');
@@ -202,7 +218,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
           <Chip label="No" onPress={() => saveWent(false)} />
         </View>
         <View style={styles.center}>
-          <TextLink label="Not now" onPress={close} />
+          <TextLink
+            label="Not now"
+            onPress={() => {
+              stopReminder(meal.id); // the pop-up still asks on later opens
+              close();
+            }}
+          />
         </View>
       </>
     );

@@ -28,9 +28,11 @@ type Props = {
   round: number | null;
   /** Adds one assistant line to the chat (confirmations). */
   onSay: (text: string) => void;
+  /** After a pick is recorded (or was already): sets up the feedback reminder (P1-16). */
+  onPicked: () => void;
 };
 
-export default function ResultCards({ picks, user, sessionId, round, onSay }: Props) {
+export default function ResultCards({ picks, user, sessionId, round, onSay, onPicked }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision>('open');
   const [failed, setFailed] = useState<(() => void) | null>(null);
@@ -56,20 +58,22 @@ export default function ResultCards({ picks, user, sessionId, round, onSay }: Pr
     Linking.openURL(directionsUrl(p.lat, p.lon));
   }
 
-  async function decide(save: () => Promise<unknown>, done: string) {
+  async function decide(save: () => Promise<unknown>, done: string, after?: () => void) {
     setDecision('saving');
     setFailed(null);
     try {
       await save();
       setDecision('done');
       onSay(done);
+      after?.();
     } catch (e) {
       if (e instanceof ApiError && e.kind === 'conflict') {
         setDecision('done');
         onSay('Already saved.');
+        after?.();
       } else {
         setDecision('open');
-        setFailed(() => () => decide(save, done));
+        setFailed(() => () => decide(save, done, after));
       }
     }
   }
@@ -77,7 +81,7 @@ export default function ResultCards({ picks, user, sessionId, round, onSay }: Pr
   function pick(p: Pick) {
     if (sessionId === null || round === null || decision !== 'open') return;
     setSelectedId(p.id);
-    decide(() => logPicked(sessionId, round, p.id), `Enjoy ${p.name}!`);
+    decide(() => logPicked(sessionId, round, p.id), `Enjoy ${p.name}!`, onPicked);
   }
 
   function none() {
