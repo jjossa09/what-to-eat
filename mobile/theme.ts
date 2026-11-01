@@ -20,6 +20,40 @@ export const colors = {
   transparent: 'transparent',
   scrim: 'rgba(31,26,23,0.28)', // dims the app behind the feedback pop-up
   accentSoft: 'rgba(242,85,44,0.12)', // warm tint behind the pop-up's emoji
+  accentDark: '#B23A17', // text on light glass over a map (about 9:1 on white)
+  accentLight: '#FF8A5C',
+  veil: '#FFFFFF', // the glass frame's white veil (opacity in frame.veil)
+  ring: '#FFFFFF', // thin outer ring around floating glass
+  scrollThumb: 'rgba(31,26,23,0.32)',
+};
+
+// Shared glass frame (P1-19): the map's "What to eat?!" button now, the meal detail card later.
+// Accent gradient on the border only, running bottom to top (the background runs top to
+// bottom). The glass is a blur plus a white radial veil: strongest at the edge, light inside.
+export const frame = {
+  gradient: [colors.accentLight, colors.accent, colors.accentDark] as const, // bottom to top
+  start: { x: 0.5, y: 1 },
+  end: { x: 0.5, y: 0 },
+  borderWidth: 3.5,
+  blurIntensity: 30,
+  veil: { center: 0.12, mid: 0.3, edge: 0.78, midOffset: 0.6 }, // white opacity by radius
+  ringWidth: 1.5,
+  shadowOpacity: 0.18,
+  shadowRadius: 14,
+  shadowOffsetY: 6,
+  fabSize: 92,
+  fabTextSize: 15,
+  fabLineHeight: 17,
+};
+
+// Chat scroll indicator (P1-19): thicker than the native one, at the screen's right edge.
+export const scrollBar = {
+  width: 5,
+  edgeInset: 3, // from the screen's right edge
+  minThumb: 36,
+  fadeInMs: 120,
+  fadeOutMs: 300,
+  holdMs: 700, // visible this long after scrolling stops
 };
 
 export const blur = {
@@ -43,6 +77,8 @@ export const motion = {
   pressedScale: 0.96,
   pressIn: { stiffness: 400, damping: 40, mass: 1 },
   release: { stiffness: 300, damping: 22, mass: 1 },
+  // One small bounce when the Map tab opens (the "What to eat?!" button).
+  bounce: { scale: 1.08, upMs: 140, settle: { stiffness: 260, damping: 14, mass: 1 } },
 };
 
 // Maps (P1-13): emoji pins, the chat's mini map, the Map tab's starting zoom.
@@ -82,6 +118,7 @@ export const type = {
   body: 16,
   small: 15,
   caption: 12,
+  fine: 11, // results attribution
 };
 
 // One emoji per ML2 category (shown on picks and meals). Other is the fallback.

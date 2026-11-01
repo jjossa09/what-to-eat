@@ -28,9 +28,10 @@ def env(monkeypatch):
 
 
 def output(understood=True, craving="none", exclude=(), budget="none", distance="none",
-           something_else=False) -> dict:
+           something_else=False, intent="answer", reply="") -> dict:
     return {"understood": understood, "craving": craving, "exclude": list(exclude),
-            "budget": budget, "distance": distance, "something_else": something_else}
+            "budget": budget, "distance": distance, "something_else": something_else,
+            "intent": intent, "reply": reply}
 
 
 def content(**kw) -> str:
@@ -147,6 +148,88 @@ def test_follow_ups_not_sure(out):
     assert parse(Meta(out), "refine").status == answers.NOT_SURE
 
 
+# Chat (P1-19): small talk and off-topic get one short line back, never an answer
+
+
+def chat(reply: str, intent="small_talk", key="craving") -> answers.Parsed:
+    return parse(Meta(output(understood=False, intent=intent, reply=reply)), key, "hello")
+
+
+@pytest.mark.parametrize("intent", ["small_talk", "off_topic"])
+def test_small_talk_and_off_topic_get_a_line(intent):
+    result = chat("Hi {name}! What are you craving?", intent)
+    assert (result.status, result.change, result.source) == (answers.CHAT, None, muse.MUSE)
+    assert result.reply == "Hi {name}! What are you craving?"
+
+
+@pytest.mark.parametrize("key", list(answers.SHORT_QUESTIONS))
+def test_chat_works_for_every_question(key):
+    assert chat("Anytime, {name}! " + answers.SHORT_QUESTIONS[key], key=key).status == answers.CHAT
+
+
+@pytest.mark.parametrize("reply", [
+    "",
+    "Hello there!",  # does not steer back with a question
+    "Hi! What? Are you craving?",  # two questions
+    "Hey {name}, I am so glad you asked me that question, what now?",  # too long
+    "Hi {name}! How about pizza tonight?",  # suggests food (R2)
+    "You could try somewhere new. What are you craving?",
+    "Hi! Want something healthy today?",  # NFR5
+    "Low carb or not? What are you craving?",
+    "Your choices say a lot about you! What next?",  # personality read
+    "You seem adventurous, {name}! What are you craving?",
+    "Hi Maria! What are you craving?\nOk?",
+    "Hi {name} {name}! What are you craving?",
+    "Hi {user}! What are you craving?",
+    "Hi! Under $15? What are you craving?",
+])
+def test_a_bad_line_falls_back_to_the_fixed_one(reply):
+    result = chat(reply)
+    assert result.status == answers.CHAT
+    assert result.reply == "Happy to help, {name}! What are you craving?"
+
+
+def test_fallback_lines_pass_their_own_checks():
+    for key, line in answers.FALLBACK_REPLY.items():
+        assert answers.check_reply(line, key) == line
+        assert len(line.split()) <= answers.MAX_REPLY_WORDS
+
+
+def test_chat_never_drops_an_answer():
+    # "hi, thai please" said small talk but named a category: it is an answer.
+    result = parse(Meta(output(craving="thai", intent="small_talk", reply="Hi! What?")))
+    assert (result.status, result.change, result.reply) == (
+        answers.OK, refine.Change(craving="thai"), None)
+
+
+def test_prompt_never_holds_a_name():
+    body = answers.request_body("craving", "hello")
+    system = body["messages"][0]["content"]
+    assert "{name}" in system
+    assert json.loads(body["messages"][1]["content"]) == {
+        "question": "What are you craving?", "message": "hello"}
+
+
+def test_chat_logs_never_hold_the_text(caplog):
+    caplog.set_level(logging.DEBUG)
+    meta = Meta(output(understood=False, intent="off_topic",
+                       reply="Ha, {name}! What are you craving?"))
+    parse(meta, "craving", SECRET_TEXT)
+    assert "Muse parse chat: off_topic (question=craving fallback=False" in caplog.text
+    assert "Oak" not in caplog.text and "secret" not in caplog.text
+    assert "What are you craving" not in caplog.text
+
+
+def test_endpoint_chat():
+    meta = Meta(output(understood=False, intent="small_talk",
+                       reply="Anytime, {name}! What should change?"))
+    response = endpoint(meta, question_key="refine", text="thanks!")
+    assert response.status_code == 200
+    assert response.json() == {"status": "chat", "answer": None, "source": "muse",
+                               "reply": "Anytime, {name}! What should change?"}
+    assert len(meta.requests) == 1
+
+
 # Bad output: not sure, never a guess
 
 
@@ -162,6 +245,9 @@ def test_follow_ups_not_sure(out):
     json.dumps({**output(), "understood": "yes"}),
     json.dumps({k: v for k, v in output().items() if k != "something_else"}),
     json.dumps({**output(), "exclude": "burgers"}),
+    json.dumps({**output(), "intent": "chat"}),
+    json.dumps({**output(), "reply": None}),
+    json.dumps({k: v for k, v in output().items() if k != "intent"}),
 ])
 def test_bad_output_is_not_sure(raw):
     result = parse(Meta(raw=raw), "refine")
@@ -258,7 +344,7 @@ def test_endpoint_ok():
                         question_key="refine", text="cheaper, not burgers")
     assert response.status_code == 200
     assert response.json() == {
-        "status": "ok", "source": "muse",
+        "status": "ok", "source": "muse", "reply": None,
         "answer": {"craving": None, "exclude_categories": ["burgers"], "budget": "cheaper",
                    "distance": None, "something_else": False},
     }
@@ -267,7 +353,8 @@ def test_endpoint_ok():
 def test_endpoint_not_sure_is_200():
     response = endpoint(Meta(status=500), question_key="craving", text="hmm")
     assert response.status_code == 200
-    assert response.json() == {"status": "not_sure", "answer": None, "source": "none"}
+    assert response.json() == {"status": "not_sure", "answer": None, "source": "none",
+                               "reply": None}
 
 
 def test_endpoint_answer_feeds_recommendations_refine():

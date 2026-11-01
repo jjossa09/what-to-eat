@@ -1,12 +1,14 @@
 import { type NavigationProp, type ParamListBase, useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Linking, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Animated, Easing, Linking, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import GlassFrame from '../components/GlassFrame';
 import { Attribution, EmojiPin } from '../components/PlaceMap';
 import PressScale from '../components/PressScale';
 import { Chip, GlassCard, GlassScreen, PrimaryButton, useTabBarSpace } from '../components/ui';
+import { useReduceMotion } from '../lib/accessibility';
 import type { Place } from '../lib/api';
 import { getPosition, type Position } from '../lib/location';
 import {
@@ -21,11 +23,12 @@ import {
   searchArea,
 } from '../lib/places';
 import { loadCategories } from '../lib/profile';
-import { colors, emojiFor, map, radii, spacing, type } from '../theme';
+import { colors, emojiFor, frame, map, motion, radii, spacing, type } from '../theme';
 
 // Map tab (P1-13): Apple Map centered on the user with nearby places as emoji pins. One search
 // when the tab opens, reused until the user moves about 500 m. "Search this area" (P1-23): after
 // a meaningful pan or zoom, one tap searches the visible region; never on every pan.
+// "What to eat?!" (P1-19): a glass-frame circle that bounces once each time the tab opens.
 
 type Problem = 'denied' | 'nofix' | 'places';
 type AreaSearch = 'hidden' | 'ready' | 'searching' | 'failed';
@@ -56,6 +59,9 @@ export default function MapScreen() {
   const searched = useRef<Region | null>(null);
   const visible = useRef<Region | null>(null);
   const selectedId = useRef<string | null>(null); // read by merges; never dropped by the cap
+  const reduceMotion = useReduceMotion();
+  const [bounce] = useState(() => new Animated.Value(1));
+  const ready = user !== null; // the button exists once the map does
 
   useEffect(() => {
     selectedId.current = selected?.id ?? null;
@@ -94,6 +100,27 @@ export default function MapScreen() {
         live = false;
       };
     }, [load]),
+  );
+
+  // One small bounce on tab open (and when the map first appears). None with Reduce Motion.
+  useFocusEffect(
+    useCallback(() => {
+      if (!ready || reduceMotion) return;
+      const run = Animated.sequence([
+        Animated.timing(bounce, {
+          toValue: motion.bounce.scale,
+          duration: motion.bounce.upMs,
+          easing: Easing.out(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.spring(bounce, { toValue: 1, ...motion.bounce.settle, useNativeDriver: true }),
+      ]);
+      run.start();
+      return () => {
+        run.stop();
+        bounce.setValue(1);
+      };
+    }, [ready, reduceMotion, bounce]),
   );
 
   function retry() {
@@ -241,13 +268,17 @@ export default function MapScreen() {
             />
           </GlassCard>
         )}
-        <PressScale
-          style={styles.fab}
-          onPress={() => navigation.navigate('Eat')}
-          accessibilityRole="button"
-        >
-          <Text style={styles.fabText}>What to eat?</Text>
-        </PressScale>
+        <Animated.View style={[styles.fab, { transform: [{ scale: bounce }] }]}>
+          <PressScale
+            onPress={() => navigation.navigate('Eat')}
+            accessibilityRole="button"
+            accessibilityLabel="What to eat?!"
+          >
+            <GlassFrame shape="circle" size={frame.fabSize} style={styles.fabFrame}>
+              <Text style={styles.fabText}>{'What\nto\neat?!'}</Text>
+            </GlassFrame>
+          </PressScale>
+        </Animated.View>
       </View>
     </View>
   );
@@ -321,20 +352,16 @@ const styles = StyleSheet.create({
   },
   fab: {
     alignSelf: 'flex-start',
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.xl,
-    borderRadius: radii.pill,
-    backgroundColor: colors.glassStrong,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.hairline,
-    shadowColor: colors.shadow,
-    shadowOpacity: 0.12,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 4 },
+  },
+  fabFrame: {
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   fabText: {
-    fontSize: type.body,
-    fontWeight: '600',
-    color: colors.text,
+    fontSize: frame.fabTextSize,
+    lineHeight: frame.fabLineHeight,
+    fontWeight: '800',
+    textAlign: 'center',
+    color: colors.accentDark,
   },
 });

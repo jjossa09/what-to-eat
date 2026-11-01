@@ -3,11 +3,15 @@
 One Muse call per message turns typed text into a Change, the same shape the chips give.
 Language only: Muse never sees or returns places (R2). The output is a json_schema of fixed
 enums, checked again here; anything unclear or off is "not sure" and the app shows chips
-instead of guessing. Never log the user's text, the prompt, or the response text.
+instead of guessing. Small talk or off-topic text gets "chat": a short warm line from the same
+call that steers back to the question, checked here (P1-19). The user's name never goes to
+Muse: the line may hold a {name} placeholder the app fills in. Never log the user's text, the
+prompt, or the response text.
 """
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,8 +25,12 @@ FIRST_QUESTIONS = ("craving", "budget", "distance")  # the 3 questions before ro
 MAX_TEXT = 200
 MAX_COMPLETION_TOKENS = 600  # a ceiling that includes reasoning tokens
 
-OK, NOT_SURE = "ok", "not_sure"
+OK, NOT_SURE, CHAT = "ok", "not_sure", "chat"
 NONE = "none"  # Muse's "not mentioned" for an enum field
+INTENTS = ("answer", "small_talk", "off_topic")
+NAME = "{name}"  # filled in by the app; the name itself never reaches Muse
+MAX_REPLY_WORDS = 10
+MAX_REPLY_CHARS = 80
 
 BUDGETS = {"1": 1, "2": 2, "3": 3, "4": 4, "cheaper": "cheaper", "pricier": "pricier"}
 DISTANCES = {
@@ -42,7 +50,31 @@ QUESTIONS = {
     "open": "Follow-up after the best picks so far: what would make it right?",
 }
 
+# The chat line steers back with the app's own wording of the question (mobile Chat.tsx).
+SHORT_QUESTIONS = {
+    "craving": "What are you craving?",
+    "budget": "Budget this time?",
+    "distance": "How far?",
+    "refine": "What should change?",
+    "open": "What would make it right?",
+}
+# Used when Muse's line fails a check.
+FALLBACK_REPLY = {k: f"Happy to help, {NAME}! {q}" for k, q in SHORT_QUESTIONS.items()}
+
 CATEGORY_LIST = ", ".join(f"{c} ({muse.CATEGORY_LABELS[c]})" for c in CRAVINGS)
+
+# Words that would make the line suggest food or a place (R2: only scored places are shown).
+_FOOD_WORDS = sorted({w.lower() for label in muse.CATEGORY_LABELS.values()
+                      for w in label.split("/")} | {"try", "recommend", "suggest", "restaurant"})
+SUGGEST_TERMS = re.compile(r"\b(" + "|".join(map(re.escape, _FOOD_WORDS)) + r")\w*\b",
+                           re.IGNORECASE)
+# Hackathon rules: no personality analysis, no read of what the user's choices say about them.
+PERSONALITY_TERMS = re.compile(
+    r"\b(personalit\w*|character|type of person|kind of person|says? (a lot )?about you"
+    r"|tells? (me )?about you|you seem|you sound|you must be|you'?re (so|such|clearly|definitely)"
+    r"|your (choices|taste|picks|habits|vibe)|zodiac|horoscope|introvert\w*|extrovert\w*)\b",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = (
     "You turn one chat message from a food app user into structured answers. "
@@ -57,7 +89,14 @@ SYSTEM_PROMPT = (
     'distance: "walk", "short_drive", "worth_the_drive", or "closer"/"farther" for a step '
     'from now, else "none". '
     "something_else: true only if they want different options without saying what. "
-    "understood: false if the message does not answer the question. Never guess."
+    "understood: false if the message does not answer the question. Never guess. "
+    'intent: "answer" if it answers anything above; "small_talk" for greetings, thanks, or '
+    'questions about the app ("pick what?"); "off_topic" for anything else. '
+    'reply: "" for answer. For small_talk or off_topic: one warm line, at most 10 words, '
+    "that ends by asking the question. Address the user as {name} at most once, never by any "
+    "other name. Never suggest a food, dish, or place. Never mention diet, health, or "
+    "nutrition. Never comment on the user's personality or what their choices say about them. "
+    "Never talk about yourself."
 )
 
 RESPONSE_FORMAT = {
@@ -74,9 +113,11 @@ RESPONSE_FORMAT = {
                 "budget": {"type": "string", "enum": [*BUDGETS, NONE]},
                 "distance": {"type": "string", "enum": [*DISTANCES, NONE]},
                 "something_else": {"type": "boolean"},
+                "intent": {"type": "string", "enum": list(INTENTS)},
+                "reply": {"type": "string"},
             },
             "required": ["understood", "craving", "exclude", "budget", "distance",
-                         "something_else"],
+                         "something_else", "intent", "reply"],
             "additionalProperties": False,
         },
     },
@@ -87,9 +128,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Parsed:
-    status: str  # "ok" or "not_sure"
+    status: str  # "ok", "not_sure", or "chat"
     change: Change | None  # set when ok; on not sure, only the partial answer to pre-fill
     source: str  # "muse" if Muse answered, "none" if no usable reply came back
+    reply: str | None = None  # chat only: one line, may hold {name}
+
+
+class ChatReply(Exception):  # noqa: N818 (a result, like NotSure)
+    """Small talk or off-topic: no answer, just a short line back. Message = intent."""
+
+    def __init__(self, intent: str, reply: str):
+        super().__init__(intent)
+        self.reply = reply
 
 
 class NotSure(Exception):
@@ -118,8 +168,31 @@ def request_body(question_key: str, text: str) -> dict:
     }
 
 
+def check_reply(reply: str, question_key: str) -> str:
+    """Muse's chat line if it passes every check, else the fixed line for this question."""
+    line = reply.strip()
+    words = line.split()
+    ok = (
+        bool(words)
+        and "\n" not in line
+        and len(words) <= MAX_REPLY_WORDS
+        and len(line) <= MAX_REPLY_CHARS
+        and line.count("?") == 1
+        and line.endswith("?")
+        and line.count(NAME) <= 1
+        and "{" not in line.replace(NAME, "")
+        and "}" not in line.replace(NAME, "")
+        and not muse.HEALTH_TERMS.search(line)
+        and not SUGGEST_TERMS.search(line)
+        and not PERSONALITY_TERMS.search(line)
+        and not re.search(r"\d|\$", line)
+    )
+    return line if ok else FALLBACK_REPLY[question_key]
+
+
 def check_parse(content, question_key: str, finish_reason: str | None = None) -> Change:
-    """Muse content -> Change, RejectedOutput (bad output), or NotSure (unclear answer)."""
+    """Muse content -> Change, RejectedOutput (bad output), NotSure (unclear answer), or
+    ChatReply (small talk or off-topic, with a checked line)."""
     if finish_reason == "length":
         raise muse.RejectedOutput("truncated")
     if not isinstance(content, str):
@@ -132,7 +205,9 @@ def check_parse(content, question_key: str, finish_reason: str | None = None) ->
         raise muse.RejectedOutput("shape")
     understood, something_else = data.get("understood"), data.get("something_else")
     craving, budget, distance = data.get("craving"), data.get("budget"), data.get("distance")
-    exclude = data.get("exclude")
+    exclude, intent, reply = data.get("exclude"), data.get("intent"), data.get("reply")
+    if intent not in INTENTS or not isinstance(reply, str):
+        raise muse.RejectedOutput("shape")
     if not isinstance(understood, bool) or not isinstance(something_else, bool):
         raise muse.RejectedOutput("shape")
     if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
@@ -141,6 +216,11 @@ def check_parse(content, question_key: str, finish_reason: str | None = None) ->
         raise muse.RejectedOutput("category")
     if budget not in (*BUDGETS, NONE) or distance not in (*DISTANCES, NONE):
         raise muse.RejectedOutput("enum")
+    nothing = (craving == NONE and not exclude and budget == NONE and distance == NONE
+               and not something_else)
+    if intent != "answer" and nothing:
+        # Never an answer: the app keeps the question and its chips.
+        raise ChatReply(intent, check_reply(reply, question_key))
     if not understood:
         raise NotSure("not_understood")
     if craving != NONE and craving in exclude:
@@ -192,5 +272,15 @@ async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> 
             muse.usage_note(reply.usage),
         )
         return Parsed(NOT_SURE, e.partial, muse.MUSE)
+    except ChatReply as e:
+        fallback = e.reply == FALLBACK_REPLY[question_key]
+        logger.info(
+            "Muse parse chat: %s (question=%s fallback=%s usage=%s)",
+            e,
+            question_key,
+            fallback,
+            muse.usage_note(reply.usage),
+        )
+        return Parsed(CHAT, None, muse.MUSE, e.reply)
     logger.info("Muse parse usage: %s (question=%s)", muse.usage_note(reply.usage), question_key)
     return Parsed(OK, change, muse.MUSE)

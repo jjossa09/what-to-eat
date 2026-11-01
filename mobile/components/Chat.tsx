@@ -1,9 +1,10 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Keyboard,
   KeyboardAvoidingView,
   Linking,
-  ScrollView,
+  Pressable,
   type ScrollViewInstance,
   StyleSheet,
   Text,
@@ -17,6 +18,7 @@ import {
   getRecommendations,
   localTimeIso,
   parseAnswer,
+  type ParseResponse,
   type Pick,
   type QuestionKey,
   type RoundRequest,
@@ -25,10 +27,17 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { remindAfterPick } from '../lib/notify';
-import { type Category, loadCategories, loadTastePrior, type TastePrior } from '../lib/profile';
+import {
+  type Category,
+  loadCategories,
+  loadDisplayName,
+  loadTastePrior,
+  type TastePrior,
+} from '../lib/profile';
 import { colors, radii, spacing, type } from '../theme';
 import Composer from './Composer';
 import ResultCards from './ResultCards';
+import ScrollWithBar from './ScrollWithBar';
 import { Chip, GlassScreen } from './ui';
 
 // Chat (P1-09) with the fixed Phase 1 questions (P1-10): craving, budget, distance.
@@ -36,6 +45,9 @@ import { Chip, GlassScreen } from './ui';
 // Typed answers are parsed by Muse into the same answers as the chips (P1-21). After a round,
 // the chat stays open: Cheaper / Closer / Something else or a typed follow-up runs a new round
 // that skips every place already shown (P1-14). Round 4 without a pick is the best so far.
+// P1-19: the composer is always there. After a pick or None of these, typed text is the craving
+// of a new search (budget and distance asked again, preselected). Small talk gets one short
+// line back from the same parse call; {name} in it is filled in here, never sent to Muse.
 
 type Step = 'craving' | 'budget' | 'distance' | 'loading' | 'results' | 'error';
 type FirstKey = 'craving' | 'budget' | 'distance';
@@ -70,6 +82,15 @@ const FOLLOW_UPS: { label: string; change: Partial<Change> }[] = [
   { label: 'Closer', change: { distance: 'closer' } },
   { label: 'Something else', change: { something_else: true } },
 ];
+
+const NOT_SURE = "Didn't catch that. Tap one below.";
+
+/** Fills Muse's {name} placeholder with the user's name, or drops it cleanly when unset. */
+function withName(line: string, name: string | null): string {
+  if (name) return line.split('{name}').join(name);
+  const out = line.replace(/,?\s*\{name\}/g, '').replace(/^[\s,!.]+/, '').trim();
+  return out.charAt(0).toUpperCase() + out.slice(1);
+}
 
 const PROBLEM_TEXT: Record<Problem, string> = {
   denied: 'Location is off.',
@@ -106,6 +127,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [user, setUser] = useState<Position | null>(null);
   const [decided, setDecided] = useState(false);
   const [parsing, setParsing] = useState(false);
+  const [name, setName] = useState<string | null>(null);
+  const [keyboard, setKeyboard] = useState(false);
   // Pre-selected chips for later questions, from a typed answer that covered them (FR4).
   const [preset, setPreset] = useState<{ budget?: number; radius?: Radius }>({});
 
@@ -115,6 +138,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const sessionId = useRef<string | null>(null);
   const shownIds = useRef<string[]>([]);
   const pendingChange = useRef<Partial<Change> | undefined>(undefined);
+  const firstOfSearch = useRef(true); // the next round is this search's first ("3 spots")
   const nextIsOpen = useRef(false); // the next follow-up answers "What would make it right?"
   const busy = useRef(false); // one answer at a time (a chip tap during a parse is ignored)
   const location = useRef<Promise<LocationResult> | null>(null);
@@ -149,11 +173,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   useEffect(() => {
     let live = true;
     location.current = getPosition();
-    Promise.all([loadCategories(), loadTastePrior(userId)])
-      .then(([rows, quiz]) => {
+    Promise.all([loadCategories(), loadTastePrior(userId), loadDisplayName(userId).catch(() => null)])
+      .then(([rows, quiz, shownName]) => {
         if (!live) return;
         setCategories(rows);
         setPrior(quiz);
+        setName(shownName);
         if (quiz.budget) answers.current.budget = quiz.budget;
         nextId.current += 1;
         setBubbles([{ id: nextId.current, role: 'assistant', text: QUESTIONS.craving }]);
@@ -168,6 +193,16 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       live = false;
     };
   }, [userId]);
+
+  // With the keyboard up, the composer sits right on it, not a dock's height above it.
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardWillShow', () => setKeyboard(true));
+    const hide = Keyboard.addListener('keyboardWillHide', () => setKeyboard(false));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
 
   const names = new Map((categories ?? []).map((c) => [c.id, c.name]));
   const favorites = (prior?.favorites ?? []).filter((id) => names.has(id));
@@ -208,10 +243,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     for (const c of a.exclude_categories) {
       if (!answers.current.exclude.includes(c)) answers.current.exclude.push(c);
     }
-    const later: { budget?: number; radius?: Radius } = { ...preset };
-    if (key === 'craving' && typeof a.budget === 'number') later.budget = a.budget;
-    if (key !== 'distance' && typeof a.distance === 'number') later.radius = a.distance;
-    setPreset(later);
+    setPreset((prev) => {
+      const later = { ...prev };
+      if (key === 'craving' && typeof a.budget === 'number') later.budget = a.budget;
+      if (key !== 'distance' && typeof a.distance === 'number') later.radius = a.distance;
+      return later;
+    });
   }
 
   /** A parsed first answer: echoed as the matching chip. */
@@ -250,30 +287,55 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     followUp(change, label, 'chip');
   }
 
+  /** After a pick or None of these: a new session that starts at the craving. */
+  function startNewSearch() {
+    sessionId.current = null;
+    shownIds.current = [];
+    transcript.current = [];
+    pendingChange.current = undefined;
+    nextIsOpen.current = false;
+    firstOfSearch.current = true;
+    answers.current = { ...answers.current, craving: null, exclude: [] };
+    // Budget and distance are asked again, preselected from the last search.
+    setPreset({ budget: answers.current.budget, radius: answers.current.radius });
+    setShowAll(false);
+    setDecided(false);
+    setStep('craving');
+  }
+
   async function sendText(text: string) {
     if (busy.current) return;
-    const key: QuestionKey = isFirst(step) ? step : nextIsOpen.current ? 'open' : 'refine';
+    const fresh = step === 'results' && decided; // the text is a new search's craving
+    const first: FirstKey | null = fresh ? 'craving' : isFirst(step) ? step : null;
+    const key: QuestionKey = first ?? (nextIsOpen.current ? 'open' : 'refine');
     busy.current = true;
     setParsing(true);
-    let parsed: Change | null = null;
-    let partial: Change | null = null; // not sure, but it answered later questions
+    let result: ParseResponse | null = null;
     try {
-      const result = await parseAnswer(key, text);
-      parsed = result.status === 'ok' ? result.answer : null;
-      partial = result.status === 'not_sure' ? result.answer : null;
+      result = await parseAnswer(key, text);
     } catch {
-      parsed = null; // offline or a server error: same as not sure, the chips still work
+      result = null; // offline or a server error: same as not sure, the chips still work
     } finally {
       busy.current = false;
       setParsing(false);
     }
-    if (!parsed) {
-      if (partial && isFirst(step)) prefill(step, partial);
+    // Small talk: one line back, the question and its chips stay. Not an answer, not logged.
+    if (result?.status === 'chat' && result.reply) {
       say('user', text);
-      say('assistant', isFirst(step) ? 'Not sure. Pick one?' : 'Not sure. Try a chip?');
+      say('assistant', withName(result.reply, name));
       return;
     }
-    if (isFirst(step)) typedFirst(step, parsed, text);
+    const parsed: Change | null = result?.status === 'ok' ? result.answer : null;
+    if (fresh) startNewSearch();
+    if (!parsed) {
+      // Not sure, but it may have answered later questions (FR4 prefill).
+      const partial = result?.status === 'not_sure' ? result.answer : null;
+      if (partial && first) prefill(first, partial);
+      say('user', text);
+      say('assistant', NOT_SURE);
+      return;
+    }
+    if (first) typedFirst(first, parsed, text);
     else followUp(parsed, text, 'text');
   }
 
@@ -328,7 +390,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       shownIds.current = [...shownIds.current, ...result.picks.map((p) => p.id)];
       setUser(where.position);
       setDecided(false);
-      const line = roundLine(result, rounds.length === 0);
+      const line = roundLine(result, firstOfSearch.current);
+      firstOfSearch.current = false;
       const id = line ? say('assistant', line) : null;
       if (id !== null && result.picks.length) {
         const round = result.session_id ? result.round : null;
@@ -354,10 +417,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     } else if (problem === 'load') {
       setProblem(null);
       setStep('craving');
-      Promise.all([loadCategories(), loadTastePrior(userId)])
-        .then(([rows, quiz]) => {
+      Promise.all([loadCategories(), loadTastePrior(userId), loadDisplayName(userId).catch(() => null)])
+        .then(([rows, quiz, shownName]) => {
           setCategories(rows);
           setPrior(quiz);
+          setName(shownName);
           if (quiz.budget) answers.current.budget = quiz.budget;
           ask('craving');
         })
@@ -370,89 +434,67 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     }
   }
 
-  let controls = null;
-  const composer = (placeholder: string) => (
-    <Composer placeholder={placeholder} onSend={sendText} busy={parsing} />
-  );
+  // Chips for the current step (none while loading or after a decision), then the composer,
+  // which is always there (P1-19).
+  let chips: ReactNode = null;
   if (step === 'craving' && categories) {
     const list = showAll ? categories.map((c) => c.id) : favorites;
-    controls = (
-      <View style={styles.stack}>
-        <View style={styles.chips}>
-          {list.map((id) => (
-            <Chip key={id} label={cravingLabel(id)} onPress={() => chooseCraving(id, cravingLabel(id))} />
-          ))}
-          <Chip label="Anything" onPress={() => chooseCraving(null, 'Anything')} />
-          {!showAll && <Chip label="More" onPress={() => setShowAll(true)} />}
-        </View>
-        {composer('Or type it')}
-      </View>
+    chips = (
+      <>
+        {list.map((id) => (
+          <Chip key={id} label={cravingLabel(id)} onPress={() => chooseCraving(id, cravingLabel(id))} />
+        ))}
+        <Chip label="Anything" onPress={() => chooseCraving(null, 'Anything')} />
+        {!showAll && <Chip label="More" onPress={() => setShowAll(true)} />}
+      </>
     );
   } else if (step === 'budget') {
-    controls = (
-      <View style={styles.stack}>
-        <View style={styles.chips}>
-          {BUDGETS.map((b) => (
-            <Chip
-              key={b.level}
-              label={b.label}
-              selected={budgetPick === b.level}
-              onPress={() => chooseBudget(b.level, b.label)}
-            />
-          ))}
-        </View>
-        {composer('Or type it')}
-      </View>
-    );
+    chips = BUDGETS.map((b) => (
+      <Chip
+        key={b.level}
+        label={b.label}
+        selected={budgetPick === b.level}
+        onPress={() => chooseBudget(b.level, b.label)}
+      />
+    ));
   } else if (step === 'distance') {
-    controls = (
-      <View style={styles.stack}>
-        <View style={styles.chips}>
-          {DISTANCES.map((d) => (
-            <Chip
-              key={d.radius}
-              label={d.label}
-              selected={radiusPick === d.radius}
-              onPress={() => chooseDistance(d.radius, d.label)}
-            />
-          ))}
-        </View>
-        {composer('Or type it')}
-      </View>
-    );
+    chips = DISTANCES.map((d) => (
+      <Chip
+        key={d.radius}
+        label={d.label}
+        selected={radiusPick === d.radius}
+        onPress={() => chooseDistance(d.radius, d.label)}
+      />
+    ));
   } else if (step === 'results' && !decided) {
-    controls = (
-      <View style={styles.stack}>
-        <View style={styles.chips}>
-          {FOLLOW_UPS.map((f) => (
-            <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label)} />
-          ))}
-        </View>
-        {composer('Or type what to change')}
-      </View>
-    );
+    chips = FOLLOW_UPS.map((f) => (
+      <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label)} />
+    ));
   } else if (step === 'error' && problem) {
-    controls = (
-      <View style={styles.problem}>
-        <Text style={styles.problemText}>{PROBLEM_TEXT[problem]}</Text>
-        <View style={styles.chips}>
-          {problem === 'denied' && <Chip label="Open Settings" onPress={() => Linking.openSettings()} />}
-          <Chip label={problem === 'auth' ? 'Sign in' : 'Try again'} onPress={retry} />
-        </View>
-      </View>
+    chips = (
+      <>
+        {problem === 'denied' && <Chip label="Open Settings" onPress={() => Linking.openSettings()} />}
+        <Chip label={problem === 'auth' ? 'Sign in' : 'Try again'} onPress={retry} />
+      </>
     );
   }
+
+  const placeholder =
+    step === 'results' ? (decided ? 'Craving something else?' : 'Or type what to change') : 'Or type it';
+  const composerOff = step === 'loading' || step === 'error' || !categories;
 
   const latest = rounds.length ? rounds[rounds.length - 1].bubbleId : null;
 
   return (
     <GlassScreen tabBar>
       <KeyboardAvoidingView behavior="padding" style={styles.fill}>
-        <ScrollView
-          ref={scroll}
-          // Without chips below, the thread scrolls behind the tab bar and ends above it.
-          contentContainerStyle={[styles.thread, !controls && { paddingBottom: bottom }]}
+        <ScrollWithBar
+          scrollRef={scroll}
+          // Full screen width, so the scroll bar sits at the screen's right edge.
+          style={styles.edgeToEdge}
+          contentContainerStyle={styles.thread}
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
           onContentSizeChange={() => scroll.current?.scrollToEnd({ animated: true })}
         >
           {!categories && step !== 'error' && <ActivityIndicator style={styles.spinner} />}
@@ -484,8 +526,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               <Text style={styles.bubbleText}>Finding spots…</Text>
             </View>
           )}
-        </ScrollView>
-        {controls && <View style={[styles.controls, { marginBottom: bottom }]}>{controls}</View>}
+        </ScrollWithBar>
+        {/* A tap outside the input or chips closes the keyboard. */}
+        <Pressable
+          accessible={false}
+          onPress={Keyboard.dismiss}
+          style={[styles.controls, { marginBottom: keyboard ? spacing.sm : bottom }]}
+        >
+          {step === 'error' && problem && <Text style={styles.problemText}>{PROBLEM_TEXT[problem]}</Text>}
+          {chips && <View style={styles.chips}>{chips}</View>}
+          <Composer placeholder={placeholder} onSend={sendText} busy={parsing} disabled={composerOff} />
+        </Pressable>
       </KeyboardAvoidingView>
     </GlassScreen>
   );
@@ -495,8 +546,12 @@ const styles = StyleSheet.create({
   fill: {
     flex: 1,
   },
+  edgeToEdge: {
+    marginHorizontal: -spacing.xl, // undoes GlassScreen's side padding
+  },
   thread: {
     gap: 10,
+    paddingHorizontal: spacing.xl,
     paddingBottom: spacing.lg,
   },
   spinner: {
@@ -527,17 +582,12 @@ const styles = StyleSheet.create({
   },
   controls: {
     paddingTop: spacing.md,
-  },
-  stack: {
     gap: spacing.md,
   },
   chips: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: spacing.sm,
-  },
-  problem: {
-    gap: 10,
   },
   problemText: {
     fontSize: type.small,
