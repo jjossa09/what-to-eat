@@ -45,9 +45,31 @@ class Conflict(FunnelError):
 
 
 @dataclass(frozen=True)
+class ShownCard:
+    """A card shown earlier in this session, with its cached place (P1-14 cap, ML10)."""
+
+    round: int
+    place_id: str
+    score: float
+    slot: str
+    pick_reason: str | None
+    reasons_source: str | None
+    name: str
+    lat: float
+    lon: float
+    category: str
+    address: str | None
+
+
+@dataclass(frozen=True)
 class RoundRef:
     session_id: str
     round: int
+    shown: tuple[ShownCard, ...] = ()  # every card shown before this round
+    closed: bool = False  # the session already has an outcome (picked or none)
+
+    def shown_in(self, round_: int) -> list[str]:
+        return [c.place_id for c in self.shown if c.round == round_]
 
 
 @dataclass(frozen=True)
@@ -160,18 +182,84 @@ async def open_round(
         return RoundRef(session_id=rows[0]["id"], round=1)
 
     params = {
-        "select": "id,recommendation_events(round)",
+        "select": SESSION_SELECT,
         "id": f"eq.{session_id}",
         "user_id": f"eq.{user_id}",
-        "recommendation_events.order": "round.desc",
-        "recommendation_events.limit": 1,
+        "recommendation_events.event": "eq.shown",
     }
     rows = await _send(client, "GET", "sessions", headers, params=params)
     if not rows or not isinstance(rows[0], dict):
         raise NotFound
     events = rows[0].get("recommendation_events") or []
-    last = events[0].get("round") if events and isinstance(events[0], dict) else 0
-    return RoundRef(session_id=session_id, round=(last if isinstance(last, int) else 0) + 1)
+    rounds = [e.get("round") for e in events if isinstance(e, dict)]
+    last = max((r for r in rounds if isinstance(r, int)), default=0)
+    shown = tuple(c for c in (_shown_card(e) for e in events) if c is not None)
+    return RoundRef(session_id=session_id, round=last + 1, shown=shown,
+                    closed=rows[0].get("outcome") is not None)
+
+
+# The session, with every shown card and its cached place: one read per later round.
+SESSION_SELECT = (
+    "id,outcome,recommendation_events(round,place_id,score,slot,pick_reason,reasons_source,"
+    "places(name,lat,lon,category_id,address))"
+)
+
+
+def _shown_card(event) -> ShownCard | None:
+    """A shown event row -> ShownCard, or None if any needed field is missing."""
+    if not isinstance(event, dict) or not isinstance(event.get("places"), dict):
+        return None
+    place = event["places"]
+    number = (int, float)
+    if not (isinstance(event.get("round"), int) and isinstance(event.get("place_id"), str)
+            and isinstance(event.get("score"), number) and isinstance(event.get("slot"), str)
+            and isinstance(place.get("name"), str) and isinstance(place.get("lat"), number)
+            and isinstance(place.get("lon"), number)):
+        return None
+    reason, source = event.get("pick_reason"), event.get("reasons_source")
+    address = place.get("address")
+    return ShownCard(
+        round=event["round"],
+        place_id=event["place_id"],
+        score=float(event["score"]),
+        slot=event["slot"],
+        pick_reason=reason if isinstance(reason, str) else None,
+        reasons_source=source if isinstance(source, str) else None,
+        name=place["name"],
+        lat=float(place["lat"]),
+        lon=float(place["lon"]),
+        category=place.get("category_id") or "other",
+        address=address if isinstance(address, str) else None,
+    )
+
+
+async def update_answers(
+    user_id: str, token: str, session_id: str, new: NewSession, *, client: httpx2.AsyncClient,
+) -> None:
+    """Later rounds: the session keeps the current answers (R3; raw answers are in messages)."""
+    row = {
+        "craving_category_id": new.craving,
+        "budget_level": new.budget_level,
+        "radius_m": new.radius_m,
+        "search_radius_m": new.search_radius_m,
+    }
+    await _send(client, "PATCH", "sessions", _user_headers(token),
+                params={"id": f"eq.{session_id}", "user_id": f"eq.{user_id}"}, json=row)
+
+
+async def log_rejected(
+    user_id: str, token: str, session_id: str, round_: int, place_ids: list[str], reason: str,
+    *, client: httpx2.AsyncClient,
+) -> None:
+    """The previous round's cards, rejected by a follow-up (ML10), in one insert."""
+    if not place_ids:
+        return
+    rows = [
+        {"user_id": user_id, "session_id": session_id, "round": round_, "place_id": pid,
+         "event": "rejected", "reject_reason": reason}
+        for pid in place_ids
+    ]
+    await _send(client, "POST", "recommendation_events", _user_headers(token), json=rows)
 
 
 async def upsert_places(candidates: list[Candidate], *, client: httpx2.AsyncClient) -> None:
@@ -215,15 +303,9 @@ async def log_shown(
     client: httpx2.AsyncClient,
 ) -> None:
     """One 'shown' row per card, in one insert."""
-    if not picks:
-        return
     rows = [
         {
-            "user_id": user_id,
-            "session_id": ref.session_id,
-            "round": ref.round,
             "place_id": pick.scored.place.id,
-            "event": "shown",
             "rank": pick.rank,
             "slot": pick.slot,
             "score": round(pick.scored.score, 4),
@@ -232,6 +314,17 @@ async def log_shown(
         }
         for pick, reason in zip(picks, reasons, strict=True)
     ]
+    await log_shown_rows(user_id, token, ref, rows, client=client)
+
+
+async def log_shown_rows(
+    user_id: str, token: str, ref: RoundRef, cards: list[dict], *, client: httpx2.AsyncClient,
+) -> None:
+    """Shown rows from card fields (place_id, rank, slot, score, pick_reason, reasons_source)."""
+    if not cards:
+        return
+    rows = [{"user_id": user_id, "session_id": ref.session_id, "round": ref.round,
+             "event": "shown", **card} for card in cards]
     await _send(client, "POST", "recommendation_events", _user_headers(token), json=rows)
 
 

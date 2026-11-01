@@ -30,14 +30,27 @@ type Props = {
   onSay: (text: string) => void;
   /** After a pick is recorded (or was already): sets up the feedback reminder (P1-16). */
   onPicked: () => void;
+  /** After Pick this or None of these is saved: the chat stops offering follow-ups. */
+  onDecided?: () => void;
+  /** An earlier round (P1-14): cards and Directions stay, the decision buttons hide. */
+  readOnly?: boolean;
 };
 
-export default function ResultCards({ picks, user, sessionId, round, onSay, onPicked }: Props) {
+export default function ResultCards({
+  picks,
+  user,
+  sessionId,
+  round,
+  onSay,
+  onPicked,
+  onDecided,
+  readOnly = false,
+}: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision>('open');
   const [failed, setFailed] = useState<(() => void) | null>(null);
   const interested = useRef(new Set<string>());
-  const canRecord = sessionId !== null && round !== null;
+  const canRecord = !readOnly && sessionId !== null && round !== null;
 
   function logInterest(placeId: string, kind: 'card' | 'directions') {
     if (sessionId === null || round === null) return;
@@ -65,11 +78,13 @@ export default function ResultCards({ picks, user, sessionId, round, onSay, onPi
       await save();
       setDecision('done');
       onSay(done);
+      onDecided?.();
       after?.();
     } catch (e) {
       if (e instanceof ApiError && e.kind === 'conflict') {
         setDecision('done');
         onSay('Already saved.');
+        onDecided?.();
         after?.();
       } else {
         setDecision('open');
@@ -79,13 +94,13 @@ export default function ResultCards({ picks, user, sessionId, round, onSay, onPi
   }
 
   function pick(p: Pick) {
-    if (sessionId === null || round === null || decision !== 'open') return;
+    if (!canRecord || sessionId === null || round === null || decision !== 'open') return;
     setSelectedId(p.id);
     decide(() => logPicked(sessionId, round, p.id), `Enjoy ${p.name}!`, onPicked);
   }
 
   function none() {
-    if (sessionId === null || decision !== 'open') return;
+    if (!canRecord || sessionId === null || decision !== 'open') return;
     decide(() => logNone(sessionId), 'Got it, no pick this time.');
   }
 

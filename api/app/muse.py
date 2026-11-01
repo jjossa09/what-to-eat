@@ -306,6 +306,67 @@ def usage_note(usage: Usage | None) -> str:
 # Call ------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Reply:
+    content: object  # the message content; checked by the caller
+    finish_reason: str | None
+    usage: Usage | None
+
+
+async def call(body: dict, *, client: httpx2.AsyncClient) -> Reply | None:
+    """One chat completion, shared by reasons and answer parsing (app/answers.py).
+
+    None on any failure (not configured, daily cap, timeout, HTTP error, unreadable body),
+    with a short warning. Never logs the key, the request, or the response text.
+    """
+    settings = get_settings()
+    try:
+        api_key = settings.require("META_API_KEY")
+    except MissingSettingError:
+        logger.warning("Muse is not configured")
+        return None
+    if not daily_cap.take(settings.MUSE_DAILY_CAP, datetime.now(UTC).date()):
+        logger.warning("Muse daily cap reached")
+        return None
+
+    # Exceptions are dropped without their message: it can echo request details.
+    try:
+        async with asyncio.timeout(settings.MUSE_TIMEOUT_S):  # total, not per phase
+            response = await client.post(
+                MUSE_URL,
+                json=body,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=settings.MUSE_TIMEOUT_S,
+            )
+    except (TimeoutError, httpx2.TimeoutException):
+        logger.warning("Muse timed out")
+        return None
+    except httpx2.HTTPError:
+        logger.warning("Muse request failed")
+        return None
+    if response.status_code != 200:
+        logger.warning("Muse returned status %s", response.status_code)
+        return None
+    try:
+        data = response.json()
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
+    except (ValueError, KeyError, IndexError, TypeError):
+        logger.warning("Muse returned an unreadable body")
+        return None
+    return Reply(content, finish_reason, parse_usage(data) if isinstance(data, dict) else None)
+
+
+def rejection_note(content, finish_reason: str | None, usage: Usage | None) -> str:
+    """Shape facts about rejected output, never the content (it can echo the prompt)."""
+    text = content.strip() if isinstance(content, str) else ""
+    return (
+        f"finish_reason={finish_reason} len={len(text)} fence={text.startswith('```')} "
+        f"brace={text.startswith('{')} usage={usage_note(usage)}"
+    )
+
+
 async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) -> Reasons:
     """One Muse call for all picks. Any failure gives the template reasons, never an error."""
     templates = tuple(template_reason(p) for p in picks)
@@ -315,59 +376,17 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
 
     if not picks:
         return fallback()
-    settings = get_settings()
-    try:
-        api_key = settings.require("META_API_KEY")
-    except MissingSettingError:
-        logger.warning("Muse is not configured")
+    reply = await call(request_body(picks), client=client)
+    if reply is None:
         return fallback()
-    if not daily_cap.take(settings.MUSE_DAILY_CAP, datetime.now(UTC).date()):
-        logger.warning("Muse daily cap reached")
-        return fallback()
-
-    # Exceptions are dropped without their message: it can echo request details.
-    try:
-        async with asyncio.timeout(settings.MUSE_TIMEOUT_S):  # total, not per phase
-            response = await client.post(
-                MUSE_URL,
-                json=request_body(picks),
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=settings.MUSE_TIMEOUT_S,
-            )
-    except (TimeoutError, httpx2.TimeoutException):
-        logger.warning("Muse timed out")
-        return fallback()
-    except httpx2.HTTPError:
-        logger.warning("Muse request failed")
-        return fallback()
-    if response.status_code != 200:
-        logger.warning("Muse returned status %s", response.status_code)
-        return fallback()
-    try:
-        body = response.json()
-        choice = body["choices"][0]
-        content = choice["message"]["content"]
-        finish_reason = choice.get("finish_reason")
-    except (ValueError, KeyError, IndexError, TypeError):
-        logger.warning("Muse returned an unreadable body")
-        return fallback()
-
-    usage = parse_usage(body) if isinstance(body, dict) else None
+    content, finish_reason, usage = reply.content, reply.finish_reason, reply.usage
     ids = [p.scored.place.id for p in picks]
     try:
         never_visited = frozenset(p.scored.place.id for p in picks if p.scored.evidence.visits == 0)
         lines = check_output(content, ids, finish_reason, never_visited)
     except RejectedOutput as e:
-        # Shape facts only, never the content (it can echo the prompt).
-        text = content.strip() if isinstance(content, str) else ""
         logger.warning(
-            "Muse output rejected: %s (finish_reason=%s len=%d fence=%s brace=%s usage=%s)",
-            e,
-            finish_reason,
-            len(text),
-            text.startswith("```"),
-            text.startswith("{"),
-            usage_note(usage),
+            "Muse output rejected: %s (%s)", e, rejection_note(content, finish_reason, usage)
         )
         return fallback(usage)
     logger.info("Muse usage: %s", usage_note(usage))

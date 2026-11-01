@@ -65,11 +65,13 @@ class Upstreams:
     """One MockTransport for Geoapify, Supabase, and Meta, routed by host."""
 
     def __init__(self, places_status=200, history_status=200, muse_lines=None, muse_status=200,
-                 history_exc=None, fail=(), last_round=None, session_found=True):
+                 history_exc=None, fail=(), last_round=None, session_found=True, shown=None,
+                 outcome=None):
         self.places_status, self.history_status = places_status, history_status
         self.muse_lines, self.muse_status, self.history_exc = muse_lines, muse_status, history_exc
         self.fail = set(fail)  # "METHOD table" pairs that return 500
         self.last_round, self.session_found = last_round, session_found
+        self.shown, self.outcome = shown, outcome  # shown: event rows for the session read
         self.requests: list[httpx2.Request] = []
         self.in_flight = self.max_in_flight = 0
 
@@ -118,7 +120,12 @@ def supabase(self, request: httpx2.Request) -> httpx2.Response:
         if not self.session_found:
             return httpx2.Response(200, json=[])
         events = [] if self.last_round is None else [{"round": self.last_round}]
-        return httpx2.Response(200, json=[{"id": SESSION_ID, "recommendation_events": events}])
+        if self.shown is not None:
+            events = self.shown
+        return httpx2.Response(200, json=[{"id": SESSION_ID, "outcome": self.outcome,
+                                           "recommendation_events": events}])
+    if request.method == "PATCH" and table == "sessions":
+        return httpx2.Response(204)
     if request.method == "POST" and table in ("places", "recommendation_events", "messages"):
         return httpx2.Response(201)
     raise AssertionError(f"unexpected Supabase call {request.method} {table}")
@@ -347,10 +354,11 @@ def test_later_round_continues_the_session():
     up = Upstreams(last_round=2)
     body = post(up, session_id=SESSION_ID).json()
     assert (body["session_id"], body["round"], body["logged"]) == (SESSION_ID, 3, True)
-    assert writes(up, "sessions") == []
-    (read,) = [r for r in up.requests if r.url.path.endswith("/sessions")]
+    assert [r.method for r in writes(up, "sessions")] == ["PATCH"]  # answers, no new session
+    (read,) = [r for r in up.requests if r.url.path.endswith("/sessions") and r.method == "GET"]
     assert read.url.params["id"] == f"eq.{SESSION_ID}"
     assert read.url.params["user_id"] == f"eq.{USER_ID}"
+    assert read.url.params["recommendation_events.event"] == "eq.shown"
     rows = json.loads(writes(up, "recommendation_events")[0].content)
     assert {r["round"] for r in rows} == {3}
 
@@ -518,3 +526,217 @@ def test_bad_transcript_is_rejected(transcript):
     up = Upstreams()
     assert post(up, transcript=transcript).status_code == 422
     assert up.requests == []
+
+
+# Follow-ups (P1-14, ML10)
+
+
+def shown_event(round_, pid, score, category, lat, slot="familiar", reason="Stored reason."):
+    return {"round": round_, "place_id": pid, "score": score, "slot": slot,
+            "pick_reason": reason, "reasons_source": "muse",
+            "places": {"name": f"Place {pid}", "lat": lat, "lon": LON, "category_id": category,
+                       "address": f"{pid} Main St"}}
+
+
+ROUND_1 = [shown_event(1, "node/1", 0.9, "thai", 33.953),
+           shown_event(1, "node/2", 0.8, "pizza", 33.955),
+           shown_event(1, "node/3", 0.5, "mexican", 33.957, slot="discovery")]
+
+
+def follow_up(up: Upstreams, **body):
+    base = {"session_id": SESSION_ID, "budget_level": 2, "radius_m": 5000}
+    return post(up, **{**base, **body})
+
+
+def rejected_rows(up: Upstreams) -> list[dict]:
+    rows = [row for r in writes(up, "recommendation_events") for row in json.loads(r.content)]
+    return [row for row in rows if row["event"] == "rejected"]
+
+
+def session_patch(up: Upstreams) -> dict:
+    (patch,) = [r for r in writes(up, "sessions") if r.method == "PATCH"]
+    assert patch.url.params["id"] == f"eq.{SESSION_ID}"
+    assert patch.url.params["user_id"] == f"eq.{USER_ID}"
+    return json.loads(patch.content)
+
+
+def test_follow_up_skips_every_shown_place_and_increments_the_round():
+    up = Upstreams(shown=ROUND_1)
+    body = follow_up(up, exclude_ids=[]).json()  # the server skips them even if the app doesn't
+    assert body["round"] == 2 and body["logged"] is True
+    assert not {"node/1", "node/2", "node/3"} & {p["id"] for p in body["picks"]}
+    shown = [row for r in writes(up, "recommendation_events") for row in json.loads(r.content)
+             if row["event"] == "shown"]
+    assert {r["round"] for r in shown} == {2}
+
+
+def test_follow_up_logs_previous_round_as_rejected_with_tags():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper", "exclude_categories": ["burgers"]})
+    rows = rejected_rows(up)
+    assert [r["place_id"] for r in rows] == ["node/1", "node/2", "node/3"]
+    assert {r["round"] for r in rows} == {1}
+    assert {r["reject_reason"] for r in rows} == {"refine:not:burgers,cheaper"}
+    assert all(r["user_id"] == USER_ID and r["session_id"] == SESSION_ID for r in rows)
+
+
+def test_cheaper_steps_the_budget_down_and_updates_the_session():
+    up = Upstreams(shown=ROUND_1)
+    body = follow_up(up, craving="thai", refine={"budget": "cheaper"}).json()
+    assert body["answers"] == {"craving": "thai", "budget_level": 1, "radius_m": 5000,
+                               "exclude_categories": []}
+    assert session_patch(up) == {"craving_category_id": "thai", "budget_level": 1,
+                                 "radius_m": 5000, "search_radius_m": 5000}
+
+
+def test_cheaper_stops_at_one_dollar():
+    body = follow_up(Upstreams(shown=ROUND_1), budget_level=1, refine={"budget": "cheaper"})
+    assert body.json()["answers"]["budget_level"] == 1
+
+
+def test_closer_searches_the_next_smaller_radius():
+    up = Upstreams(shown=ROUND_1)
+    body = follow_up(up, refine={"distance": "closer"}).json()
+    assert body["answers"]["radius_m"] == 1500
+    places_call = next(r for r in up.requests if r.url.host == "api.geoapify.com")
+    assert "1500" in places_call.url.params["filter"]
+
+
+def test_not_a_category_drops_it():
+    up = Upstreams(shown=[])
+    body = follow_up(up, refine={"exclude_categories": ["thai", "mexican"]}).json()
+    assert body["answers"]["exclude_categories"] == ["thai", "mexican"]
+    assert not {"thai", "mexican"} & {p["category"] for p in body["picks"]}
+
+
+def test_exclude_categories_are_kept_on_later_rounds():
+    body = follow_up(Upstreams(shown=[]), exclude_categories=["pizza"]).json()
+    assert "pizza" not in {p["category"] for p in body["picks"]}
+
+
+def test_something_else_drops_the_craving():
+    up = Upstreams(shown=[])
+    body = follow_up(up, craving="thai", refine={"something_else": True}).json()
+    assert body["answers"]["craving"] is None
+    assert body["answers"]["exclude_categories"] == ["thai"]
+    assert "thai" not in {p["category"] for p in body["picks"]}
+
+
+def test_something_else_with_anything_keeps_settings_and_shows_new_places():
+    up = Upstreams(shown=[shown_event(1, "node/1", 0.9, "thai", 33.953)])
+    body = follow_up(up, craving=None, refine={"something_else": True}).json()
+    assert body["answers"] == {"craving": None, "budget_level": 2, "radius_m": 5000,
+                               "exclude_categories": []}
+    ids = [p["id"] for p in body["picks"]]
+    assert "node/1" not in ids and len(ids) == 3
+    assert {r["reject_reason"] for r in rejected_rows(up)} == {"refine:something_else"}
+
+
+def test_follow_up_after_a_decision_is_a_conflict():
+    up = Upstreams(shown=ROUND_1, outcome="none")
+    assert follow_up(up, refine={"budget": "cheaper"}).status_code == 409
+    assert "api.geoapify.com" not in up.hosts() and "api.meta.ai" not in up.hosts()
+
+
+def test_follow_up_writes_run_alongside_muse():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"distance": "farther"})
+    assert up.hosts().count("api.meta.ai") == 1
+    assert up.hosts().count("api.geoapify.com") == 1
+    paths = [(r.method, r.url.path) for r in up.requests]
+    # One session read, one PATCH, one rejected insert, one shown insert, one places upsert.
+    assert paths.count(("GET", "/rest/v1/sessions")) == 1
+    assert paths.count(("PATCH", "/rest/v1/sessions")) == 1
+    assert paths.count(("POST", "/rest/v1/recommendation_events")) == 2
+
+
+@pytest.mark.parametrize("change", [{"budget": 5}, {"distance": 2000}, {"craving": "sushi"},
+                                    {"exclude_categories": ["other"]}, {"mood": "happy"}])
+def test_bad_refine_is_rejected(change):
+    up = Upstreams()
+    assert follow_up(up, refine=change).status_code == 422
+    assert up.requests == []
+
+
+def test_text_answers_with_a_list_are_saved():
+    up = Upstreams(shown=ROUND_1)
+    message = {"role": "user", "body": "not burgers, cheaper", "question_key": "refine",
+               "input_mode": "text",
+               "answer": {"exclude_categories": ["burgers"], "budget": "cheaper"}}
+    follow_up(up, transcript=[message], refine={"budget": "cheaper"})
+    (row,) = json.loads(writes(up, "messages")[0].content)
+    assert (row["input_mode"], row["round"]) == ("text", 1)
+    assert row["answer"]["exclude_categories"] == ["burgers"]
+
+
+# Cap: round 4 without a pick is the best so far (ML10)
+
+
+THREE_ROUNDS = [
+    *ROUND_1,
+    shown_event(2, "node/50", 0.85, "thai", 33.98, reason="Far but good."),
+    shown_event(2, "node/6", 0.4, "pizza", 33.954),
+    shown_event(3, "node/7", 0.7, "korean", 33.97),  # ~2.2 km: past a walk
+    shown_event(3, "node/8", 0.3, "indian", 33.958),
+]
+
+
+def shown_inserts(up: Upstreams) -> list[dict]:
+    rows = [row for r in writes(up, "recommendation_events") for row in json.loads(r.content)]
+    return [row for row in rows if row["event"] == "shown"]
+
+
+def test_round_four_shows_best_so_far_without_places_or_muse():
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, refine={"something_else": True}).json()
+    assert body["best_so_far"] is True and body["round"] == 4 and body["logged"] is True
+    assert [p["id"] for p in body["picks"]] == ["node/1", "node/50", "node/2"]
+    assert [p["rank"] for p in body["picks"]] == [1, 2, 3]
+    assert body["picks"][1]["reason"] == "Far but good."
+    assert "api.geoapify.com" not in up.hosts() and "api.meta.ai" not in up.hosts()
+    rows = shown_inserts(up)
+    assert [r["place_id"] for r in rows] == ["node/1", "node/50", "node/2"]
+    assert {r["round"] for r in rows} == {4}
+    assert {r["reasons_source"] for r in rows} == {"muse"}
+    assert [r["place_id"] for r in rejected_rows(up)] == ["node/7", "node/8"]
+
+
+def test_best_so_far_filters_by_current_answers():
+    # Not thai drops node/1 and node/50; a walk (1500 m) drops node/7.
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, radius_m=1500, refine={"exclude_categories": ["thai"]}).json()
+    assert [p["id"] for p in body["picks"]] == ["node/2", "node/3", "node/6"]
+
+
+def test_best_so_far_drops_known_prices_above_budget():
+    # node/50 was paid at $$ (history); at $ it no longer fits. Unknown prices stay.
+    body = follow_up(Upstreams(shown=THREE_ROUNDS), budget_level=1).json()
+    assert "node/50" not in [p["id"] for p in body["picks"]]
+    assert [p["id"] for p in body["picks"]] == ["node/1", "node/2", "node/7"]
+
+
+def test_best_so_far_fewer_than_three_shows_what_is_left():
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, radius_m=1500, refine={"exclude_categories": ["thai", "pizza"]}).json()
+    assert body["best_so_far"] is True
+    assert [p["id"] for p in body["picks"]] == ["node/3", "node/8"]
+    assert [r["rank"] for r in shown_inserts(up)] == [1, 2]
+
+
+def test_best_so_far_none_left_logs_no_cards():
+    up = Upstreams(shown=THREE_ROUNDS)
+    excluded = ["thai", "pizza", "mexican", "korean", "indian"]
+    body = follow_up(up, refine={"exclude_categories": excluded}).json()
+    assert body["best_so_far"] is True and body["picks"] == []
+    assert body["logged"] is True
+    assert shown_inserts(up) == []
+    assert len(rejected_rows(up)) == 2  # round 3's cards
+
+
+def test_answer_to_the_open_question_runs_a_normal_round():
+    up = Upstreams(shown=THREE_ROUNDS)
+    message = {"role": "user", "body": "Pizza", "question_key": "open", "input_mode": "chip",
+               "answer": {"craving": "pizza"}}
+    body = follow_up(up, transcript=[message], refine={"craving": "pizza"}).json()
+    assert body["best_so_far"] is False and body["round"] == 4
+    assert "api.geoapify.com" in up.hosts()
