@@ -1,7 +1,8 @@
 """User history for scoring (P1-12): quiz prior and counted meals with their places.
 
 Reads go through PostgREST with the user's own JWT and the publishable (anon) key, so RLS
-decides what comes back. The user_id filter is a second check. Two queries, run together.
+decides what comes back. The user_id filter is a second check. Two queries run together;
+with-people profiles also load companion IDs.
 Never log the token. Errors carry no upstream detail beyond the status code.
 """
 
@@ -21,11 +22,11 @@ MEALS_LIMIT = 1000
 # meals at unresolved backfill places load too (place = None): they count for the cuisine
 # model only, never as candidates, place stats, or distance.
 MEALS_SELECT = (
-    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,"
+    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,solo,meal_companions(companion_id),"
     "places(id,name,lat,lon,geoapify_categories,address,unresolved)"
 )
 MEAL_SLOTS = frozenset({"breakfast", "lunch", "dinner", "late"})
-PRIOR_SELECT = "favorite_categories,hard_no_categories,budget_level"
+PRIOR_SELECT = "favorite_categories,hard_no_categories,budget_level,mostly_solo"
 LEVELS = range(1, 5)
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def parse_prior(rows: list) -> QuizPrior:
         favorites=_categories(row.get("favorite_categories")),
         hard_nos=_categories(row.get("hard_no_categories")),
         budget_level=_level(row.get("budget_level")),
+        mostly_solo=row.get("mostly_solo") if isinstance(row.get("mostly_solo"), bool) else None,
     )
 
 
@@ -129,7 +131,17 @@ def parse_meal(row: dict) -> PastMeal | None:
         food_answered=isinstance(row.get("ate_at"), str) and bool(row["ate_at"]),
         went=True if live else None,
         stars=_stars(row.get("stars")) if live else None,
+        solo=row.get("solo") if isinstance(row.get("solo"), bool) else None,
+        companion_ids=read_ids(row.get("meal_companions"), "companion_id"),
     )
+
+
+def read_ids(rows: object, key: str) -> frozenset[str]:
+    """IDs from an optional PostgREST embed; malformed entries do not count."""
+    if not isinstance(rows, list):
+        return frozenset()
+    return frozenset(r[key] for r in rows if isinstance(r, dict)
+                     and isinstance(r.get(key), str) and r[key])
 
 
 async def _get(client: httpx2.AsyncClient, url: str, params: dict, headers: dict, timeout: float):
@@ -153,7 +165,9 @@ async def _get(client: httpx2.AsyncClient, url: str, params: dict, headers: dict
     return rows
 
 
-async def load(user_id: str, token: str, *, client: httpx2.AsyncClient) -> History:
+async def load(
+    user_id: str, token: str, *, client: httpx2.AsyncClient, include_companions: bool = True,
+) -> History:
     """The quiz prior and counted meals (newest first), read as the user."""
     settings = get_settings()
     try:
@@ -171,9 +185,22 @@ async def load(user_id: str, token: str, *, client: httpx2.AsyncClient) -> Histo
         "limit": MEALS_LIMIT,
     }
     prior_params = {"select": PRIOR_SELECT, "user_id": f"eq.{user_id}", "limit": 1}
-    prior_rows, meal_rows = await asyncio.gather(
+    async def companions_read():
+        if not include_companions:
+            return frozenset()
+        try:
+            rows = await _get(client, f"{base}/companions",
+                              {"select": "id", "user_id": f"eq.{user_id}"}, headers, timeout)
+            return read_ids(rows, "id")
+        except HistoryError as error:
+            logger.warning("Companions read failed: %s", type(error).__name__)
+            return frozenset()
+
+    prior_rows, meal_rows, companions = await asyncio.gather(
         _get(client, f"{base}/taste_profiles", prior_params, headers, timeout),
         _get(client, f"{base}/meals", meals_params, headers, timeout),
+        companions_read(),
     )
     meals = (parse_meal(r) for r in meal_rows if isinstance(r, dict))
-    return History(prior=parse_prior(prior_rows), meals=tuple(m for m in meals if m))
+    return History(prior=parse_prior(prior_rows), meals=tuple(m for m in meals if m),
+                   companions=companions)

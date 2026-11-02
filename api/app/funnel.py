@@ -10,6 +10,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from uuid import UUID
 
 import httpx2
 
@@ -84,6 +85,7 @@ class NewSession:
     radius_m: int | None
     search_radius_m: int
     solo: bool | None = None
+    companion_ids: frozenset[str] = frozenset()
 
 
 # REST plumbing ---------------------------------------------------------------
@@ -144,6 +146,31 @@ async def _send(
     return rows
 
 
+async def _write_companions(client: httpx2.AsyncClient, table: str, headers: dict, rows: list):
+    """Companion links are best effort; their failure must not lose the core session/pick."""
+    try:
+        await _send(client, "POST", table, headers, json=rows)
+    except FunnelError as error:
+        logger.warning("Funnel %s failed: %s", table, type(error).__name__)
+
+
+def _session_companions(value: object) -> list[str]:
+    """Check the optional embed before any pick writes; never index unchecked data."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise FunnelUpstreamError
+    ids = set()
+    for row in value:
+        if not isinstance(row, dict) or not isinstance(row.get("companion_id"), str):
+            raise FunnelUpstreamError
+        try:
+            ids.add(str(UUID(row["companion_id"])))
+        except ValueError:
+            raise FunnelUpstreamError from None
+    return sorted(ids)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -179,7 +206,12 @@ async def open_round(
                            json=row, prefer="return=representation")
         if not rows or not isinstance(rows[0], dict) or not rows[0].get("id"):
             raise FunnelUpstreamError
-        return RoundRef(session_id=rows[0]["id"], round=1)
+        sid = rows[0]["id"]
+        if new.companion_ids:
+            await _write_companions(client, "session_companions", headers,
+                                    [{"session_id": sid, "companion_id": cid, "user_id": user_id}
+                                     for cid in sorted(new.companion_ids)])
+        return RoundRef(session_id=sid, round=1)
 
     params = {
         "select": SESSION_SELECT,
@@ -387,7 +419,7 @@ async def log_messages(
 
 SHOWN_SELECT = (
     "place_id,places(category_id,lat,lon),"
-    "sessions(lat,lon,local_date,meal_slot,budget_level,solo,outcome)"
+    "sessions(lat,lon,local_date,meal_slot,budget_level,solo,outcome,session_companions(companion_id))"
 )
 
 
@@ -453,6 +485,7 @@ async def log_pick(
     session, place = shown["sessions"], shown["places"]
     if session.get("outcome") is not None:
         raise Conflict
+    companions = _session_companions(session.get("session_companions"))
     await close_session(user_id, token, session_id, "picked", client=client)
     meal = {
         "user_id": user_id,
@@ -467,10 +500,19 @@ async def log_pick(
         "budget_level": session.get("budget_level"),
         "distance_m": _distance(session, place),
     }
-    await asyncio.gather(
-        _send(client, "POST", "meals", _user_headers(token), json=meal),
+    headers = _user_headers(token)
+    options = {"params": {"select": "id"}, "prefer": "return=representation"} if companions else {}
+    rows, _ = await asyncio.gather(
+        _send(client, "POST", "meals", headers, json=meal, **options),
         log_event(user_id, token, session_id, round_, place_id, "picked", {}, client=client),
     )
+    if companions:
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("id"):
+            logger.warning("Funnel meal_companions skipped: meal insert returned no id")
+            return
+        await _write_companions(client, "meal_companions", headers,
+                                [{"meal_id": rows[0]["id"], "companion_id": cid, "user_id": user_id}
+                                 for cid in companions])
 
 
 def _distance(session: dict, place: dict) -> int | None:

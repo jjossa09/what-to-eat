@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { budgetPick, planPrefill, traceOf } from './questionPlan.ts';
+import { budgetPick, companySelection, matchCompany, planPrefill, skippedAnswers, traceOf } from './questionPlan.ts';
 
 // The exact body POST /questions/plan returned for a history like the device test (confident
 // Chinese at $, slot_weekend), captured from the API through its test client.
@@ -66,4 +66,92 @@ test('the trace lists every question, null when nothing was pre-selected', () =>
     distance: null,
   });
   assert.deepEqual(traceOf({}), { craving: null, budget: null, distance: null });
+});
+
+
+const A = 'aaaaaaaa-1111-4111-8111-000000000001';
+const B = 'bbbbbbbb-2222-4222-8222-000000000002';
+const C = 'cccccccc-3333-4333-8333-000000000003';
+const D = 'dddddddd-4444-4444-8444-000000000004';
+const PEOPLE = [{ id: A, name: 'Alex' }, { id: B, name: 'Sam' },
+  { id: C, name: 'Andrea' }, { id: D, name: 'Kim' }];
+const IDS = new Set(PEOPLE.map((c) => c.id));
+
+test('company matches an exact name', () => {
+  assert.deepEqual(matchCompany('Alex', PEOPLE), [A]);
+});
+test('company matches names ignoring case and surrounding whitespace', () => {
+  assert.deepEqual(matchCompany('  aLeX  ', PEOPLE), [A]);
+});
+test('company matches comma groups', () => {
+  assert.deepEqual(matchCompany('Sam, Alex', PEOPLE), [A, B]);
+});
+test('company matches ampersand groups', () => {
+  assert.deepEqual(matchCompany('Alex & Sam', PEOPLE), [A, B]);
+});
+test('company matches and groups', () => {
+  assert.deepEqual(matchCompany('Alex and Sam', PEOPLE), [A, B]);
+});
+test('company matches mixed separators', () => {
+  assert.deepEqual(matchCompany('Alex, Sam & Andrea and Kim', PEOPLE), [A, B, C, D]);
+});
+test('company never splits and inside a name', () => {
+  assert.deepEqual(matchCompany('Andrea and Sam', PEOPLE), [B, C]);
+});
+test('an exact Jack and Jill name wins over splitting it', () => {
+  const people = [{ id: A, name: 'Jack and Jill' }, { id: B, name: 'Jack' }, { id: C, name: 'Jill' }];
+  assert.deepEqual(matchCompany('Jack and Jill', people), [A]);
+});
+test('ambiguous Alex is never guessed, alone or in a group', () => {
+  const people = [...PEOPLE, { id: 'another-id', name: 'alex' }];
+  assert.equal(matchCompany('Alex', people), null);
+  assert.equal(matchCompany('Sam and Alex', people), null);
+});
+test('unknown names reject the whole group', () => {
+  assert.equal(matchCompany('Taylor', PEOPLE), null);
+  assert.equal(matchCompany('Alex and Taylor', PEOPLE), null);
+});
+test('repeated companions are rejected', () => {
+  assert.equal(matchCompany('Alex, alex', PEOPLE), null);
+});
+test('dangling and consecutive separators are rejected', () => {
+  for (const text of ['Alex,', ',Alex', 'Alex &', 'and Alex', 'Alex and', 'Alex,,Sam']) {
+    assert.equal(matchCompany(text, PEOPLE), null, text);
+  }
+});
+test('solo words are matched locally', () => {
+  for (const text of ['solo', 'alone', 'just me', ' SOLO ']) {
+    assert.equal(matchCompany(text, PEOPLE), 'solo');
+  }
+});
+test('empty company text is unknown', () => {
+  assert.equal(matchCompany('', PEOPLE), null);
+  assert.equal(matchCompany('  ', PEOPLE), null);
+});
+test('unmatched punctuation is not stripped to guess a name', () => {
+  assert.equal(matchCompany('Alex!', PEOPLE), null);
+  assert.equal(matchCompany('Alex; Sam', PEOPLE), null);
+});
+test('company selections accept known ids and lowercase solo only', () => {
+  assert.deepEqual(companySelection([B, A], IDS), [A, B]);
+  assert.equal(companySelection('solo', IDS), 'solo');
+  assert.equal(companySelection('Solo', IDS), null);
+  assert.equal(companySelection([A, 'unknown'], IDS), null);
+});
+test('company selections reject empty, duplicate, and non-array groups', () => {
+  for (const value of [[], [A, A], A, null, undefined, {}, 1, [1], ['Alex']]) {
+    assert.equal(companySelection(value, IDS), null);
+  }
+});
+
+test('a weak skipped company is never applied', () => {
+  for (const predicted of [[A], 'solo']) {
+    assert.deepEqual(skippedAnswers({ key: 'company', weak: true, predicted }, CATEGORY_IDS, IDS), {});
+  }
+});
+test('a confident skipped company is applied', () => {
+  assert.deepEqual(skippedAnswers({ key: 'company', weak: false, predicted: [A] }, CATEGORY_IDS, IDS),
+    { company: [A] });
+  assert.deepEqual(skippedAnswers({ key: 'company', weak: false, predicted: 'solo' }, CATEGORY_IDS, IDS),
+    { company: 'solo' });
 });

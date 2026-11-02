@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field, JsonValue, field_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
 from app import funnel, gate, history, muse, places, refine
 from app.answers import QuestionKey as ParseKey
@@ -116,7 +116,8 @@ class RecommendationsRequest(BaseModel):
     none_of_these: bool = False
     session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
-    solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
+    solo: bool | None = None
+    companion_ids: list[UUID] = Field(default_factory=list)
     transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=8)
     # Round 1 (P2-05): the question order the phone used and where it came from ("plan" or
     # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
@@ -125,6 +126,13 @@ class RecommendationsRequest(BaseModel):
     # Round 1 trace: the plan's pre-fills as the phone received them, and the chips it showed
     # selected at each answer. Loosely typed like the two above.
     prefilled: JsonValue = None
+    company_prefilled: JsonValue = None
+
+    @model_validator(mode="after")
+    def consistent_company(self):
+        if self.solo is True and self.companion_ids:
+            raise ValueError("solo cannot include companions")
+        return self
 
     @field_validator("timezone")
     @classmethod
@@ -173,10 +181,13 @@ async def quietly(coro, what: str):
     return True if result is None else result
 
 
-async def load_history(user_id: str, token: str, client: httpx2.AsyncClient) -> History | None:
+async def load_history(
+    user_id: str, token: str, client: httpx2.AsyncClient, *, include_companions: bool = True,
+) -> History | None:
     """History, or None on any failure (the round goes on as a cold start)."""
     try:
-        return await history.load(user_id, token, client=client)
+        return await history.load(user_id, token, client=client,
+                                  include_companions=include_companions)
     except Exception as e:
         logger.warning("History load failed: %s", type(e).__name__)
         return None
@@ -214,6 +225,7 @@ async def recommendations(
         radius_m=answers.radius_m,
         search_radius_m=radius,
         solo=body.solo,
+        companion_ids=frozenset(str(c) for c in body.companion_ids),
     )
     session_id = str(body.session_id) if body.session_id else None
     opening = quietly(
@@ -228,7 +240,9 @@ async def recommendations(
             )
         else:
             # The session read decides the round (and whether it is the cap) before searching.
-            loaded, ref = await asyncio.gather(load_history(user_id, token, client), opening)
+            loaded, ref = await asyncio.gather(
+                load_history(user_id, token, client, include_companions=False), opening
+            )
             if ref and ref.closed:
                 raise HTTPException(status.HTTP_409_CONFLICT, "Session already has an outcome")
             if ref and ref.round == CAP_ROUND and not body.answered_open_question():
@@ -248,6 +262,7 @@ async def recommendations(
         meal_slot=slot,
         is_weekend=is_weekend,
         search_radius_m=result.radius_m,
+        companion_ids=frozenset(str(c) for c in body.companion_ids),
         craving=answers.craving,
         budget_level=answers.budget_level,
         radius_m=answers.radius_m,
@@ -357,10 +372,13 @@ def round_one_plan(
 ) -> dict:
     """Round 1's plan log: the plan recomputed from the same history and context as
     /questions/plan, and next to it what the phone actually asked (gate.asked_log)."""
-    recomputed = gate.plan(user_history, slot, is_weekend, local_date)
+    recomputed = gate.plan(user_history, slot, is_weekend, local_date,
+                           new_search=body.plan_source == "new_search")
     asked = gate.asked_log(body.asked_order, body.plan_source, recomputed)
-    return {**recomputed.as_log(),
-            "asked": {**asked, "prefilled": gate.prefilled_log(body.prefilled)}}
+    asked["prefilled"] = gate.prefilled_log(body.prefilled)
+    if "company_prefilled" in body.model_fields_set:
+        asked["company_prefilled"] = gate.company_prefilled_log(body.company_prefilled)
+    return {**recomputed.as_log(), "asked": asked}
 
 
 async def log_gate(
@@ -484,6 +502,7 @@ def best_reason(meters: int) -> str:
 
 
 class PlanRequest(BaseModel):
+    new_search: bool = False
     local_time: datetime  # the device's local time; sets the meal slot and date
 
 
@@ -499,11 +518,12 @@ async def question_plan(
     user_id, token = auth
     loaded = await load_history(user_id, token, client)
     slot, local_date, is_weekend = meal_context(body.local_time)
-    chosen = gate.plan(loaded or History(), slot, is_weekend, local_date)
+    chosen = gate.plan(loaded or History(), slot, is_weekend, local_date,
+                       new_search=body.new_search)
     return {
         "history_used": loaded is not None,
         "meal_slot": slot,
-        "questions": [q.as_dict() for q in chosen.questions],
+        **chosen.as_log(),
     }
 
 
