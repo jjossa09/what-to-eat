@@ -30,7 +30,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | ID | Requirement | Phase |
 |---|---|---|
 | FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 2 chips: Close to me, I don't mind. | 1 |
-| FR4 | Exactly 3 questions (3 messages) before the first round of recommendations. The ML6 confidence gate chooses which 3; Muse only phrases them. Answers the models can predict are pre-filled and editable. Cold start (Phase 1): the gate runs on the quiz prior. | 1-2 |
+| FR4 | Exactly 3 questions (3 messages) before the first round of recommendations: craving, budget, and distance (company joins the pool with P2-07). The ML6 confidence gate sets their order: weak predictions are asked first; answers the models predict confidently are asked last with their chip pre-selected and editable. The quiz budget is pre-selected even when the budget prediction is weak (it is the user's own answer). Question text is fixed; Muse only parses answers. Cold start: the gate runs on the quiz prior. | 1-2 |
 | FR5 | Free-text answers are parsed by Muse into the same structured answers as quick-reply chips (ML7). | 1 |
 
 ### Recommendations
@@ -40,7 +40,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | FR6 | Geoapify Places search (catering categories) from the current location, using the search radius defined in FR-R2. | 1 |
 | FR7 | Each candidate is scored deterministically (ML5); the top 3 are shown, each with a one-line reason written by Muse from the actual evidence (ML7). | 1 |
 | FR8 | The top 3 appear as compact cards and pins on an Apple Map, with "Powered by Geoapify" and "© OpenStreetMap contributors" shown (NFR5). Tapping Directions opens Apple Maps. | 1 |
-| FR9 | The user confirms which place they chose, or none. | 1 |
+| FR9 | The user confirms which place they chose. 'None of these' asks a refinement question and keeps the session open. A session ends as none at the round-4 cap. A session left without a decision keeps no outcome. | 1 |
 | FR9b | After the first round, the conversation stays open as long as needed; refinement follows the ML10 loop. | 1 |
 
 ### Feedback
@@ -79,7 +79,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 | ML3 | Layer 1, cuisine model: recency-weighted counts per context. Backs off to broader contexts when data is thin: this companion, then user overall, then quiz prior. Outputs a probability per category plus the number of meals behind it. | 2 |
 | ML4 | Layer 2, place model: return score from visits, recency, and 1-5 star ratings; 1-2 stars drop it sharply. New places are scored on category fit and distance fit. Price fit uses the user's own price data for that place; unknown = half. | 2 |
 | ML5 | Scoring: each real candidate is scored deterministically from ML3, ML4, price fit, and distance fit. OSM has no ratings or price levels, so neither is used. Top 3 = 2 familiar picks + 1 discovery slot (best candidate outside the user's usual categories). Phase 1 uses the quiz prior in place of ML3 and ML4. | 1 |
-| ML6 | Confidence gate: if the top prediction is weak or rests on too few meals, the app asks a question instead of assuming. This decides which of the 3 questions are asked. When price is uncertain, it may ask the budget question with the same 4 buttons ($ / $$ / $$$ / $$$$). | 2 |
+| ML6 | Confidence gate: a prediction is weak if its top probability is under 0.4 or it rests on fewer than 5 meals in the context (Starting values). The gate orders the 3 questions (weak first) and decides which answers are pre-selected; it never skips a question. Craving uses the cuisine model (ML3); budget uses the user's paid price levels, smoothed toward the quiz budget the same way; distance is treated as weak until it has its own model. | 2 |
 | ML7 | Muse is language only: parse free text into structured answers, write each pick's one-line reason from the actual evidence, run the conversation. Muse never reorders, removes, or adds places. One Muse call writes all 3 reasons; its output is checked against the candidate IDs. | 1 |
 | ML8 | Funnel logged per recommendation: shown, interested (card or directions tapped), rejected (with reason), picked, went, stars, price tap. | 1 |
 | ML9 | Evaluation: time-ordered replay on backfilled history (predict each meal using only earlier meals). Report cuisine and place top-3 hit rates against two baselines (always most frequent; random), with sample size stated. | 2 |
