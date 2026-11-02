@@ -12,7 +12,7 @@ import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
-from app import funnel, gate, history, muse, places, refine, widening
+from app import funnel, gate, history, insights, muse, places, refine, widening
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -60,6 +60,15 @@ def health() -> dict[str, str]:
 @app.get("/me")
 def me(user_id: str = Depends(current_user)) -> dict[str, str]:
     return {"user_id": user_id}
+
+
+@app.get("/insights")
+async def get_insights(
+    as_of: date,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    return await insights.response(*auth, as_of, client=client)
 
 
 @app.get("/places/search")
