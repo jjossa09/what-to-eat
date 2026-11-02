@@ -21,7 +21,7 @@ MEALS_LIMIT = 1000
 # meals at unresolved backfill places load too (place = None): they count for the cuisine
 # model only, never as candidates, place stats, or distance.
 MEALS_SELECT = (
-    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,"
+    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,"
     "places(id,name,lat,lon,geoapify_categories,address,unresolved)"
 )
 MEAL_SLOTS = frozenset({"breakfast", "lunch", "dinner", "late"})
@@ -51,6 +51,12 @@ def _categories(value) -> frozenset[str]:
     if not isinstance(value, list):
         return frozenset()
     return frozenset(c for c in value if c in CATEGORY_IDS)
+
+
+def _stars(value) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 5:
+        return value
+    return None
 
 
 def _level(value) -> int | None:
@@ -92,6 +98,10 @@ def parse_meal(row: dict) -> PastMeal | None:
     place = None; a resolved place with bad fields drops the row."""
     if row.get("source") not in ("backfill", "live"):
         return None
+    # The query loads live meals with went = true only; this is the second check.
+    live = row["source"] == "live"
+    if live and row.get("went") is not True:
+        return None
     place_row = row.get("places")
     if place_row is None:
         place = None
@@ -117,6 +127,8 @@ def parse_meal(row: dict) -> PastMeal | None:
         is_weekend=weekend if isinstance(weekend, bool) else None,
         dish=dish.strip() or None if isinstance(dish, str) else None,
         food_answered=isinstance(row.get("ate_at"), str) and bool(row["ate_at"]),
+        went=True if live else None,
+        stars=_stars(row.get("stars")) if live else None,
     )
 
 

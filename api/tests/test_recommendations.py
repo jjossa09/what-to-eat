@@ -57,8 +57,8 @@ PRIOR = [{"favorite_categories": ["thai", "pizza"], "hard_no_categories": ["burg
 FAR_PLACE = {"id": "node/50", "name": "Far Thai", "lat": 33.98, "lon": LON,
              "geoapify_categories": ["catering.restaurant.thai"], "address": "50 Far Rd",
              "unresolved": False}
-MEALS = [{"source": "live", "category_id": None, "eaten_on": "2026-10-20", "price_level": 2,
-          "places": FAR_PLACE}]
+MEALS = [{"source": "live", "went": True, "category_id": None, "eaten_on": "2026-10-20",
+          "price_level": 2, "places": FAR_PLACE}]
 
 
 class Upstreams:
@@ -202,10 +202,10 @@ def test_history_read_as_user():
 
 
 def test_history_place_beyond_geoapify_is_merged():
-    # Far Thai is only known from history. With the near Thai place rejected, it fills the
-    # second favorite slot (v1 has no return score, so nearer places win otherwise).
+    # Far Thai is only known from history. With the near Thai place rejected, it takes a
+    # favorite slot, and its return score (P2-10, one past visit) puts it above nearer Pizza.
     body = post(Upstreams(), exclude_ids=["node/1"]).json()
-    assert [p["id"] for p in body["picks"]][:2] == ["node/2", "node/50"]
+    assert [p["id"] for p in body["picks"]][:2] == ["node/50", "node/2"]
 
 
 def test_same_inputs_same_top3():

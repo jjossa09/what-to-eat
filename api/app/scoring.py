@@ -3,8 +3,9 @@
 Pure functions, no I/O, no clock: the caller passes the local date. Weights and thresholds
 are in app/scoring_rules.py. Muse never touches this; it only words the evidence (ML7).
 
-category_fit reads the cuisine model (P2-02, app/cuisine_model.py), predicted once per
-round. return_score is the place-model slot: P2-10 (ML4) replaces its body.
+category_fit reads the cuisine model (P2-02, app/cuisine_model.py); the return score, visits,
+and known price come from the place model (P2-10, app/place_model.py). Both run once per round
+with as_of = the local date.
 """
 
 from dataclasses import dataclass, replace
@@ -12,6 +13,7 @@ from datetime import date, datetime, timedelta
 
 from app.categories import OTHER, map_category
 from app.cuisine_model import CuisinePrediction, predict
+from app.place_model import PlaceScore, place_scores
 from app.places import Candidate, distance_m
 from app.refine import radius_level
 from app.scoring_rules import (
@@ -76,6 +78,8 @@ class PastMeal:
     is_weekend: bool | None = None  # from eaten_on; None = derive it
     dish: str | None = None  # loaded, not scored
     food_answered: bool = False  # live: the food answer was given (meals.ate_at)
+    went: bool | None = None  # live: True for every loaded live meal; None for backfill
+    stars: int | None = None  # live only, 1-5
 
 
 @dataclass(frozen=True)
@@ -155,28 +159,6 @@ def merge_candidates(
 # Fits ------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class PlaceStats:
-    visits: int
-    last_visit_days: int | None
-    price_level: int | None  # most recent known price at this place
-
-
-def place_stats(history: History, today: date) -> dict[str, PlaceStats]:
-    stats: dict[str, PlaceStats] = {}
-    for meal in history.meals:  # newest first
-        if meal.place is None:  # unresolved: no place to match
-            continue
-        pid = meal.place.id
-        prev = stats.get(pid)
-        if prev is None:
-            stats[pid] = PlaceStats(1, (today - meal.eaten_on).days, meal.price_level)
-        else:
-            price = prev.price_level if prev.price_level is not None else meal.price_level
-            stats[pid] = replace(prev, visits=prev.visits + 1, price_level=price)
-    return stats
-
-
 def category_fit(category: str, prediction: CuisinePrediction) -> tuple[float, str]:
     """p(category) / max p, so the top category fits 1.0. Returns (fit, source = level)."""
     if category == OTHER:
@@ -200,11 +182,6 @@ def is_weak(prediction: CuisinePrediction) -> bool:
     the reported level. Used by the confidence gate (P2-05)."""
     top = max(prediction.probs.values(), default=0.0)
     return top < WEAK_TOP_PROB or prediction.meals < WEAK_MIN_MEALS
-
-
-def return_score(stats: PlaceStats | None, context: Context) -> float:
-    """v1: 0 for every place. P2-10 replaces this with visits, recency, and stars (ML4)."""
-    return 0.0
 
 
 def price_fit(known_level: int | None, budget_level: int | None) -> float:
@@ -231,7 +208,7 @@ class Evidence:
     category_source: str  # cuisine model level ("quiz", "user", "slot", "slot_weekend"), "other"
     category_meals: int  # raw counted meals of this food category (not visits to the place)
     craving: str | None
-    return_score: float
+    return_score: float  # place model, in [-1, 1]; 0 = never visited
     price_fit: float
     known_price_level: int | None
     budget_level: int | None
@@ -240,6 +217,7 @@ class Evidence:
     radius_m: int
     visits: int
     last_visit_days: int | None
+    stars_mean: float | None  # the user's own recency-weighted mean stars; None = no ratings
     from_history: bool  # merged from Supabase, not in this Geoapify response
     reasons: tuple[str, ...]
 
@@ -270,7 +248,7 @@ def score_candidate(
     place: Candidate,
     history: History,
     context: Context,
-    stats: dict[str, PlaceStats],
+    places: dict[str, PlaceScore],
     merged_ids: frozenset[str],
     prediction: CuisinePrediction,
     usual: frozenset[str],
@@ -292,12 +270,12 @@ def score_candidate(
     if place.category == OTHER:
         reasons.append("category_unknown")
 
-    place_stat = stats.get(place.id)
-    ret = return_score(place_stat, context)
-    if place_stat:
+    visited = places.get(place.id)
+    ret = visited.return_score if visited else 0.0
+    if visited:
         reasons.append("visited_before")
 
-    known = place_stat.price_level if place_stat else None
+    known = visited.known_price_level if visited else None
     budget = context.budget_level or history.prior.budget_level
     p_fit = price_fit(known, budget)
     if known is None or budget is None:
@@ -336,8 +314,9 @@ def score_candidate(
         distance_fit=round(d_fit, SCORE_DIGITS),
         distance_m=place.distance_m,
         radius_m=radius,
-        visits=place_stat.visits if place_stat else 0,
-        last_visit_days=place_stat.last_visit_days if place_stat else None,
+        visits=visited.visits if visited else 0,
+        last_visit_days=visited.last_visit_days if visited else None,
+        stars_mean=visited.stars_mean if visited else None,
         from_history=place.id in merged_ids,
         reasons=tuple(reasons),
     )
@@ -358,7 +337,7 @@ def rank(
     """Hard no's, excluded categories, and rejected places are dropped, the rest scored,
     top 3 = 2 familiar + 1 discovery (ML5). A craving answer makes the craved category the
     familiar one."""
-    stats = place_stats(history, context.local_date)
+    places = place_scores(history, as_of=context.local_date)
     prediction = predict(history, context, as_of=context.local_date)
     model_usual = usual_categories(prediction, history.prior)
     allowed = [
@@ -371,7 +350,7 @@ def rank(
     ranked = tuple(
         sorted(
             (
-                score_candidate(c, history, context, stats, merged_ids, prediction, model_usual)
+                score_candidate(c, history, context, places, merged_ids, prediction, model_usual)
                 for c in allowed
             ),
             key=rank_key,

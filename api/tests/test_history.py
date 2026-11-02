@@ -32,8 +32,8 @@ def place_row(pid="node/1", unresolved=False, **kw) -> dict:
 
 
 def meal_row(place=None, **kw) -> dict:
-    return {"source": "live", "category_id": None, "eaten_on": "2026-10-28", "price_level": 2,
-            "places": place_row() if place is None else place, **kw}
+    return {"source": "live", "went": True, "category_id": None, "eaten_on": "2026-10-28",
+            "price_level": 2, "places": place_row() if place is None else place, **kw}
 
 
 class Supabase:
@@ -154,3 +154,26 @@ def test_missing_settings_raise_not_configured(monkeypatch):
 def test_upstream_failures(upstream, error):
     with pytest.raises(error):
         run_load(upstream)
+
+
+def test_select_loads_went_and_stars():
+    upstream = Supabase()
+    run_load(upstream)
+    meals = next(r for r in upstream.requests if r.url.path.endswith("/meals"))
+    fields = set(meals.url.params["select"].split("places(")[0].strip(",").split(","))
+    assert {"went", "stars"} <= fields
+
+
+def test_stars_are_live_only_and_went_false_is_dropped():
+    meals = [
+        meal_row(stars=5),
+        meal_row(stars=9),
+        meal_row(stars=True),
+        meal_row(source="backfill", went=None, stars=4),
+        meal_row(went=False, stars=1),
+        meal_row(went=None),
+    ]
+    result = run_load(Supabase(meals=meals)).meals
+    assert [(m.source, m.went, m.stars) for m in result] == [
+        ("live", True, 5), ("live", True, None), ("live", True, None),
+        ("backfill", None, None)]

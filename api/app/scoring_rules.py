@@ -4,8 +4,9 @@ Every number here is an untuned starting value (REQUIREMENTS, Starting values). 
 live data only, never on the backfill.
 """
 
-# Score = sum of weight * fit, each fit in [0, 1]. Weights sum to 1, so scores are in [0, 1].
-# Return score is 0 for every place until P2-10, so its weight shifts no ranking yet.
+# Score = sum of weight * fit. Weights sum to 1. Every fit is in [0, 1] except the return
+# score (P2-10), which is in [-1, 1]: 1-2 stars go negative so a low-rated place scores below
+# a new place (0). Scores are in [-0.25, 1]; only their order is used.
 WEIGHTS: dict[str, float] = {
     "category": 0.40,
     "return": 0.25,
@@ -20,6 +21,13 @@ SMOOTHING_K = 3  # p = (weighted count + K * parent p) / (weighted n + K)
 QUIZ_FAVORITES_MASS = 0.7  # quiz prior: favorites share 0.7, other allowed categories 0.3
 LEVEL_MIN_N_EFF = 1.0  # the reported level is the deepest with this much weighted data
 OTHER_FIT = 0.0  # Other is shown but never predicted (ML2)
+
+# Place model (P2-10, ML4, app/place_model.py). Fixed before evaluation (ML9), never tuned on
+# the backfill. Same recency weight as the cuisine model (HALF_LIFE_DAYS).
+FAMILIARITY_SCALE = 1.5  # familiarity = 1 - exp(-weighted visits / FAMILIARITY_SCALE)
+# Star factor by the recency-weighted mean of the user's stars, linear between whole stars.
+STAR_FACTOR: dict[int, float] = {5: 1.0, 4: 0.85, 3: 0.6, 2: -0.5, 1: -1.0}
+STAR_UNKNOWN = 0.85  # a visited place with no ratings (all backfill)
 
 # Usual categories (ML5): at least this raw recency-weighted share of the user's meals.
 USUAL_MIN_SHARE = 0.15

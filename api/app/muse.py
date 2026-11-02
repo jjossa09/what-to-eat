@@ -73,6 +73,11 @@ PAST_VISIT_TERMS = re.compile(
     r"\b(familiar|usual\w*|again|back|return\w*|regular\w*|go-to)\b", re.IGNORECASE
 )
 
+# A star rating (P2-10). Rejected for a pick with no stars_mean; for a rated pick, a stated
+# number of stars must be its stars_mean (rounded to 0.1, or the whole number when exact).
+RATING_TERMS = re.compile(r"\b(stars?|rated|ratings?)\b", re.IGNORECASE)
+STAR_CLAIM = re.compile(r"(\d+(?:\.\d+)?)[\s-]*stars?\b", re.IGNORECASE)
+
 # Ranking labels, not facts: never sent to Muse (the slot name is withheld too).
 RANKING_SIGNALS = frozenset({"familiar", "discovery"})
 
@@ -83,6 +88,8 @@ SYSTEM_PROMPT = (
     "(no familiar, usual, again, back, return, regular, go-to). "
     "times_had_category counts the user's past meals of that food anywhere, not visits to "
     "this place. "
+    "Mention a star rating only from stars_mean, the user's own rating of that place; "
+    "if stars_mean is absent, never mention stars or ratings. "
     "Do not repeat the place name. No health, nutrition, calorie, or diet claims. "
     f"Each reason is one plain sentence of at most {MAX_REASON_CHARS} characters. "
     'Reply with JSON only: {"reasons": [{"id": "<pick id>", "line": "<reason>"}]}, '
@@ -212,7 +219,19 @@ def pick_evidence(pick: Pick) -> dict:
         "times_had_category": e.category_meals,
         "price": price_note(price),
         "signals": [r for r in e.reasons if r not in RANKING_SIGNALS],
-    }
+    } | ({"stars_mean": stars_shown(e.stars_mean)} if e.stars_mean is not None else {})
+
+
+def stars_shown(stars_mean: float) -> float:
+    return round(stars_mean, 1)
+
+
+def star_claims_ok(line: str, stars_mean: float | None) -> bool:
+    """No rating words without a rating; a stated star count must match the rating."""
+    if stars_mean is None:
+        return not RATING_TERMS.search(line)
+    shown = stars_shown(stars_mean)
+    return all(float(n) == shown for n in STAR_CLAIM.findall(line))
 
 
 def request_body(picks: tuple[Pick, ...]) -> dict:
@@ -253,8 +272,12 @@ def check_output(
     ids: list[str],
     finish_reason: str | None = None,
     never_visited: frozenset[str] = frozenset(),
+    stars: dict[str, float | None] | None = None,
 ) -> dict[str, str]:
-    """Muse content -> {id: line} for exactly these ids, or RejectedOutput with a code."""
+    """Muse content -> {id: line} for exactly these ids, or RejectedOutput with a code.
+
+    stars: pick id -> stars_mean (None = unrated) to check rating claims; None skips it.
+    """
     if finish_reason == "length":
         raise RejectedOutput("truncated")
     if not isinstance(content, str):
@@ -283,6 +306,8 @@ def check_output(
             raise RejectedOutput("health_term")
         if entry["id"] in never_visited and PAST_VISIT_TERMS.search(line):
             raise RejectedOutput("past_visit_claim")
+        if stars is not None and not star_claims_ok(line, stars.get(entry["id"])):
+            raise RejectedOutput("rating_claim")
         lines[entry["id"]] = line
     return lines
 
@@ -388,7 +413,8 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
     ids = [p.scored.place.id for p in picks]
     try:
         never_visited = frozenset(p.scored.place.id for p in picks if p.scored.evidence.visits == 0)
-        lines = check_output(content, ids, finish_reason, never_visited)
+        stars = {p.scored.place.id: p.scored.evidence.stars_mean for p in picks}
+        lines = check_output(content, ids, finish_reason, never_visited, stars)
     except RejectedOutput as e:
         logger.warning(
             "Muse output rejected: %s (%s)", e, rejection_note(content, finish_reason, usage)
