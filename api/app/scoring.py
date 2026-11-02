@@ -177,11 +177,15 @@ def usual_categories(prediction: CuisinePrediction, prior: QuizPrior) -> frozens
     return frozenset(c for c, s in prediction.user_shares.items() if s >= USUAL_MIN_SHARE)
 
 
+def weak(top_prob: float, meals: int) -> bool:
+    """ML6: top probability under WEAK_TOP_PROB, or fewer than WEAK_MIN_MEALS raw meals."""
+    return top_prob < WEAK_TOP_PROB or meals < WEAK_MIN_MEALS
+
+
 def is_weak(prediction: CuisinePrediction) -> bool:
-    """ML6: top probability under WEAK_TOP_PROB, or fewer than WEAK_MIN_MEALS raw meals behind
-    the reported level. Used by the confidence gate (P2-05)."""
-    top = max(prediction.probs.values(), default=0.0)
-    return top < WEAK_TOP_PROB or prediction.meals < WEAK_MIN_MEALS
+    """ML6 for the cuisine model: weak() on the top probability and the raw meals behind the
+    reported level (FR-R3: meals in that context). Used by the confidence gate (P2-05)."""
+    return weak(max(prediction.probs.values(), default=0.0), prediction.meals)
 
 
 def price_fit(known_level: int | None, budget_level: int | None) -> float:
@@ -328,18 +332,38 @@ def rank_key(s: Scored) -> tuple[float, int, str]:
     return (-s.score, s.place.distance_m, s.place.id)
 
 
+@dataclass(frozen=True)
+class Models:
+    """The model outputs a round ranks with. They depend on history, the local date, and the
+    meal slot and weekday/weekend, never on the answers, so one copy serves every re-rank of
+    the round (P2-05 information gain)."""
+
+    places: dict[str, PlaceScore]
+    prediction: CuisinePrediction
+    usual: frozenset[str]  # the model's usual categories (not the craving)
+
+
+def models_for(history: History, context: Context) -> Models:
+    prediction = predict(history, context, as_of=context.local_date)
+    return Models(
+        places=place_scores(history, as_of=context.local_date),
+        prediction=prediction,
+        usual=usual_categories(prediction, history.prior),
+    )
+
+
 def rank(
     candidates: list[Candidate],
     context: Context,
     history: History,
     merged_ids: frozenset[str] = frozenset(),
+    models: Models | None = None,
 ) -> Ranking:
     """Hard no's, excluded categories, and rejected places are dropped, the rest scored,
     top 3 = 2 familiar + 1 discovery (ML5). A craving answer makes the craved category the
-    familiar one."""
-    places = place_scores(history, as_of=context.local_date)
-    prediction = predict(history, context, as_of=context.local_date)
-    model_usual = usual_categories(prediction, history.prior)
+    familiar one. models: precomputed models_for(history, context), else computed here."""
+    m = models or models_for(history, context)
+    places, prediction, model_usual = m.places, m.prediction, m.usual
     allowed = [
         c
         for c in candidates

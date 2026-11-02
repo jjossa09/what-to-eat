@@ -247,6 +247,38 @@ async def update_answers(
                 params={"id": f"eq.{session_id}", "user_id": f"eq.{user_id}"}, json=row)
 
 
+async def append_gate(
+    token: str, session_id: str, round_: int, entry: dict, plan: dict | None = None,
+    *, client: httpx2.AsyncClient,
+) -> None:
+    """sessions.gate (P2-05): adds this round's entry, and the plan on round 1, through
+    append_session_gate() (SECURITY INVOKER, so RLS applies; it matches only the caller's own
+    session). Its own write, never part of the round's other logging: a failure here loses
+    only the gate entry. NotFound when no session of the caller's matched."""
+    try:
+        response = await client.post(
+            f"{_base()}/rpc/append_session_gate",
+            json={"p_session_id": session_id, "p_round": round_, "p_entry": entry,
+                  "p_plan": plan},
+            headers=_user_headers(token),
+            timeout=get_settings().SUPABASE_TIMEOUT_S,
+        )
+    except httpx2.TimeoutException:
+        raise FunnelTimeout from None
+    except httpx2.HTTPError:
+        raise FunnelUpstreamError from None
+    if response.status_code != 200:
+        logger.warning("Supabase rpc append_session_gate returned status %s",
+                       response.status_code)
+        raise FunnelUpstreamError
+    try:
+        appended = response.json()
+    except ValueError:
+        raise FunnelUpstreamError from None
+    if appended is not True:
+        raise NotFound
+
+
 async def log_rejected(
     user_id: str, token: str, session_id: str, round_: int, place_ids: list[str], reason: str,
     *, client: httpx2.AsyncClient,
