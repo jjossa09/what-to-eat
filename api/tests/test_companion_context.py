@@ -461,6 +461,11 @@ def test_company_prior_without_groups_keeps_the_quiz_share_for_solo():
                                    unseen_group(): 1 - QUIZ_FAVORITES_MASS}, abs=1e-12)
 
 
+def test_company_prior_without_quiz_or_groups_is_equal_shares():
+    probs = company_prior(None, [])
+    assert probs == pytest.approx({"solo": 0.5, unseen_group(): 0.5}, abs=1e-12)
+
+
 def test_twenty_solo_dinners_without_groups_skip_company_as_solo():
     days = range(1, 21)
     cats = ("thai", "pizza", "mexican", "indian", "korean")  # craving stays weak
