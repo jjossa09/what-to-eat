@@ -7,10 +7,12 @@ import { directionsUrl } from '../lib/places';
 import { colors, emojiFor, radii, spacing, type } from '../theme';
 import { Attribution, MiniMap } from './PlaceMap';
 import PressScale from './PressScale';
-import { Chip, GlassCard, TextLink } from './ui';
+import { Chip, GlassCard } from './ui';
 
 // The round's 3 picks as glass cards with a mini map (P1-13, FR8). Funnel events (ML8):
-// card tap and Directions log "interested"; Pick this / None of these record the decision.
+// card tap and Directions log "interested"; Pick this records the decision. None of these
+// (P2-05): before the cap it hands over to the chat (a refinement question, session stays
+// open, no call); on the cap round (final) it records the session's outcome as none.
 
 const METERS_PER_MILE = 1609.344;
 
@@ -34,6 +36,11 @@ type Props = {
   onDecided?: () => void;
   /** An earlier round (P1-14): cards and Directions stay, the decision buttons hide. */
   readOnly?: boolean;
+  /** The cap round (best so far): None of these ends the session as none. */
+  final?: boolean;
+  /** Before the cap: None of these asks the chat for a refinement question instead. False
+   * when the chat is busy: the buttons stay so the user can tap again. */
+  onNoneOfThese?: () => boolean;
 };
 
 export default function ResultCards({
@@ -45,6 +52,8 @@ export default function ResultCards({
   onPicked,
   onDecided,
   readOnly = false,
+  final = false,
+  onNoneOfThese,
 }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision>('open');
@@ -99,8 +108,16 @@ export default function ResultCards({
     decide(() => logPicked(sessionId, round, p.id), `Enjoy ${p.name}!`, onPicked);
   }
 
+  /** Before the cap: hand over to the chat, nothing saved. On the cap round: outcome none. */
+  const refines = !final && onNoneOfThese !== undefined;
+
   function none() {
-    if (!canRecord || sessionId === null || decision !== 'open') return;
+    if (readOnly || decision !== 'open') return;
+    if (refines) {
+      if (onNoneOfThese?.()) setDecision('done');
+      return;
+    }
+    if (!canRecord || sessionId === null) return;
     decide(() => logNone(sessionId), 'Got it, no pick this time.');
   }
 
@@ -132,9 +149,9 @@ export default function ResultCards({
           <Chip label="Try again" onPress={failed} />
         </View>
       )}
-      {canRecord && open && !failed && (
+      {open && !failed && (refines ? !readOnly : canRecord) && (
         <View style={styles.center}>
-          <TextLink label="None of these" onPress={none} />
+          <Chip label="None of these" onPress={none} />
         </View>
       )}
       {/* Once under the results: only the latest round shows it. */}

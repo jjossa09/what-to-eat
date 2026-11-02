@@ -3,16 +3,16 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator
 
-from app import funnel, history, muse, places, refine
+from app import funnel, gate, history, muse, places, refine
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -21,7 +21,7 @@ from app.config import get_settings
 from app.logs import configure_logging
 from app.place_model import place_scores
 from app.refine import Change
-from app.scoring import Context, History, meal_context, merge_candidates, rank
+from app.scoring import Context, History, meal_context, merge_candidates, models_for, rank
 
 configure_logging()
 app = FastAPI(title="What to eat! API")
@@ -111,10 +111,20 @@ class RecommendationsRequest(BaseModel):
     # Current answers from the chat ("not burgers"); a follow-up's change is in refine.
     exclude_categories: list[str] = Field(default_factory=list, max_length=len(refine.CRAVINGS))
     refine: Change | None = None  # a follow-up (chip or parsed text), applied here
+    # The user tapped "None of these" on the previous round before this follow-up (P2-05):
+    # its cards are logged as rejected with none_of_these first in the reason.
+    none_of_these: bool = False
     session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
     solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
     transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=8)
+    # Round 1 (P2-05): the question order the phone used and where it came from ("plan" or
+    # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
+    asked_order: list[JsonValue] | None = Field(default=None, max_length=10)
+    plan_source: JsonValue = None
+    # Round 1 trace: the plan's pre-fills as the phone received them, and the chips it showed
+    # selected at each answer. Loosely typed like the two above.
+    prefilled: JsonValue = None
 
     @field_validator("timezone")
     @classmethod
@@ -246,17 +256,29 @@ async def recommendations(
     )
     user_history = loaded or History()
     candidates, merged_ids = merge_candidates(result.places, user_history, context)
-    ranking = rank(candidates, context, user_history, merged_ids)
+    models = models_for(user_history, context)
+    ranking = rank(candidates, context, user_history, merged_ids, models)
     shown = [pick.scored.place for pick in ranking.top3]
+    # P2-05 (ML10 v2): the next question by information gain, from the same models.
+    chosen = gate.next_question(
+        ranking, context, user_history, merged_ids, models,
+        gate.predict_budget(user_history, slot, is_weekend, local_date),
+    )
     # The shown places are cached while Muse writes; the events need their rows.
     # The transcript and a later round's follow-up writes go alongside them.
-    reasons, cached, saved, followed = await asyncio.gather(
+    reasons, cached, saved, followed, gated = await asyncio.gather(
         muse.write_reasons(ranking.top3, client=client),
         quietly(funnel.upsert_places(shown, client=client), "places")
         if ref
         else asyncio.sleep(0),
         log_transcript(user_id, token, ref, body, client) if ref else asyncio.sleep(0),
-        log_follow_up(user_id, token, ref, new_session, applied.tags, client)
+        log_follow_up(user_id, token, ref, new_session, reject_tags(body, applied), client)
+        if ref
+        else asyncio.sleep(0),
+        # sessions.gate: never part of `logged`, so a failure loses only the gate entry.
+        log_gate(token, ref, chosen.as_log(),
+                 round_one_plan(body, user_history, slot, is_weekend, local_date)
+                 if ref.round == 1 else None, client)
         if ref
         else asyncio.sleep(0),
     )
@@ -282,6 +304,7 @@ async def recommendations(
         "session_id": ref.session_id if ref else session_id,
         "round": ref.round if ref else None,
         "logged": logged,
+        "gate_logged": bool(gated),
         "history_used": loaded is not None,
         "reasons_source": reasons.source,
         "cold_start": ranking.cold_start,
@@ -289,6 +312,7 @@ async def recommendations(
         "truncated": result.truncated,
         "best_so_far": False,
         "answers": answers_out(answers),
+        "next_question": chosen.as_dict(),
         "picks": [
             {
                 "rank": pick.rank,
@@ -325,6 +349,36 @@ async def log_transcript(
     return await quietly(
         funnel.log_messages(user_id, token, ref, transcript, client=client), "messages"
     )
+
+
+def round_one_plan(
+    body: RecommendationsRequest, user_history: History, slot: str, is_weekend: bool,
+    local_date: date,
+) -> dict:
+    """Round 1's plan log: the plan recomputed from the same history and context as
+    /questions/plan, and next to it what the phone actually asked (gate.asked_log)."""
+    recomputed = gate.plan(user_history, slot, is_weekend, local_date)
+    asked = gate.asked_log(body.asked_order, body.plan_source, recomputed)
+    return {**recomputed.as_log(),
+            "asked": {**asked, "prefilled": gate.prefilled_log(body.prefilled)}}
+
+
+async def log_gate(
+    token: str, ref: funnel.RoundRef, entry: dict, plan_log: dict | None,
+    client: httpx2.AsyncClient,
+):
+    """This round's gate entry; round 1 adds the plan log. True when written, None on any
+    failure (logged, not raised)."""
+    return await quietly(
+        funnel.append_gate(token, ref.session_id, ref.round, entry, plan_log, client=client),
+        "gate",
+    )
+
+
+def reject_tags(body: RecommendationsRequest, applied: refine.Applied) -> tuple[str, ...]:
+    """What the previous round's rejected cards are logged with: none_of_these first when the
+    user tapped it, then what the follow-up changed."""
+    return (("none_of_these",) if body.none_of_these else ()) + applied.tags
 
 
 async def log_follow_up(
@@ -377,9 +431,10 @@ async def best_so_far_round(
         }
         for rank_, (card, meters) in enumerate(best, start=1)
     ]
-    saved, followed = await asyncio.gather(
+    saved, followed, gated = await asyncio.gather(
         log_transcript(user_id, token, ref, body, client),
-        log_follow_up(user_id, token, ref, new, applied.tags, client),
+        log_follow_up(user_id, token, ref, new, reject_tags(body, applied), client),
+        log_gate(token, ref, gate.CAP_ENTRY, None, client),
     )
     logged = bool(
         saved
@@ -394,6 +449,7 @@ async def best_so_far_round(
         "session_id": ref.session_id,
         "round": ref.round,
         "logged": logged,
+        "gate_logged": bool(gated),
         "history_used": loaded is not None,
         "reasons_source": "stored",
         "cold_start": False,
@@ -401,6 +457,7 @@ async def best_so_far_round(
         "truncated": False,
         "best_so_far": True,
         "answers": answers_out(answers),
+        "next_question": None,  # the cap asks the open question (ML10)
         "picks": [
             {
                 "rank": row["rank"],
@@ -421,6 +478,33 @@ async def best_so_far_round(
 
 def best_reason(meters: int) -> str:
     return f"One of your best so far, {muse.format_distance(meters)} away."
+
+
+# The 3 questions (P2-05, FR4, ML6) -------------------------------------------
+
+
+class PlanRequest(BaseModel):
+    local_time: datetime  # the device's local time; sets the meal slot and date
+
+
+@app.post("/questions/plan")
+async def question_plan(
+    body: PlanRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    """The confidence gate: the 3 questions in asking order, weak first, confident ones with a
+    pre-selected chip. History only: no places search, no Muse call. History failure = the
+    cold start plan (craving, budget, distance), never a 5xx."""
+    user_id, token = auth
+    loaded = await load_history(user_id, token, client)
+    slot, local_date, is_weekend = meal_context(body.local_time)
+    chosen = gate.plan(loaded or History(), slot, is_weekend, local_date)
+    return {
+        "history_used": loaded is not None,
+        "meal_slot": slot,
+        "questions": [q.as_dict() for q in chosen.questions],
+    }
 
 
 # Answer parsing (P1-21 FR5, P1-14) --------------------------------------------

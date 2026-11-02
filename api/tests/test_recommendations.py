@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 
 import httpx2
 import pytest
@@ -126,6 +127,8 @@ def supabase(self, request: httpx2.Request) -> httpx2.Response:
                                            "recommendation_events": events}])
     if request.method == "PATCH" and table == "sessions":
         return httpx2.Response(204)
+    if request.method == "POST" and table == "append_session_gate":
+        return httpx2.Response(200, json=getattr(self, "gate_result", True))
     if request.method == "POST" and table in ("places", "recommendation_events", "messages"):
         return httpx2.Response(201)
     raise AssertionError(f"unexpected Supabase call {request.method} {table}")
@@ -183,8 +186,9 @@ def test_one_call_each_and_parallel_fetch():
     post(up)
     hosts = up.hosts()
     assert hosts.count("api.geoapify.com") == 1
-    # taste_profiles + meals reads; session insert; places upsert; shown events insert.
-    assert hosts.count(SUPABASE_HOST) == 5
+    # taste_profiles + meals reads; session insert; places upsert; gate append (P2-05); shown
+    # events insert.
+    assert hosts.count(SUPABASE_HOST) == 6
     assert hosts.count("api.meta.ai") == 1
     paths = [r.url.path for r in up.requests]
     assert paths.index("/v1/chat/completions") < paths.index("/rest/v1/recommendation_events")
@@ -319,7 +323,9 @@ def test_round_one_creates_session_and_logs_shown():
     assert body["session_id"] == SESSION_ID
     assert body["round"] == 1
 
-    (session,) = writes(up, "sessions")
+    (session,) = writes(up, "sessions")  # one POST, no PATCH: the gate goes through its RPC
+    assert session.method == "POST"
+    assert len(gate_calls(up)) == 1
     row = json.loads(session.content)
     assert row == {"user_id": USER_ID, "timezone": "America/New_York",
                    "local_date": "2026-10-29", "meal_slot": "dinner", "lat": LAT, "lon": LON,
@@ -751,3 +757,351 @@ def test_answer_to_the_open_question_runs_a_normal_round():
     body = follow_up(up, transcript=[message], refine={"craving": "pizza"}).json()
     assert body["best_so_far"] is False and body["round"] == 4
     assert "api.geoapify.com" in up.hosts()
+
+
+# Confidence gate (P2-05, ML6, ML10) -------------------------------------------
+
+
+def plan_post(up: Upstreams, authed=True, **body):
+    return use(up, authed).post("/questions/plan", json={"local_time": LOCAL_TIME, **body})
+
+
+def gate_calls(up: Upstreams) -> list[dict]:
+    """append_session_gate payloads, in order."""
+    return [json.loads(r.content) for r in up.requests
+            if r.url.path == "/rest/v1/rpc/append_session_gate"]
+
+
+def test_plan_returns_three_questions_from_history_only():
+    up = Upstreams()
+    body = plan_post(up).json()
+    assert body["history_used"] is True and body["meal_slot"] == "dinner"
+    assert [q["key"] for q in body["questions"]] == ["craving", "budget", "distance"]
+    # The quiz prior alone has no meals behind it: nothing is confident, nothing pre-filled.
+    assert all(q["weak"] and q["prefill"] is None for q in body["questions"])
+    assert set(up.hosts()) == {SUPABASE_HOST}  # no places search, no Muse call
+    assert all(r.method == "GET" for r in up.requests)  # reads only, as the user
+    assert all(r.headers["authorization"] == f"Bearer {TOKEN}" for r in up.requests)
+
+
+def test_plan_pre_fills_a_confident_craving_and_asks_it_last(monkeypatch):
+    meals = [{"source": "backfill", "category_id": "thai", "eaten_on": f"2026-10-{d:02d}",
+              "meal_slot": "dinner", "is_weekend": False, "price_level": None,
+              "places": None} for d in (1, 8, 15, 22, 27, 28)]
+    monkeypatch.setattr(sys.modules[__name__], "MEALS", meals)
+    body = plan_post(Upstreams()).json()
+    assert [q["key"] for q in body["questions"]] == ["budget", "distance", "craving"]
+    assert body["questions"][-1]["prefill"] == "thai"
+
+
+@pytest.mark.parametrize("kw", [{"history_status": 500},
+                                {"history_exc": httpx2.ConnectError("down")}])
+def test_plan_history_failure_is_the_cold_start_order(kw):
+    response = plan_post(Upstreams(**kw))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["history_used"] is False
+    assert [q["key"] for q in body["questions"]] == ["craving", "budget", "distance"]
+
+
+def test_plan_requires_auth():
+    assert plan_post(Upstreams(), authed=False).status_code == 401
+
+
+def test_plan_bad_request():
+    assert use(Upstreams()).post("/questions/plan", json={}).status_code == 422
+
+
+def test_round_one_appends_the_plan_and_the_refinement_choice():
+    up = Upstreams()
+    body = post(up).json()
+    assert body["logged"] is True and body["gate_logged"] is True
+    (call,) = gate_calls(up)
+    assert (call["p_session_id"], call["p_round"]) == (SESSION_ID, 1)
+    assert [q["key"] for q in call["p_plan"]["questions"]] == ["craving", "budget", "distance"]
+    assert set(call["p_entry"]["gains"]) == {"craving", "budget", "distance"}
+    (rpc,) = [r for r in up.requests if r.url.path.endswith("/append_session_gate")]
+    assert rpc.headers["authorization"] == f"Bearer {TOKEN}"  # as the user (RLS)
+    assert rpc.headers["apikey"] != SERVICE_KEY
+
+
+def test_no_places_left_means_no_next_question():
+    # 3 allowed places, all shown: nothing left to split, the app keeps its fixed chips.
+    up = Upstreams()
+    body = post(up).json()
+    assert body["next_question"] is None
+    assert gate_calls(up)[0]["p_entry"] == {
+        "key": None, "options": [], "gains": {"craving": 0.0, "budget": 0.0, "distance": 0.0}}
+
+
+def test_next_question_from_information_gain(monkeypatch):
+    cats = [("thai", "catering.restaurant.thai"), ("pizza", "catering.restaurant.pizza"),
+            ("mexican", "catering.restaurant.mexican"), ("indian", "catering.restaurant.indian")]
+    features = [feature(f"{c} {i}", 100 + 10 * k + i, 33.951 + 0.001 * i, ["catering", tag])
+                for k, (c, tag) in enumerate(cats) for i in range(3)]
+    monkeypatch.setattr(sys.modules[__name__], "FEATURES", features)
+    up = Upstreams()
+    body = post(up).json()
+    nq = body["next_question"]
+    assert nq["key"] == "craving" and nq["gains"]["craving"] > 0
+    assert set(nq["options"]) <= {"thai", "pizza", "mexican", "indian"}
+    assert gate_calls(up)[0]["p_entry"]["key"] == "craving"
+    assert up.hosts().count("api.meta.ai") == 1  # no extra Muse call for the question
+    assert up.hosts().count("api.geoapify.com") == 1
+
+
+def test_later_round_appends_its_entry_without_the_plan():
+    up = Upstreams(shown=ROUND_1)
+    body = follow_up(up, refine={"budget": "cheaper"}).json()
+    assert body["gate_logged"] is True
+    (call,) = gate_calls(up)
+    assert (call["p_round"], call["p_plan"]) == (2, None)
+    assert "gains" in call["p_entry"]
+    assert "gate" not in session_patch(up)  # the answers' PATCH is unchanged
+
+
+def test_cap_round_appends_the_rule():
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, refine={"something_else": True}).json()
+    assert body["best_so_far"] is True and body["next_question"] is None
+    assert body["gate_logged"] is True
+    (call,) = gate_calls(up)
+    assert (call["p_round"], call["p_entry"], call["p_plan"]) == (
+        4, {"key": "open", "rule": "cap"}, None)
+
+
+# Gate writes failing (e.g. the column or function is not there yet): the round and every
+# other log go on; only the gate entry is lost.
+
+GATE_FAILURES = [
+    {"fail": {"POST append_session_gate"}},  # 500
+    {"gate_result": False},  # no row of the caller's matched
+]
+GATE_TRANSCRIPT = [
+    {"role": "assistant", "body": "What are you craving?", "question_key": "craving"},
+    {"role": "user", "body": "Thai", "question_key": "craving", "answer": {"craving": "thai"},
+     "input_mode": "chip"},
+]
+
+
+def failing(kw, **upstream) -> Upstreams:
+    up = Upstreams(**{k: v for k, v in kw.items() if k == "fail"}, **upstream)
+    if "gate_result" in kw:
+        up.gate_result = kw["gate_result"]
+    return up
+
+
+def events(up: Upstreams, event: str) -> list[dict]:
+    rows = [row for r in writes(up, "recommendation_events") for row in json.loads(r.content)]
+    return [row for row in rows if row["event"] == event]
+
+
+@pytest.mark.parametrize("kw", GATE_FAILURES)
+def test_gate_failure_round_one_logs_everything_else(kw, caplog):
+    up = failing(kw)
+    body = post(up, transcript=GATE_TRANSCRIPT).json()
+    assert (body["round"], body["logged"], body["gate_logged"]) == (1, True, False)
+    assert len(body["picks"]) == 3
+    assert [r["place_id"] for r in events(up, "shown")] == [p["id"] for p in body["picks"]]
+    assert [r.method for r in writes(up, "sessions")] == ["POST"]
+    assert len(writes(up, "messages")) == 1
+    assert len(gate_calls(up)) == 1  # tried once, not retried
+    assert "Funnel gate failed" in caplog.text
+
+
+@pytest.mark.parametrize("kw", GATE_FAILURES)
+def test_gate_failure_later_round_logs_everything_else(kw):
+    up = failing(kw, shown=ROUND_1)
+    body = follow_up(up, refine={"budget": "cheaper"}, transcript=GATE_TRANSCRIPT).json()
+    assert (body["round"], body["logged"], body["gate_logged"]) == (2, True, False)
+    assert {r["round"] for r in events(up, "shown")} == {2}
+    assert [r["place_id"] for r in events(up, "rejected")] == ["node/1", "node/2", "node/3"]
+    assert session_patch(up)["budget_level"] == 1  # answers updated
+    assert len(writes(up, "messages")) == 1
+
+
+@pytest.mark.parametrize("kw", GATE_FAILURES)
+def test_gate_failure_round_four_still_caps(kw):
+    up = failing(kw, shown=THREE_ROUNDS)
+    body = follow_up(up, refine={"something_else": True}, transcript=GATE_TRANSCRIPT).json()
+    assert body["best_so_far"] is True and body["round"] == 4
+    assert (body["logged"], body["gate_logged"]) == (True, False)
+    assert {r["round"] for r in events(up, "shown")} == {4}
+    assert [r["place_id"] for r in events(up, "rejected")] == ["node/7", "node/8"]
+    assert len(writes(up, "sessions")) == 1  # the answers' PATCH
+    assert len(writes(up, "messages")) == 1
+    assert "api.geoapify.com" not in up.hosts() and "api.meta.ai" not in up.hosts()
+
+
+# What the phone asked, next to the recomputed plan (round 1) -------------------
+# The quiz-only fixture recomputes craving, budget, distance.
+
+def asked(up: Upstreams) -> dict:
+    """The asked block without the pre-fill trace (tested on its own below)."""
+    block = dict(gate_calls(up)[0]["p_plan"]["asked"])
+    block.pop("prefilled")
+    return block
+
+
+def prefilled(up: Upstreams) -> dict:
+    return gate_calls(up)[0]["p_plan"]["asked"]["prefilled"]
+
+
+def test_round_one_logs_the_plan_the_phone_used():
+    up = Upstreams()
+    body = post(up, asked_order=["craving", "budget", "distance"], plan_source="plan").json()
+    assert body["gate_logged"] is True
+    assert asked(up) == {"status": "ok", "order": ["craving", "budget", "distance"],
+                         "source": "plan", "matches_plan": True}
+    plan = gate_calls(up)[0]["p_plan"]
+    assert [q["key"] for q in plan["questions"]] == ["craving", "budget", "distance"]
+
+
+def test_round_one_logs_a_fallback():
+    up = Upstreams()
+    post(up, asked_order=["craving", "budget", "distance"], plan_source="fallback")
+    assert (asked(up)["status"], asked(up)["source"]) == ("ok", "fallback")
+
+
+def test_round_one_logs_a_new_search_after_a_pick():
+    up = Upstreams()
+    body = post(up, craving="thai", asked_order=["craving", "budget", "distance"],
+                plan_source="new_search").json()
+    assert body["gate_logged"] is True
+    assert asked(up) == {"status": "ok", "order": ["craving", "budget", "distance"],
+                         "source": "new_search", "matches_plan": True}
+
+
+def test_round_one_logs_a_mismatch_with_the_recomputed_plan():
+    # E.g. the phone's plan came from an earlier meal slot.
+    up = Upstreams()
+    post(up, asked_order=["budget", "distance", "craving"], plan_source="plan")
+    assert asked(up) == {"status": "ok", "order": ["budget", "distance", "craving"],
+                         "source": "plan", "matches_plan": False}
+
+
+@pytest.mark.parametrize(("order", "source", "kept_order", "kept_source"), [
+    (["craving", "craving", "budget"], "plan", None, "plan"),
+    (["craving", "budget", "company"], "plan", None, "plan"),
+    (["craving", "budget"], "plan", None, "plan"),
+    ([1, {"a": 2}, None], "plan", None, "plan"),
+    (["craving", "budget", "distance"], "guess", ["craving", "budget", "distance"], None),
+    (["craving", "budget", "distance"], "new-search", ["craving", "budget", "distance"], None),
+    (["craving", "budget", "distance"], {"nested": [1, 2]}, ["craving", "budget", "distance"],
+     None),
+])
+def test_round_one_invalid_order_is_logged_never_refused(order, source, kept_order, kept_source):
+    up = Upstreams()
+    response = post(up, asked_order=order, plan_source=source)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["logged"] is True and body["gate_logged"] is True
+    log = asked(up)
+    assert log["status"] == "invalid"
+    assert (log["order"], log["source"]) == (kept_order, kept_source)  # bad values never logged
+    assert log["matches_plan"] == (None if kept_order is None else True)
+
+
+def test_round_one_without_asked_order_is_missing():
+    up = Upstreams()
+    post(up)
+    assert asked(up)["status"] == "missing"
+
+
+def test_later_rounds_ignore_the_asked_order():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"}, asked_order=["craving", "budget", "distance"],
+              plan_source="plan")
+    assert gate_calls(up)[0]["p_plan"] is None
+
+
+# "None of these" before a follow-up (P2-05) -----------------------------------
+
+
+def test_none_of_these_is_the_first_rejected_reason():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, none_of_these=True, refine={"budget": "cheaper"})
+    rows = rejected_rows(up)
+    assert [r["place_id"] for r in rows] == ["node/1", "node/2", "node/3"]
+    assert {r["reject_reason"] for r in rows} == {"refine:none_of_these,cheaper"}
+
+
+def test_without_none_of_these_the_reason_is_unchanged():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"})
+    assert {r["reject_reason"] for r in rejected_rows(up)} == {"refine:cheaper"}
+
+
+def test_none_of_these_on_the_cap_round_is_in_the_reason():
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, none_of_these=True, refine={"something_else": True}).json()
+    assert body["best_so_far"] is True
+    assert {r["reject_reason"] for r in rejected_rows(up)} == {
+        "refine:none_of_these,something_else"}
+
+
+def test_none_of_these_on_round_one_logs_no_rejections():
+    up = Upstreams()
+    body = post(up, none_of_these=True).json()
+    assert body["round"] == 1 and body["logged"] is True
+    assert rejected_rows(up) == []
+
+
+def test_none_of_these_must_be_a_boolean():
+    assert post(Upstreams(), none_of_these="maybe").status_code == 422
+
+
+
+# Pre-fill trace (round 1): what the phone received and what it showed selected --------
+
+TRACE = {"received": {"craving": "chinese", "budget": 1, "distance": None},
+         "shown": {"craving": "chinese", "budget": 1, "distance": None}}
+
+
+def test_round_one_logs_the_prefill_trace():
+    up = Upstreams()
+    post(up, asked_order=["distance", "craving", "budget"], plan_source="plan", prefilled=TRACE)
+    assert prefilled(up) == {"status": "ok", **TRACE}
+
+
+def test_a_received_prefill_that_was_not_shown_is_visible():
+    # The case the trace exists for: the plan's $ arrived, but no budget chip was highlighted.
+    trace = {"received": TRACE["received"],
+             "shown": {"craving": None, "budget": None, "distance": None}}
+    up = Upstreams()
+    post(up, asked_order=["distance", "craving", "budget"], plan_source="plan", prefilled=trace)
+    log = prefilled(up)
+    assert log["received"]["budget"] == 1 and log["shown"]["budget"] is None
+
+
+def test_round_one_without_a_trace_is_missing():
+    up = Upstreams()
+    post(up, asked_order=["craving", "budget", "distance"], plan_source="plan")
+    assert prefilled(up) == {"status": "missing", "received": None, "shown": None}
+
+
+@pytest.mark.parametrize("trace", [
+    {"received": TRACE["received"]},  # no shown
+    {**TRACE, "extra": {}},  # unknown set
+    {**TRACE, "shown": {"craving": "Chinese", "budget": 1, "distance": None}},  # label, not id
+    {**TRACE, "shown": {"craving": "chinese", "budget": "1", "distance": None}},  # string level
+    {**TRACE, "shown": {"craving": "chinese", "budget": 5, "distance": None}},  # no such chip
+    {**TRACE, "shown": {"craving": "chinese", "budget": True, "distance": None}},  # a bool
+    {**TRACE, "shown": {"craving": "chinese", "budget": 1, "distance": 5000}},  # old radius
+    {**TRACE, "shown": {"craving": "chinese", "budget": 1}},  # a key missing
+    "not an object",
+    [1, 2],
+])
+def test_an_invalid_trace_is_logged_as_invalid_never_refused(trace):
+    up = Upstreams()
+    response = post(up, asked_order=["craving", "budget", "distance"], plan_source="plan",
+                    prefilled=trace)
+    assert response.status_code == 200 and response.json()["gate_logged"] is True
+    assert prefilled(up) == {"status": "invalid", "received": None, "shown": None}
+    assert asked(up)["status"] == "ok"  # the order check is independent
+
+
+def test_later_rounds_ignore_the_trace():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"}, prefilled=TRACE)
+    assert gate_calls(up)[0]["p_plan"] is None
