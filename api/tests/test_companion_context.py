@@ -31,7 +31,13 @@ Gate (ML6, FR15), key "company"
 - Plan.skipped: Question | None. The skipped question's prediction is its answer. Plan.as_log()
   adds "skipped": the question's dict, or None. /questions/plan adds "skipped" too.
 - Company prediction: outcomes "solo" (meal.solo is True) or the meal's companion group
-  (sorted list of ids); other meals don't count. Same levels (user, slot, slot_weekend),
+  (sorted list of ids); other meals don't count. Prior: gate.company_prior(mostly_solo, groups)
+  -> {"solo": p, group tuple: p}. Quiz solo: solo QUIZ_FAVORITES_MASS, the observed groups
+  share the rest equally. Quiz with people: solo 1 - QUIZ_FAVORITES_MASS, groups share
+  QUIZ_FAVORITES_MASS. No quiz answer: equal shares. No observed groups: solo keeps its quiz
+  share and the rest goes to the placeholder gate.UNSEEN_GROUP, so the prior sums to 1 and
+  never gives solo 1.0. The placeholder is never an answer: on top, company is weak with
+  predicted None. Same levels (user, slot, slot_weekend),
   recency weight, K, and ML6 rule as the budget model; no data = weak. predicted is "solo"
   or the sorted list of ids.
 - gate.asked_log accepts any 3 distinct keys of the pool the server recomputed; "company" stays
@@ -59,7 +65,7 @@ import pytest
 from app import gate, history
 from app.cuisine_model import SLOT_WEEKEND, predict, recency_weight
 from app.scoring import Context, History, PastMeal, QuizPrior, StoredPlace, is_weak
-from app.scoring_rules import SMOOTHING_K
+from app.scoring_rules import QUIZ_FAVORITES_MASS, SMOOTHING_K
 from scripts.evaluate import build_runs
 from tests import test_funnel as funnel_t
 from tests import test_history as history_t
@@ -269,7 +275,7 @@ def test_parses_meal_companions_and_solo():
     assert [m.solo for m in loaded.meals] == [False, True, None, None]
 
 
-def test_companions_are_read_only_when_the_quiz_says_with_people():
+def test_saved_companions_are_read_as_the_user():
     require(History, "companions")
     up = HistoryFake(prior=[{"mostly_solo": False}], companions=[A, B])
     loaded = history_t.run_load(up)
@@ -378,8 +384,10 @@ def test_plan_company_joins_when_the_quiz_says_solo_but_companions_exist():
     require(QuizPrior, "mostly_solo")
     plan = gate.plan(device_history(QuizPrior(mostly_solo=True, budget_level=2), [A]),
                      "dinner", False, TODAY)
-    assert len(plan.order) == 3
-    assert COMPANY in plan.order or skipped_key(plan) == COMPANY
+    # Same as the with-people device case: no meal has known company, so company is weak and
+    # asked; budget (0.97) is the most confident and is skipped.
+    assert plan.order == ("distance", COMPANY, "craving")
+    assert skipped_key(plan) == "budget" and plan.skipped.predicted == 1
 
 
 def test_plan_no_company_without_companions():
@@ -419,6 +427,86 @@ def test_company_prediction_solo():
     plan = gate.plan(h, "dinner", False, TODAY)
     everyone = {x.key: x for x in [*plan.questions, *([plan.skipped] if plan.skipped else [])]}
     assert everyone[COMPANY].predicted == "solo" and not everyone[COMPANY].weak
+
+
+def company_prior(mostly_solo, groups):
+    if not hasattr(gate, "company_prior"):
+        pytest.fail("P2-07 not implemented: gate.company_prior(mostly_solo, groups)")
+    return gate.company_prior(mostly_solo, groups)
+
+
+GROUPS = [(A,), (A, B)]
+
+
+@pytest.mark.parametrize("mostly_solo,solo,each_group", [
+    (True, QUIZ_FAVORITES_MASS, (1 - QUIZ_FAVORITES_MASS) / 2),   # 0.7, 0.15 each
+    (False, 1 - QUIZ_FAVORITES_MASS, QUIZ_FAVORITES_MASS / 2),    # 0.3, 0.35 each
+    (None, 1 / 3, 1 / 3),                                         # no quiz answer: equal
+])
+def test_company_prior_with_no_meals(mostly_solo, solo, each_group):
+    probs = company_prior(mostly_solo, GROUPS)
+    assert probs == pytest.approx({"solo": solo, (A,): each_group, (A, B): each_group},
+                                  abs=1e-12)
+
+
+def unseen_group():
+    if not hasattr(gate, "UNSEEN_GROUP"):
+        pytest.fail("P2-07 not implemented: gate.UNSEEN_GROUP")
+    return gate.UNSEEN_GROUP
+
+
+def test_company_prior_without_groups_keeps_the_quiz_share_for_solo():
+    probs = company_prior(True, [])
+    assert probs == pytest.approx({"solo": QUIZ_FAVORITES_MASS,
+                                   unseen_group(): 1 - QUIZ_FAVORITES_MASS}, abs=1e-12)
+
+
+def test_twenty_solo_dinners_without_groups_skip_company_as_solo():
+    days = range(1, 21)
+    cats = ("thai", "pizza", "mexican", "indian", "korean")  # craving stays weak
+    h = hist(*[meal(cats[d % 5], d, solo=True) for d in days],
+             prior=QuizPrior(mostly_solo=False), companions=[A])
+    # Prior: solo 0.3, unseen group 0.7. Every meal is a weekday dinner: three equal levels.
+    n = sum(recency_weight(d) for d in days)
+    p_solo = 1 - QUIZ_FAVORITES_MASS
+    for _ in range(3):
+        p_solo = (n + SMOOTHING_K * p_solo) / (n + SMOOTHING_K)
+    assert 0.4 <= p_solo < 1.0
+    plan = gate.plan(h, "dinner", False, TODAY)
+    assert plan.order == ("craving", "budget", "distance")
+    assert skipped_key(plan) == COMPANY
+    assert plan.skipped.predicted == "solo" and not plan.skipped.weak
+    assert plan.skipped.top_prob == pytest.approx(p_solo, abs=1e-12)
+
+
+def test_unseen_group_on_top_is_weak_and_never_an_answer():
+    # One solo lunch: counted at the user level only. Prior solo 0.3, unseen 0.7, so after
+    # one level the unseen group stays on top and the dinner levels add nothing.
+    h = hist(meal("thai", 1, slot="lunch", solo=True), prior=QuizPrior(mostly_solo=False),
+             companions=[A])
+    w = recency_weight(1)
+    p_unseen = SMOOTHING_K * QUIZ_FAVORITES_MASS / (w + SMOOTHING_K)
+    assert p_unseen > (w + SMOOTHING_K * (1 - QUIZ_FAVORITES_MASS)) / (w + SMOOTHING_K)
+    got = gate.predict_company(h, "dinner", False, TODAY)
+    assert got.weak and got.predicted is None and got.prefill is None
+    assert got.predicted != unseen_group()
+
+
+def test_quiz_solo_is_overridden_by_five_dinners_with_a():
+    days = range(1, 6)
+    h = hist(*[meal("thai", d, with_=[A]) for d in days],
+             prior=QuizPrior(mostly_solo=True), companions=[A])
+    # Prior: solo 0.7, A 0.3. Every meal is a weekday dinner, so user, slot, and slot_weekend
+    # all count the same n, and each smooths toward the level before it.
+    n = sum(recency_weight(d) for d in days)
+    p_a = 1 - QUIZ_FAVORITES_MASS
+    for _ in range(3):
+        p_a = (n + SMOOTHING_K * p_a) / (n + SMOOTHING_K)
+    assert p_a == pytest.approx(0.9581, abs=1e-4)
+    got = gate.predict_company(h, "dinner", False, TODAY)
+    assert got.predicted == [A]
+    assert got.top_prob == pytest.approx(p_a, abs=1e-12)
+    assert got.meals == 5 and not got.weak
 
 
 def test_company_without_data_is_weak():
