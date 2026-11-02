@@ -4,6 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
+from app.cuisine_model import predict
 from app.places import Candidate
 from app.scoring import (
     Context,
@@ -13,11 +14,14 @@ from app.scoring import (
     StoredPlace,
     category_fit,
     distance_fit,
+    is_weak,
     meal_context,
     merge_candidates,
+    place_stats,
     price_fit,
     rank,
     return_score,
+    usual_categories,
 )
 from app.scoring_rules import CLOSE_M, DONT_MIND_WEIGHTS, WEIGHTS
 
@@ -44,9 +48,10 @@ def stored(pid, distance_m, name="Stored", tags=("catering.restaurant.thai",)) -
                        geoapify_categories=tuple(tags), address=None)
 
 
-def meal(place, days_ago=1, source="live", category_id=None, price_level=None) -> PastMeal:
+def meal(place, days_ago=1, source="live", category_id=None, price_level=None,
+         **kw) -> PastMeal:
     return PastMeal(place=place, eaten_on=date.fromordinal(TODAY.toordinal() - days_ago),
-                    source=source, category_id=category_id, price_level=price_level)
+                    source=source, category_id=category_id, price_level=price_level, **kw)
 
 
 def top_ids(ranking) -> list[str]:
@@ -87,13 +92,62 @@ def test_after_midnight_sunday_counts_as_saturday_weekend():
 # Fits.
 
 
+def fit(category, history, context=None):
+    context = context or ctx()
+    return category_fit(category, predict(history, context, as_of=context.local_date))
+
+
 def test_category_fit_quiz_prior_and_uniform():
+    # One favorite holds 0.7; the other 23 share 0.3. Fit = p / max p.
     quiz = History(prior=QuizPrior(favorites=frozenset({"thai"})))
-    assert category_fit("thai", quiz, ctx()) == (1.0, "quiz_prior")
-    assert category_fit("pizza", quiz, ctx()) == (0.5, "quiz_prior")
-    assert category_fit("pizza", History(), ctx()) == (1.0, "uniform")
-    assert category_fit("other", quiz, ctx())[0] == 0.0
-    assert category_fit("other", History(), ctx())[0] == 0.0
+    assert fit("thai", quiz) == (1.0, "quiz")
+    assert fit("pizza", quiz) == (pytest.approx((0.3 / 23) / 0.7), "quiz")
+    assert fit("pizza", History()) == (pytest.approx(1.0), "quiz")
+    assert fit("other", quiz)[0] == 0.0
+    assert fit("other", History())[0] == 0.0
+
+
+def test_category_fit_top_predicted_category_is_one():
+    p = stored("node/1", 100)
+    history = History(meals=(meal(p, 1, source="backfill", category_id="thai"),
+                             meal(p, 2, source="backfill", category_id="thai"),
+                             meal(p, 3, source="backfill", category_id="pizza")))
+    assert fit("thai", history) == (1.0, "user")
+    assert 0 < fit("pizza", history)[0] < 1.0
+    assert fit("burgers", history)[0] < fit("pizza", history)[0]
+
+
+def test_usual_is_raw_weighted_share_at_user_level():
+    p = stored("node/1", 100)
+    prior = QuizPrior(favorites=frozenset({"korean"}))
+    # 6 thai, 1 pizza, all 1 day old: pizza share 1/7 = 0.143 < 0.15. Korean is a quiz
+    # favorite with no meals: smoothing would give it mass, the raw share does not.
+    meals = tuple(meal(p, 1, source="backfill", category_id="thai") for _ in range(6)) + (
+        meal(p, 1, source="backfill", category_id="pizza"),)
+    h = History(prior=prior, meals=meals)
+    assert usual_categories(predict(h, ctx(), TODAY), prior) == frozenset({"thai"})
+    meals += (meal(p, 1, source="backfill", category_id="pizza"),)  # 2/8 = 0.25
+    h = History(prior=prior, meals=meals)
+    assert usual_categories(predict(h, ctx(), TODAY), prior) == frozenset({"thai", "pizza"})
+
+
+def test_usual_before_any_counted_meal_is_quiz_favorites_minus_hard_nos():
+    prior = QuizPrior(favorites=frozenset({"thai", "pizza"}), hard_nos=frozenset({"pizza"}))
+    # A live meal with no food answer does not count.
+    h = History(prior=prior, meals=(meal(stored("node/1", 100), category_id="burgers"),))
+    assert usual_categories(predict(h, ctx(), TODAY), prior) == frozenset({"thai"})
+
+
+def test_is_weak():
+    p = stored("node/1", 100)
+    four = tuple(meal(p, 1, source="backfill", category_id="thai") for _ in range(4))
+    five = four + (meal(p, 1, source="backfill", category_id="thai"),)
+    assert is_weak(predict(History(), ctx(), TODAY))  # no meals
+    assert is_weak(predict(History(meals=four), ctx(), TODAY))  # 4 raw meals < 5
+    assert not is_weak(predict(History(meals=five), ctx(), TODAY))  # top 0.63, 5 meals
+    mixed = tuple(meal(p, 1, source="backfill", category_id=c)
+                  for c in ("thai", "pizza", "korean", "bbq", "seafood", "indian"))
+    assert is_weak(predict(History(meals=mixed), ctx(), TODAY))  # 6 meals, top < 0.4
 
 
 def test_return_score_is_zero_in_v1():
@@ -184,7 +238,7 @@ def test_quiz_favorites_fill_familiar_slots_and_discovery_is_outside():
     assert not r.cold_start
     assert top_ids(r) == ["thai", "pizza", "near_burgers"]
     assert "favorite_category" in r.top3[0].scored.evidence.reasons
-    assert r.top3[0].scored.evidence.category_source == "quiz_prior"
+    assert r.top3[0].scored.evidence.category_source == "quiz"
 
 
 def test_craving_takes_the_familiar_slots():
@@ -283,15 +337,36 @@ def test_merge_dedupes_and_geoapify_row_wins():
     assert ids == frozenset()
 
 
-def test_backfill_label_overrides_mapping_for_any_candidate():
+def test_meal_label_never_changes_a_place_category():
+    # The meal's category is the food eaten (wings at a Thai place); the place stays Thai.
     p1, p2 = stored("node/1", 100), stored("node/2", 200)
     history = History(meals=(
-        meal(p1, 1, source="backfill", category_id="vietnamese"),
-        meal(p1, 9, source="backfill", category_id="thai"),
+        meal(p1, 1, source="backfill", category_id="chicken_wings"),
         meal(p2, 2, source="backfill", category_id="korean"),
+        meal(p2, 3, category_id="burgers", food_answered=True),
     ))
     merged, _ = merge_candidates([cand("node/1", "thai", 100)], history, ctx())
-    assert {c.id: c.category for c in merged} == {"node/1": "vietnamese", "node/2": "korean"}
+    assert {c.id: c.category for c in merged} == {"node/1": "thai", "node/2": "thai"}
+    r = rank(merged, ctx(), history)
+    assert {s.place.id: s.place.category for s in r.ranked} == {"node/1": "thai",
+                                                                "node/2": "thai"}
+
+
+def test_unresolved_meals_count_for_cuisine_but_never_become_candidates():
+    history = History(meals=(
+        meal(None, 1, source="backfill", category_id="korean"),
+        meal(None, 2, source="backfill", category_id="korean"),
+        meal(stored("node/1", 100), 3, source="backfill", category_id="pizza"),
+    ))
+    merged, ids = merge_candidates([], history, ctx())
+    assert [c.id for c in merged] == ["node/1"] and ids == frozenset({"node/1"})
+    assert set(place_stats(history, TODAY)) == {"node/1"}
+    prediction = predict(history, ctx(), TODAY)
+    assert prediction.user_counts == {"korean": 2, "pizza": 1}
+    r = rank([cand("k", "korean", 900)] + merged, ctx(), history, ids)
+    korean = next(s for s in r.ranked if s.place.id == "k")
+    assert korean.evidence.category_fit == 1.0 and korean.evidence.visits == 0
+    assert korean.evidence.category_meals == 2
 
 
 def test_merged_place_carries_from_history_evidence():

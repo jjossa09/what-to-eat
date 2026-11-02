@@ -81,6 +81,8 @@ SYSTEM_PROMPT = (
     "Use only the evidence given; never invent menus, dishes, ratings, hours, or prices. "
     "If visited_before is false, the user has never been there: never imply they have "
     "(no familiar, usual, again, back, return, regular, go-to). "
+    "times_had_category counts the user's past meals of that food anywhere, not visits to "
+    "this place. "
     "Do not repeat the place name. No health, nutrition, calorie, or diet claims. "
     f"Each reason is one plain sentence of at most {MAX_REASON_CHARS} characters. "
     'Reply with JSON only: {"reasons": [{"id": "<pick id>", "line": "<reason>"}]}, '
@@ -173,6 +175,8 @@ def template_reason(pick: Pick) -> str:
         lead = f"You've been here {e.visits} times"
     elif e.visits == 1:
         lead = "You've been here before"
+    elif e.category_meals >= 2 and label:
+        lead = f"{label}, you've had it {e.category_meals} times"
     elif "favorite_category" in e.reasons and label:
         lead = f"{label}, one of your favorites"
     elif pick.slot == DISCOVERY:
@@ -205,6 +209,7 @@ def pick_evidence(pick: Pick) -> dict:
         "visited_before": e.visits > 0,
         "visits": e.visits,
         "days_since_last_visit": e.last_visit_days,
+        "times_had_category": e.category_meals,
         "price": price_note(price),
         "signals": [r for r in e.reasons if r not in RANKING_SIGNALS],
     }

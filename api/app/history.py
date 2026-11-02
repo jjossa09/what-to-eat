@@ -17,12 +17,14 @@ from app.scoring import History, PastMeal, QuizPrior, StoredPlace
 
 # PostgREST caps rows per request; a month of backfill plus live use is far below this.
 MEALS_LIMIT = 1000
-# Meals that count (backfill, or live with went = true), each with its resolved place.
-# Unresolved backfill places have no coordinates, so they never become candidates.
+# Meals that count (backfill, or live with went = true) with their place. A left join, so
+# meals at unresolved backfill places load too (place = None): they count for the cuisine
+# model only, never as candidates, place stats, or distance.
 MEALS_SELECT = (
-    "source,category_id,eaten_on,price_level,"
-    "places!inner(id,name,lat,lon,geoapify_categories,address,unresolved)"
+    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,"
+    "places(id,name,lat,lon,geoapify_categories,address,unresolved)"
 )
+MEAL_SLOTS = frozenset({"breakfast", "lunch", "dinner", "late"})
 PRIOR_SELECT = "favorite_categories,hard_no_categories,budget_level"
 LEVELS = range(1, 5)
 
@@ -67,37 +69,54 @@ def parse_prior(rows: list) -> QuizPrior:
     )
 
 
-def parse_meal(row: dict) -> PastMeal | None:
-    """One meals row -> PastMeal, or None if the place is unresolved or malformed."""
-    place = row.get("places")
-    if not isinstance(place, dict) or place.get("unresolved") is not False:
-        return None
+def parse_place(place: dict) -> StoredPlace | None:
+    """A resolved places row -> StoredPlace, or None if malformed."""
     pid, name, lat, lon = (place.get(k) for k in ("id", "name", "lat", "lon"))
     if not (isinstance(pid, str) and pid and isinstance(name, str) and name.strip()):
         return None
+    if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in (lat, lon)):
+        return None
+    tags = place.get("geoapify_categories")
+    return StoredPlace(
+        id=pid,
+        name=name.strip(),
+        lat=float(lat),
+        lon=float(lon),
+        geoapify_categories=tuple(t for t in tags or [] if isinstance(t, str)),
+        address=place.get("address") or None,
+    )
+
+
+def parse_meal(row: dict) -> PastMeal | None:
+    """One meals row -> PastMeal, or None if malformed. An unresolved (or missing) place gives
+    place = None; a resolved place with bad fields drops the row."""
     if row.get("source") not in ("backfill", "live"):
         return None
-    if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in (lat, lon)):
+    place_row = row.get("places")
+    if place_row is None:
+        place = None
+    elif not isinstance(place_row, dict) or not isinstance(place_row.get("unresolved"), bool):
+        return None
+    elif place_row["unresolved"]:
+        place = None
+    elif (place := parse_place(place_row)) is None:
         return None
     try:
         eaten_on = date.fromisoformat(row.get("eaten_on") or "")
     except (TypeError, ValueError):
         return None
-    tags = place.get("geoapify_categories")
-    category = row.get("category_id")
+    category, slot, weekend = (row.get(k) for k in ("category_id", "meal_slot", "is_weekend"))
+    dish = row.get("dish")
     return PastMeal(
-        place=StoredPlace(
-            id=pid,
-            name=name.strip(),
-            lat=float(lat),
-            lon=float(lon),
-            geoapify_categories=tuple(t for t in tags or [] if isinstance(t, str)),
-            address=place.get("address") or None,
-        ),
+        place=place,
         eaten_on=eaten_on,
         source=row["source"],
         category_id=category if category in CATEGORY_IDS else None,
         price_level=_level(row.get("price_level")),
+        meal_slot=slot if slot in MEAL_SLOTS else None,
+        is_weekend=weekend if isinstance(weekend, bool) else None,
+        dish=dish.strip() or None if isinstance(dish, str) else None,
+        food_answered=isinstance(row.get("ate_at"), str) and bool(row["ate_at"]),
     )
 
 
@@ -135,7 +154,6 @@ async def load(user_id: str, token: str, *, client: httpx2.AsyncClient) -> Histo
     meals_params = {
         "select": MEALS_SELECT,
         "user_id": f"eq.{user_id}",
-        "places.unresolved": "is.false",
         "or": "(source.eq.backfill,went.is.true)",
         "order": "eaten_on.desc,created_at.desc",
         "limit": MEALS_LIMIT,

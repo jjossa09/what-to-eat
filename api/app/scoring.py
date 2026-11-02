@@ -3,14 +3,15 @@
 Pure functions, no I/O, no clock: the caller passes the local date. Weights and thresholds
 are in app/scoring_rules.py. Muse never touches this; it only words the evidence (ML7).
 
-category_fit and return_score are the model slots: P2-02 (cuisine model) and P2-10 (place
-model) replace their bodies without changing the rest.
+category_fit reads the cuisine model (P2-02, app/cuisine_model.py), predicted once per
+round. return_score is the place-model slot: P2-10 (ML4) replaces its body.
 """
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
 from app.categories import OTHER, map_category
+from app.cuisine_model import CuisinePrediction, predict
 from app.places import Candidate, distance_m
 from app.refine import radius_level
 from app.scoring_rules import (
@@ -18,14 +19,14 @@ from app.scoring_rules import (
     CRAVING_MATCH_FIT,
     CRAVING_OTHER_FACTOR,
     DONT_MIND_WEIGHTS,
-    FAVORITE_FIT,
     MEAL_SLOT_STARTS,
-    NON_FAVORITE_FIT,
     OTHER_FIT,
     PRICE_FIT_BY_LEVELS_ABOVE,
     PRICE_FIT_UNKNOWN,
     SCORE_DIGITS,
-    UNIFORM_FIT,
+    USUAL_MIN_SHARE,
+    WEAK_MIN_MEALS,
+    WEAK_TOP_PROB,
     WEIGHTS,
 )
 
@@ -46,7 +47,7 @@ class QuizPrior:
 
 @dataclass(frozen=True)
 class StoredPlace:
-    """A resolved row of the places table (unresolved places never become candidates)."""
+    """A resolved row of the places table. Unresolved places are never loaded as one."""
 
     id: str
     name: str
@@ -58,13 +59,23 @@ class StoredPlace:
 
 @dataclass(frozen=True)
 class PastMeal:
-    """A meal that counts: backfill, or live with went = true. Newest first in History."""
+    """A meal that counts: backfill, or live with went = true. Newest first in History.
 
-    place: StoredPlace
+    category_id is the food eaten (backfill CSV, or the live "What did you have?" answer). It
+    never changes the place's category, which comes only from map_category (ML2). A live
+    meal with no food answer yet still holds the pick-time place category, so the cuisine
+    model skips it (food_answered = False).
+    """
+
+    place: StoredPlace | None  # None: unresolved backfill place (cuisine model only)
     eaten_on: date
     source: str  # "backfill" or "live"
-    category_id: str | None  # backfill: the user's label, which overrides the ML2 mapping
+    category_id: str | None  # the food eaten; see above
     price_level: int | None  # what was paid: price tap, else backfill amount as a level
+    meal_slot: str | None = None  # breakfast, lunch, dinner, late
+    is_weekend: bool | None = None  # from eaten_on; None = derive it
+    dish: str | None = None  # loaded, not scored
+    food_answered: bool = False  # live: the food answer was given (meals.ate_at)
 
 
 @dataclass(frozen=True)
@@ -113,16 +124,15 @@ def merge_candidates(
 
     Geoapify returns at most 100 places, nearest first, so known places farther out can be
     cut off. Stored places were returned by Geoapify on an earlier search (R2). Dedupe on id;
-    the Geoapify row wins. Stored places are mapped again so the category stays current, and
-    the user's backfill label overrides the mapping for any place. Returns the candidates,
-    nearest first, and the ids that came only from history.
+    the Geoapify row wins. Stored places are mapped again so the category stays current; a
+    meal's food label never changes a place's category. Unresolved places are skipped.
+    Returns the candidates, nearest first, and the ids that came only from history.
     """
-    labels = backfill_labels(history)
     by_id = {c.id: c for c in searched}
     merged_ids: set[str] = set()
     for meal in history.meals:
         place = meal.place
-        if place.id in by_id:
+        if place is None or place.id in by_id:
             continue
         d = distance_m(context.lat, context.lon, place.lat, place.lon)
         if d > context.search_radius_m:
@@ -138,20 +148,8 @@ def merge_candidates(
             address=place.address,
         )
         merged_ids.add(place.id)
-    candidates = [
-        replace(c, category=labels[c.id]) if c.id in labels else c for c in by_id.values()
-    ]
-    candidates.sort(key=lambda c: (c.distance_m, c.id))
+    candidates = sorted(by_id.values(), key=lambda c: (c.distance_m, c.id))
     return candidates, frozenset(merged_ids)
-
-
-def backfill_labels(history: History) -> dict[str, str]:
-    """Place id -> the user's most recent backfill category label for it."""
-    labels: dict[str, str] = {}
-    for meal in history.meals:  # newest first, so the first label seen wins
-        if meal.source == "backfill" and meal.category_id:
-            labels.setdefault(meal.place.id, meal.category_id)
-    return labels
 
 
 # Fits ------------------------------------------------------------------------
@@ -167,6 +165,8 @@ class PlaceStats:
 def place_stats(history: History, today: date) -> dict[str, PlaceStats]:
     stats: dict[str, PlaceStats] = {}
     for meal in history.meals:  # newest first
+        if meal.place is None:  # unresolved: no place to match
+            continue
         pid = meal.place.id
         prev = stats.get(pid)
         if prev is None:
@@ -177,19 +177,29 @@ def place_stats(history: History, today: date) -> dict[str, PlaceStats]:
     return stats
 
 
-def category_fit(category: str, history: History, context: Context) -> tuple[float, str]:
-    """v1: quiz prior, else uniform (ML5 Phase 1). Returns (fit, source). P2-02 replaces this."""
+def category_fit(category: str, prediction: CuisinePrediction) -> tuple[float, str]:
+    """p(category) / max p, so the top category fits 1.0. Returns (fit, source = level)."""
     if category == OTHER:
         return OTHER_FIT, "other"
-    favorites = history.prior.favorites
-    if not favorites:
-        return UNIFORM_FIT, "uniform"
-    return (FAVORITE_FIT if category in favorites else NON_FAVORITE_FIT), "quiz_prior"
+    top = max(prediction.probs.values(), default=0.0)
+    if top <= 0:
+        return 0.0, prediction.level
+    return prediction.probs.get(category, 0.0) / top, prediction.level
 
 
-def usual_categories(history: History, context: Context) -> frozenset[str]:
-    """v1: quiz favorites (until data exists, REQUIREMENTS). P2-02 adds the 15% rule."""
-    return history.prior.favorites - history.prior.hard_nos
+def usual_categories(prediction: CuisinePrediction, prior: QuizPrior) -> frozenset[str]:
+    """At least USUAL_MIN_SHARE of the user's recency-weighted meals (raw, unsmoothed).
+    No counted meals yet: quiz favorites minus hard no's (REQUIREMENTS, Usual categories)."""
+    if not prediction.user_meals:
+        return prior.favorites - prior.hard_nos
+    return frozenset(c for c, s in prediction.user_shares.items() if s >= USUAL_MIN_SHARE)
+
+
+def is_weak(prediction: CuisinePrediction) -> bool:
+    """ML6: top probability under WEAK_TOP_PROB, or fewer than WEAK_MIN_MEALS raw meals behind
+    the reported level. Used by the confidence gate (P2-05)."""
+    top = max(prediction.probs.values(), default=0.0)
+    return top < WEAK_TOP_PROB or prediction.meals < WEAK_MIN_MEALS
 
 
 def return_score(stats: PlaceStats | None, context: Context) -> float:
@@ -218,7 +228,8 @@ class Evidence:
 
     category: str
     category_fit: float
-    category_source: str  # "quiz_prior", "uniform", "other"
+    category_source: str  # cuisine model level ("quiz", "user", "slot", "slot_weekend"), "other"
+    category_meals: int  # raw counted meals of this food category (not visits to the place)
     craving: str | None
     return_score: float
     price_fit: float
@@ -252,7 +263,7 @@ class Ranking:
     ranked: tuple[Scored, ...]  # every allowed candidate, best first
     top3: tuple[Pick, ...]
     usual: frozenset[str]  # categories the familiar slots draw from this round
-    cold_start: bool  # no quiz favorites and no craving: distance decides
+    cold_start: bool  # no usual categories (no favorites, no meals) and no craving
 
 
 def score_candidate(
@@ -261,12 +272,17 @@ def score_candidate(
     context: Context,
     stats: dict[str, PlaceStats],
     merged_ids: frozenset[str],
+    prediction: CuisinePrediction,
+    usual: frozenset[str],
 ) -> Scored:
+    """usual is the model's usual categories (not the craving), for the usual_category signal."""
     reasons: list[str] = []
 
-    cat_fit, cat_source = category_fit(place.category, history, context)
-    if cat_source == "quiz_prior" and place.category in history.prior.favorites:
+    cat_fit, cat_source = category_fit(place.category, prediction)
+    if place.category in history.prior.favorites:
         reasons.append("favorite_category")
+    if prediction.user_meals and place.category in usual:
+        reasons.append("usual_category")
     if context.craving:
         if place.category == context.craving:
             cat_fit = CRAVING_MATCH_FIT
@@ -311,6 +327,7 @@ def score_candidate(
         category=place.category,
         category_fit=cat_fit,
         category_source=cat_source,
+        category_meals=prediction.user_counts.get(place.category, 0),
         craving=context.craving,
         return_score=ret,
         price_fit=p_fit,
@@ -342,6 +359,8 @@ def rank(
     top 3 = 2 familiar + 1 discovery (ML5). A craving answer makes the craved category the
     familiar one."""
     stats = place_stats(history, context.local_date)
+    prediction = predict(history, context, as_of=context.local_date)
+    model_usual = usual_categories(prediction, history.prior)
     allowed = [
         c
         for c in candidates
@@ -351,14 +370,14 @@ def rank(
     ]
     ranked = tuple(
         sorted(
-            (score_candidate(c, history, context, stats, merged_ids) for c in allowed),
+            (
+                score_candidate(c, history, context, stats, merged_ids, prediction, model_usual)
+                for c in allowed
+            ),
             key=rank_key,
         )
     )
-    if context.craving:
-        usual = frozenset({context.craving})
-    else:
-        usual = usual_categories(history, context)
+    usual = frozenset({context.craving}) if context.craving else model_usual
     cold_start = not usual
     return Ranking(ranked, pick_top3(ranked, usual, cold_start), usual, cold_start)
 

@@ -106,8 +106,8 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 - places table: id (OSM type and id if Geoapify returns them, else the Geoapify place_id), name, coordinates, and our ML2 category. Geoapify allows storing results with no limits; attribution is shown wherever they appear (NFR5).
 - Backfill: Juan's last 30 days of eating out, entered as CSV with columns date, meal_slot, place, category, price, companions. Companions are filled only when sure. Missing values stay null, never guessed.
 - On import, each place name is resolved once to a Geoapify place so backfilled and live visits match. Ambiguous matches are confirmed by Juan.
-- When the user's own backfill gives a category for a resolved place, that label overrides the ML2 mapping for that place.
-- Backfill places that can't be resolved are stored with the CSV's name and category and flagged unresolved. Those meals count for the cuisine model, not for distance or place matching.
+- A meal's category is the food eaten, for backfill (the CSV category) and live (the food answer). It never relabels a place: a place's category comes only from the ML2 mapping, including the human-verified exact-name overrides.
+- Backfill places that can't be resolved are stored with the CSV's name, mapped from the name alone, and flagged unresolved. Those meals count for the cuisine model, not for distance or place matching.
 - Backfill tests Layers 1 and 2 by meal slot and day. Companion patterns and star-based return scores learn from live use only. Backfill has no location, so it does not feed the search radius.
 - ML9 place hit rate: the candidate pool for each replayed meal is the set of places seen in earlier meals. A first visit to a new place counts as a miss; the share of new-place meals is reported separately. Parameters are fixed before replay, not tuned on it.
 
@@ -159,6 +159,7 @@ The search area should grow more accurate to the user as usage increases. Values
 ## Changes from v1.5
 
 - FR3: distance chips are Close to me (15 km) and I don't mind (35 km); recommendations always search nearest first.
+- Data: a meal's category is the food eaten, for backfill and live. Backfill labels no longer override a place's ML2 mapping.
 
 ## Changes from v1.4
 
