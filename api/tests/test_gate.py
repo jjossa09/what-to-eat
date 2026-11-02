@@ -297,6 +297,13 @@ def test_asked_fallback_is_logged_as_such():
     assert (log["status"], log["source"], log["matches_plan"]) == ("ok", "fallback", True)
 
 
+def test_asked_new_search_after_a_pick():
+    # Craving first (the typed text is the craving), then the session's order.
+    log = gate.asked_log(["craving", "distance", "budget"], "new_search", PLAN)
+    assert log == {"status": "ok", "order": ["craving", "distance", "budget"],
+                   "source": "new_search", "matches_plan": False}
+
+
 def test_asked_mismatch_with_the_recomputed_plan():
     log = gate.asked_log(["budget", "distance", "craving"], "plan", PLAN)
     assert (log["status"], log["matches_plan"]) == ("ok", False)
@@ -322,7 +329,8 @@ def test_asked_invalid_order_is_never_logged_as_given(order):
     assert log == {"status": "invalid", "order": None, "source": "plan", "matches_plan": None}
 
 
-@pytest.mark.parametrize("source", ["Plan", "guess", 1, None, ["plan"]])
+@pytest.mark.parametrize("source", ["Plan", "guess", 1, None, ["plan"], "New_search",
+                                    "new-search", "newsearch"])
 def test_asked_invalid_source(source):
     log = gate.asked_log(["craving", "budget", "distance"], source, PLAN)
     assert (log["status"], log["source"]) == ("invalid", None)

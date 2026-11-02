@@ -183,7 +183,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const transcript = useRef<TranscriptMessage[]>([]);
   const answers = useRef<Answers>({ craving: null, budget: 2, radius: CLOSE, exclude: [] });
   const order = useRef<FirstKey[]>(DEFAULT_ORDER); // the 3 questions in asking order
-  const planSource = useRef<'plan' | 'fallback'>('fallback'); // sent with round 1 (P2-05)
+  // Sent with round 1 (P2-05): where this search's question order came from.
+  const planSource = useRef<'plan' | 'fallback' | 'new_search'>('fallback');
   const sessionId = useRef<string | null>(null);
   const shownIds = useRef<string[]>([]);
   const pendingChange = useRef<Partial<Change> | undefined>(undefined);
@@ -398,6 +399,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     // The typed text is the craving, so it goes first; budget and distance follow in this
     // session's plan order, asked again and preselected from the last search.
     order.current = ['craving', ...order.current.filter((k) => k !== 'craving')];
+    planSource.current = 'new_search';
     setPreset({ budget: answers.current.budget, radius: answers.current.radius });
     setShowAll(false);
     setDecided(false);

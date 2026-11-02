@@ -283,16 +283,18 @@ def next_question(
 CAP_ENTRY: dict = {"key": "open", "rule": "cap"}
 
 
-# What the phone asked (round 1): its order and whether it came from the plan or the fallback.
-PLAN_SOURCES = ("plan", "fallback")
+# What the phone asked (round 1): its order and where it came from. plan: the gate's plan;
+# fallback: the default order (no usable plan); new_search: a search started after a pick,
+# craving first because the typed text is the craving, then the session's order.
+PLAN_SOURCES = ("plan", "fallback", "new_search")
 OK, MISSING, INVALID = "ok", "missing", "invalid"
 
 
 def asked_log(order: object, source: object, recomputed: Plan) -> dict:
     """The phone's question order and plan source, checked, next to the recomputed plan.
 
-    Valid order: exactly craving, budget, and distance, once each. Valid source: "plan" or
-    "fallback". Neither sent (an older app): missing. Anything else: invalid; a bad value is
+    Valid order: exactly craving, budget, and distance, once each. Valid source: one of
+    PLAN_SOURCES. Neither sent (an older app): missing. Anything else: invalid; a bad value is
     never logged as given, only as None. matches_plan compares a valid order with the plan
     the server recomputed now (it can differ after a fallback or a meal slot change).
     """

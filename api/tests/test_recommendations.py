@@ -956,6 +956,15 @@ def test_round_one_logs_a_fallback():
     assert (asked(up)["status"], asked(up)["source"]) == ("ok", "fallback")
 
 
+def test_round_one_logs_a_new_search_after_a_pick():
+    up = Upstreams()
+    body = post(up, craving="thai", asked_order=["craving", "budget", "distance"],
+                plan_source="new_search").json()
+    assert body["gate_logged"] is True
+    assert asked(up) == {"status": "ok", "order": ["craving", "budget", "distance"],
+                         "source": "new_search", "matches_plan": True}
+
+
 def test_round_one_logs_a_mismatch_with_the_recomputed_plan():
     # E.g. the phone's plan came from an earlier meal slot.
     up = Upstreams()
@@ -970,6 +979,7 @@ def test_round_one_logs_a_mismatch_with_the_recomputed_plan():
     (["craving", "budget"], "plan", None, "plan"),
     ([1, {"a": 2}, None], "plan", None, "plan"),
     (["craving", "budget", "distance"], "guess", ["craving", "budget", "distance"], None),
+    (["craving", "budget", "distance"], "new-search", ["craving", "budget", "distance"], None),
     (["craving", "budget", "distance"], {"nested": [1, 2]}, ["craving", "budget", "distance"],
      None),
 ])

@@ -128,7 +128,8 @@ export type RoundRequest = {
   transcript: TranscriptMessage[];
   /** Round 1 only (P2-05): the question order the chat used, and where it came from. */
   asked_order?: FirstKey[];
-  plan_source?: 'plan' | 'fallback';
+  /** new_search: a search after a pick, craving first (the typed text is the craving). */
+  plan_source?: 'plan' | 'fallback' | 'new_search';
 };
 
 export type Pick = {
