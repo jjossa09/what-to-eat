@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
@@ -12,7 +12,7 @@ import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
-from app import funnel, gate, history, muse, places, refine
+from app import funnel, gate, history, muse, places, refine, widening
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -21,14 +21,14 @@ from app.config import get_settings
 from app.logs import configure_logging
 from app.place_model import place_scores
 from app.refine import Change
-from app.scoring import Context, History, meal_context, merge_candidates, models_for, rank
+from app.scoring import Context, History, meal_context, models_for
 
 configure_logging()
 app = FastAPI(title="What to eat! API")
 logger = logging.getLogger(__name__)
 
 # FR-R2 upper clamp: 25 miles.
-MAX_RADIUS_M = 40_234
+MAX_RADIUS_M = widening.MAX_RADIUS_M
 # ML10: after 3 rounds without a pick, round 4 is the best options so far.
 CAP_ROUND = 4
 
@@ -213,6 +213,7 @@ async def recommendations(
                else refine.Applied(current, ()))
     answers = applied.answers
     radius = answers.radius_m or default_radius
+    places_budget = widening.PlacesBudget()
     slot, local_date, is_weekend = meal_context(body.local_time)
     new_session = funnel.NewSession(
         timezone=body.timezone or offset_zone(body.local_time),
@@ -234,7 +235,7 @@ async def recommendations(
     try:
         if session_id is None:
             result, loaded, ref = await asyncio.gather(
-                places.search(body.lat, body.lon, radius, bias=True, client=client),
+                places_budget.search(body.lat, body.lon, radius, client=client),
                 load_history(user_id, token, client),
                 opening,
             )
@@ -250,7 +251,7 @@ async def recommendations(
                     body, user_id, token, ref, applied, new_session, loaded, started,
                     client=client,
                 )
-            result = await places.search(body.lat, body.lon, radius, bias=True, client=client)
+            result = await places_budget.search(body.lat, body.lon, radius, client=client)
     except places.PlacesError as e:
         raise places_error(e) from None
 
@@ -265,14 +266,17 @@ async def recommendations(
         companion_ids=frozenset(str(c) for c in body.companion_ids),
         craving=answers.craving,
         budget_level=answers.budget_level,
-        radius_m=answers.radius_m,
+        radius_m=radius,
         exclude_ids=frozenset(body.exclude_ids) | shown_before,
         exclude_categories=frozenset(answers.exclude_categories),
     )
     user_history = loaded or History()
-    candidates, merged_ids = merge_candidates(result.places, user_history, context)
     models = models_for(user_history, context)
-    ranking = rank(candidates, context, user_history, merged_ids, models)
+    widened = await widening.widen(result, places_budget, context, user_history, models,
+                                   client=client)
+    result, context = widened.result, widened.context
+    ranking, merged_ids = widened.ranking, widened.merged_ids
+    new_session = replace(new_session, search_radius_m=result.radius_m)
     shown = [pick.scored.place for pick in ranking.top3]
     # P2-05 (ML10 v2): the next question by information gain, from the same models.
     chosen = gate.next_question(
@@ -281,7 +285,7 @@ async def recommendations(
     )
     # The shown places are cached while Muse writes; the events need their rows.
     # The transcript and a later round's follow-up writes go alongside them.
-    reasons, cached, saved, followed, gated = await asyncio.gather(
+    reasons, cached, saved, followed, gated, _ = await asyncio.gather(
         muse.write_reasons(ranking.top3, client=client),
         quietly(funnel.upsert_places(shown, client=client), "places")
         if ref
@@ -295,6 +299,10 @@ async def recommendations(
                  round_one_plan(body, user_history, slot, is_weekend, local_date)
                  if ref.round == 1 else None, client)
         if ref
+        else asyncio.sleep(0),
+        quietly(funnel.update_search_radius(user_id, token, ref.session_id, result.radius_m,
+                                           client=client), "search radius")
+        if ref and ref.round == 1 and result.radius_m != radius
         else asyncio.sleep(0),
     )
     logged = bool(

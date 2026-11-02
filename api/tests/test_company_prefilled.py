@@ -216,7 +216,7 @@ def test_new_search_log_reserves_craving_and_skips_weak_company(company_pool, mo
     assert plan["skipped"]["predicted"] is None
     assert plan["skipped"]["reason"] == "skipped_weak"
     assert plan["asked"]["matches_plan"] is True
-    (session,) = rec.writes(company_pool, "sessions")
+    (session, _) = rec.writes(company_pool, "sessions")
     assert json.loads(session.content)["craving_category_id"] == "pizza"
 
 

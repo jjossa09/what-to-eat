@@ -6,6 +6,7 @@ upstream detail beyond the status code.
 
 import logging
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import httpx2
@@ -107,6 +108,24 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
     )
 
 
+def deduplicate(candidates: Iterable[Candidate]) -> list[Candidate]:
+    """Keep the first ID or co-located name, sorted by distance then ID."""
+    unique: list[Candidate] = []
+    seen_keys: set[str] = set()
+    seen_spots: set[tuple[str, float, float]] = set()
+    for place in candidates:
+        # Same OSM object twice, or the same name at the same spot (~1 m).
+        spot = (place.name.lower(), round(place.lat, 5), round(place.lon, 5))
+        if place.id in seen_keys or spot in seen_spots:
+            continue
+        seen_keys.add(place.id)
+        seen_spots.add(spot)
+        unique.append(place)
+    # Id breaks distance ties so the same results always come back in the same order.
+    unique.sort(key=lambda p: (p.distance_m, p.id))
+    return unique
+
+
 async def search(
     lat: float,
     lon: float,
@@ -153,18 +172,9 @@ async def search(
         raise PlacesUpstreamError from None
 
     places: list[Candidate] = []
-    seen_keys: set[str] = set()
-    seen_spots: set[tuple[str, float, float]] = set()
     for feature in features:
         if not isinstance(feature, dict) or (place := parse_feature(feature, lat, lon)) is None:
             continue
-        # Same OSM object twice, or the same name at the same spot (~1 m).
-        spot = (place.name.lower(), round(place.lat, 5), round(place.lon, 5))
-        if place.id in seen_keys or spot in seen_spots:
-            continue
-        seen_keys.add(place.id)
-        seen_spots.add(spot)
         places.append(place)
-    # Id breaks distance ties so the same results always come back in the same order.
-    places.sort(key=lambda p: (p.distance_m, p.id))
-    return SearchResult(radius_m=radius_m, truncated=len(features) >= LIMIT, places=places)
+    return SearchResult(radius_m=radius_m, truncated=len(features) >= LIMIT,
+                        places=deduplicate(places))

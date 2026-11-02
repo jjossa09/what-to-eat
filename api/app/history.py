@@ -22,7 +22,8 @@ MEALS_LIMIT = 1000
 # meals at unresolved backfill places load too (place = None): they count for the cuisine
 # model only, never as candidates, place stats, or distance.
 MEALS_SELECT = (
-    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,solo,meal_companions(companion_id),"
+    "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,solo,"
+    "distance_m,meal_companions(companion_id),"
     "places(id,name,lat,lon,geoapify_categories,address,unresolved)"
 )
 MEAL_SLOTS = frozenset({"breakfast", "lunch", "dinner", "late"})
@@ -119,6 +120,7 @@ def parse_meal(row: dict) -> PastMeal | None:
         return None
     category, slot, weekend = (row.get(k) for k in ("category_id", "meal_slot", "is_weekend"))
     dish = row.get("dish")
+    distance = row.get("distance_m")
     return PastMeal(
         place=place,
         eaten_on=eaten_on,
@@ -133,6 +135,8 @@ def parse_meal(row: dict) -> PastMeal | None:
         stars=_stars(row.get("stars")) if live else None,
         solo=row.get("solo") if isinstance(row.get("solo"), bool) else None,
         companion_ids=read_ids(row.get("meal_companions"), "companion_id"),
+        distance_m=(distance if isinstance(distance, int) and not isinstance(distance, bool)
+                    else None),
     )
 
 
