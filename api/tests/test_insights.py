@@ -44,6 +44,8 @@ def meal(n, on="2026-11-02", *, source="backfill", category="thai", went=None,
         "eaten_on": on, "day_of_week": day.isoweekday(), "category_id": category,
         "ate_at": f"{on}T20:00:00+00:00" if food else None,
         "went": went, "solo": solo,
+        "meal_slot": None, "price_amount": None, "price_level": None,
+        "price_tap": None, "budget_level": None, "distance_m": None,
         "meal_companions": [{"companion_id": cid} for cid in companions],
     }
 
@@ -265,7 +267,8 @@ def test_t11_response_and_queries_exclude_names_dishes_and_messages():
     up.companions[0]["name"] = "Private companion"
     response = get(up)
     body = response.json()
-    assert set(body) == {"complete", "cutoff_date", "companions"}
+    assert set(body) == {"complete", "cutoff_date", "companions", "summary", "price_by_slot",
+                         "food_by_slot", "distance_by_slot", "top_categories", "coverage"}
     assert set(body["companions"]) == {"companions", "coverage"}
     assert set(companion(body)) == {
         "companion_id", "meal_count", "category_meal_count", "source_counts", "weekdays",

@@ -19,6 +19,10 @@ class Meal:
     went: bool | None
     solo: bool | None
     companion_ids: frozenset[str]
+    meal_slot: str | None = None
+    paid_level: int | None = None
+    budget_level: int | None = None
+    distance_m: int | None = None
 
 
 def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) -> dict:

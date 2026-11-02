@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { withInsightsDeadline } from './insights';
 
 // Our own API (EXPO_PUBLIC_API_URL). Every call carries the user's Supabase JWT.
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
@@ -8,6 +9,69 @@ const TIMEOUT_MS = 20_000;
 // The question plan holds up the chat's first question; past this the chat uses the default
 // order (P2-05). History only, so it is fast when the API is warm.
 export const PLAN_TIMEOUT_MS = 5_000;
+export const INSIGHTS_TIMEOUT_MS = 5_000;
+
+export type InsightCategory = { category_id: string; meal_count: number };
+export type InsightSlot = 'breakfast' | 'lunch' | 'dinner' | 'late';
+export type InsightCompanion = {
+  companion_id: string;
+  meal_count: number;
+  category_meal_count: number;
+  source_counts: { live: number; backfill: number };
+  weekdays: { iso_day: number; meal_count: number }[];
+  categories: InsightCategory[];
+  leading_day_ids: number[] | null;
+  leading_category_ids: string[] | null;
+  pattern_status: 'available' | 'insufficient_data';
+};
+export type InsightsResponse = {
+  complete: boolean;
+  cutoff_date: string;
+  summary: { meal_count: number; category_meal_count: number };
+  companions: {
+    companions: InsightCompanion[];
+    coverage: { unlinked_meals: number; contradictory_company_meals: number };
+  };
+  price_by_slot: {
+    meal_slot: InsightSlot;
+    levels: { level: number; paid_count: number; budget_count: number }[];
+    missing_meal_count: number;
+  }[];
+  food_by_slot: {
+    meal_slot: InsightSlot;
+    category_meal_count: number;
+    leaders: InsightCategory[];
+  }[];
+  distance_by_slot: {
+    meal_slot: InsightSlot;
+    measured_meal_count: number;
+    median_m: number | null;
+  }[];
+  top_categories: InsightCategory[];
+  coverage: {
+    unknown_slot_meals: number;
+    missing_price_meals: number;
+    backfill_distance_meals: number;
+    missing_distance_meals: number;
+  };
+};
+
+/** Separate deadline includes auth, fetch, and body reading; other calls are unchanged. */
+export function getInsights(asOf: string): Promise<InsightsResponse> {
+  return withInsightsDeadline(async (signal) => {
+    if (!API_URL) throw new ApiError('server');
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) throw new ApiError('auth');
+    if (signal.aborted) throw new ApiError('network');
+    const response = await fetch(
+      `${API_URL.replace(/\/$/, '')}/insights?as_of=${encodeURIComponent(asOf)}`,
+      { headers: { Authorization: `Bearer ${token}` }, signal },
+    );
+    if (!response.ok) throw new ApiError(response.status === 401 ? 'auth' : 'server');
+    return await response.json() as InsightsResponse;
+  }, INSIGHTS_TIMEOUT_MS);
+}
 
 export type ApiErrorKind = 'network' | 'server' | 'auth' | 'conflict' | 'notfound';
 

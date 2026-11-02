@@ -1,19 +1,22 @@
 import { useFocusEffect } from '@react-navigation/native';
-import { type ReactNode, useCallback, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { type ReactNode, useCallback, useRef, useState } from 'react';
+import { ActivityIndicator, Modal, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-import { Chip, GlassCard, GlassScreen, PrimaryButton, useTabBarSpace } from '../components/ui';
-import { loadMeals, mostEatenCategory } from '../lib/meals';
+import { Chip, GlassCard, GlassScreen, PrimaryButton, SecondaryButton, useTabBarSpace } from '../components/ui';
+import { getInsights } from '../lib/api';
+import { type InsightsState, loadInsights, localInsightsDate } from '../lib/insights';
 import {
   BUDGETS,
   type Category,
   loadCategories,
   loadCompanions,
+  loadCompanionChoices,
   loadDisplayName,
   loadTastePrior,
   type TastePrior,
 } from '../lib/profile';
 import { colors, emojiFor, spacing, type } from '../theme';
+import InsightsScreen from './InsightsScreen';
 
 // Read-only profile (P1-22). Editing is a later ticket.
 
@@ -22,7 +25,6 @@ type Data = {
   prior: TastePrior;
   companions: string[];
   categories: Category[];
-  mostEaten: string | null;
 };
 
 function initials(name: string | null): string {
@@ -44,6 +46,17 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
   const space = useTabBarSpace();
   const [data, setData] = useState<Data | null>(null);
   const [failed, setFailed] = useState(false);
+  const [insights, setInsights] = useState<InsightsState>({ status: 'loading' });
+  const [showInsights, setShowInsights] = useState(false);
+  const insightRequest = useRef(0);
+
+  const refreshInsights = useCallback(async (categories: Category[]) => {
+    const requestId = ++insightRequest.current;
+    setInsights({ status: 'loading' });
+    const state = await loadInsights(localInsightsDate(), getInsights,
+      () => loadCompanionChoices(userId), categories);
+    if (requestId === insightRequest.current) setInsights(state);
+  }, [userId]);
 
   const fetchProfile = useCallback(
     (isLive: () => boolean = () => true) =>
@@ -52,23 +65,29 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
         loadTastePrior(userId),
         loadCompanions(userId),
         loadCategories(),
-        loadMeals(userId),
       ])
-        .then(([name, prior, companions, categories, meals]) => {
+        .then(([name, prior, companions, categories]) => {
           if (!isLive()) return;
-          setData({ name, prior, companions, categories, mostEaten: mostEatenCategory(meals) });
+          setData({ name, prior, companions, categories });
           setFailed(false);
+          void refreshInsights(categories);
         })
-        .catch(() => isLive() && setFailed(true)),
-    [userId],
+        .catch(() => {
+          if (!isLive()) return;
+          setFailed(true);
+          setInsights({ status: 'unavailable' });
+        }),
+    [userId, refreshInsights],
   );
 
   useFocusEffect(
     useCallback(() => {
       let live = true;
+      setInsights({ status: 'loading' });
       fetchProfile(() => live);
       return () => {
         live = false;
+        insightRequest.current++;
       };
     }, [fetchProfile]),
   );
@@ -116,13 +135,14 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
               ))}
             </View>
           </Section>
-          <Section label="Most eaten">
-            <Text style={data.mostEaten ? styles.value : styles.muted}>
-              {data.mostEaten
-                ? `${emojiFor(data.mostEaten)} ${names.get(data.mostEaten) ?? data.mostEaten}`
-                : 'Not enough meals yet'}
+          {insights.status === 'ready' && <Section label="Most eaten">
+            <Text style={insights.mostEatenIds.length ? styles.value : styles.muted}>
+              {insights.mostEatenIds.length ? insights.mostEatenIds.map((id) =>
+                `${emojiFor(id)} ${names.get(id) ?? id}`).join(', ')
+                : insights.response.complete ? 'No food saved' : 'No usable data'}
             </Text>
-          </Section>
+            {insights.note && <Text style={styles.muted}>{insights.note}</Text>}
+          </Section>}
           {budget && (
             <Section label="Budget">
               <Text style={styles.value}>{`${budget.label} · ${budget.detail}`}</Text>
@@ -140,8 +160,14 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
           </Section>
         </GlassCard>
 
+        <SecondaryButton label="Insights" onPress={() => setShowInsights(true)} />
         <PrimaryButton label="Sign out" onPress={onSignOut} />
       </ScrollView>
+      <Modal visible={showInsights} animationType="slide" presentationStyle="fullScreen"
+        onRequestClose={() => setShowInsights(false)}>
+        <InsightsScreen state={insights} onClose={() => setShowInsights(false)}
+          onRefresh={() => { void refreshInsights(data.categories); }} />
+      </Modal>
     </GlassScreen>
   );
 }
