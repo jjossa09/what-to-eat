@@ -20,9 +20,11 @@ __pycache__/
 .DS_Store
 .vscode/
 
-# Claude Code (local only)
+# AI agent config (local only)
 CLAUDE.md
+AGENTS.md
 .claude/
+.codex/
 
 # Backfill data (real meals stay local)
 data/*.csv
