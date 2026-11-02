@@ -10,13 +10,13 @@ test('no answer yet asks Did you go?', () => {
   assert.deepEqual(resumePlan({ ...base, went: null }), { kind: 'went' });
 });
 
-test('went = false or rated asks nothing', () => {
+test('went = false, or food answered and rated, asks nothing', () => {
   assert.deepEqual(resumePlan({ ...base, went: false }), { kind: 'none' });
   assert.deepEqual(resumePlan({ ...base, ateAnswered: true, stars: 4 }), { kind: 'none' });
 });
 
 test('went only: food, stars, then price', () => {
-  assert.deepEqual(resumePlan(base), { kind: 'food', askPrice: true });
+  assert.deepEqual(resumePlan(base), { kind: 'food', askStars: true, askPrice: true });
 });
 
 test('food answered (in the prompt or by an edit): starts at stars', () => {
@@ -25,9 +25,10 @@ test('food answered (in the prompt or by an edit): starts at stars', () => {
 
 test('price set by an edit before stars: price is not asked again', () => {
   assert.deepEqual(resumePlan({ ...base, ateAnswered: true, priceTap: 1 }), { kind: 'stars', askPrice: false });
-  assert.deepEqual(resumePlan({ ...base, priceTap: 3 }), { kind: 'food', askPrice: false });
+  assert.deepEqual(resumePlan({ ...base, priceTap: 3 }), { kind: 'food', askStars: true, askPrice: false });
 });
 
-test('stars set by an edit ends the prompt, even with no food answer', () => {
-  assert.deepEqual(resumePlan({ ...base, stars: 5 }), { kind: 'none' });
+test('stars set by an edit with no food answer: asks food only (P2-06)', () => {
+  assert.deepEqual(resumePlan({ ...base, stars: 5 }), { kind: 'food', askStars: false, askPrice: false });
+  assert.deepEqual(resumePlan({ ...base, stars: 5, priceTap: 2 }), { kind: 'food', askStars: false, askPrice: false });
 });

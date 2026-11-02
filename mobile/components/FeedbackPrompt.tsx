@@ -28,6 +28,8 @@ import { Chip, Dots, GlassCard, PrimaryButton, TextLink } from './ui';
 // open and on return to the foreground. "Did you go?" is saved at once. The food, stars, and
 // price are held on the device while the user moves forward and Back, then saved in that order
 // when they finish (price tap or Skip). If the app closes first, the next open resumes.
+// Steps answered from the meal card's Edit are skipped: its dish prefills the food step, and
+// with stars already saved the food step is the last one (P2-06).
 // It also drives the P1-16 reminder: refreshes its cache on each check, reschedules when the app
 // goes to the background, and stops it once "Did you go?" is answered or on "Not now".
 
@@ -74,13 +76,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     if (start.kind === 'none' || open.current) return;
     open.current = true;
     const show = (at: Step, undo: boolean) => {
-      saved.current = { food: start.kind === 'resumeStars', stars: false };
+      saved.current = { food: start.kind === 'resumeStars', stars: !start.meal.askStars };
       const placeCategory = start.meal.categoryId;
       setCategory(placeCategory && placeCategory !== 'other' ? placeCategory : null);
-      setDish('');
+      setDish(start.meal.dish ?? '');
       setStars(0);
       setRetry(null);
-      setCanUndoWent(undo);
+      setCanUndoWent(undo && start.meal.askStars); // the database refuses it once rated
       setFirst(at);
       setStep(at);
       setMeal(start.meal);
@@ -163,9 +165,10 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   }
 
   // Finish: food, stars, then the price if one was tapped. A retry continues where it stopped.
-  // chosen: the star just tapped, when finishing straight from the stars step.
+  // chosen: the star just tapped, when finishing straight from the stars step. Stars already
+  // saved (meal card Edit): finishes from the food step with no star.
   async function finish(priceTap: number | null, chosen: number = stars) {
-    if (!meal || saving || !category || chosen === 0) return;
+    if (!meal || saving || !category || (!saved.current.stars && chosen === 0)) return;
     tapHaptic();
     setSaving(true);
     setRetry(null);
@@ -262,9 +265,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
           returnKeyType="done"
         />
         <PrimaryButton
-          label="Next"
-          disabled={!category}
+          label={meal.askStars ? 'Next' : 'Done'}
+          disabled={!category || saving}
           onPress={() => {
+            if (!meal.askStars) {
+              finish(null);
+              return;
+            }
             tapHaptic();
             setStep('stars');
           }}

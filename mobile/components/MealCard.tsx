@@ -170,7 +170,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     if (saving) return;
     const edit: MealEdit = {};
     const clean = dish.trim();
-    if (clean !== (meal.dish ?? '') || (!meal.ateAnswered && clean)) edit.dish = clean;
+    if (clean !== (meal.dish ?? '')) edit.dish = clean;
     if (stars !== null && stars !== meal.stars) edit.stars = stars;
     if (price !== null && price !== meal.priceTap) edit.priceTap = price;
     if (solo !== null && solo !== meal.solo) edit.solo = solo;

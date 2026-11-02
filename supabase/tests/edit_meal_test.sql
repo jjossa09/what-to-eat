@@ -1,5 +1,5 @@
--- Test for edit_meal() (P1-24). Run in the Supabase SQL Editor after applying
--- 20261105120000_edit_meal.sql. Everything runs in one transaction and is rolled back: no rows
+-- Test for edit_meal() (P1-24, P2-06). Run in the Supabase SQL Editor after applying
+-- 20261105120000_edit_meal.sql and 20261108120000_edit_meal_dish_only.sql. Everything runs in one transaction and is rolled back: no rows
 -- are left behind. Success ends with the notice "edit_meal: all checks passed". Any failed
 -- check raises an error naming it.
 
@@ -57,6 +57,7 @@ declare
   d constant uuid := '22222222-0000-0000-0000-0000000000e4';
   r record;
   n int;
+  d_ate timestamptz;
 begin
   -- Rules.
   perform public.test_expect_error('nothing to change', format('select public.edit_meal(%L)', d));
@@ -67,11 +68,16 @@ begin
   perform public.test_expect_error('dish 61', format('select public.edit_meal(%L, p_dish => %L)', d, repeat('x', 61)));
 
   -- Corrections on meal_d: each changed field logs one edited event; unchanged ones log none.
+  -- A meal with a food answer keeps it: the dish edit leaves ate_at and category_id as they were.
+  select ate_at into d_ate from public.meals where id = d;
   perform public.edit_meal(d, p_dish => 'Margherita', p_stars => 5::smallint,
                            p_price_tap => 2::smallint, p_solo => false);
-  select dish, stars, price_tap, solo into r from public.meals where id = d;
+  select dish, stars, price_tap, solo, ate_at, category_id into r from public.meals where id = d;
   if r.dish <> 'Margherita' or r.stars <> 5 or r.price_tap <> 2 or r.solo is not false then
     raise exception 'meal_d: values not saved';
+  end if;
+  if r.ate_at is distinct from d_ate or r.category_id <> 'pizza' then
+    raise exception 'meal_d: dish edit should keep the food answer as it was';
   end if;
   select count(*) into n from public.recommendation_events
     where session_id = '11111111-0000-0000-0000-0000000000e4' and edited;
@@ -92,21 +98,33 @@ begin
   select dish into r from public.meals where id = d;
   if r.dish is not null then raise exception 'meal_d: blank dish should clear'; end if;
 
-  -- meal_a: edit before finishing "Went?". A dish records the food answer (ate_at set, the
-  -- meal's category), and a price. Then the prompt's remaining step (stars) still works, and
-  -- its food and price steps are refused (they were answered).
+  -- meal_a: edit before finishing "Went?" (P2-06). A dish edit saves only the dish: ate_at
+  -- stays null, so the meal does not count for cuisine yet. The same dish again changes
+  -- nothing. Then the prompt's food answer (its own category) and stars still work, and its
+  -- price step is refused (the edit answered it).
   perform public.edit_meal(a, p_dish => 'Garlic knots', p_price_tap => 1::smallint);
   select ate_at, category_id, dish, price_tap into r from public.meals where id = a;
-  if r.ate_at is null or r.category_id <> 'pizza' or r.dish <> 'Garlic knots' or r.price_tap <> 1 then
-    raise exception 'meal_a: dish edit should record the food answer';
+  if r.ate_at is not null or r.category_id <> 'pizza' or r.dish <> 'Garlic knots' or r.price_tap <> 1 then
+    raise exception 'meal_a: dish edit should save the dish and leave ate_at null';
   end if;
   select count(*) into n from public.recommendation_events
     where session_id = '11111111-0000-0000-0000-0000000000e1' and event = 'ate'
       and ate_category_id = 'pizza' and edited and round = 2;
-  if n <> 1 then raise exception 'meal_a: ate event should use the pick round (2)'; end if;
+  if n <> 1 then raise exception 'meal_a: dish edit should log one edited event in the pick round (2)'; end if;
 
-  perform public.test_expect_error('prompt food after edit',
-    format('select public.save_meal_feedback(%L, p_category => ''pizza'')', a));
+  perform public.edit_meal(a, p_dish => 'Garlic knots ');
+  select ate_at into r from public.meals where id = a;
+  select count(*) into n from public.recommendation_events
+    where session_id = '11111111-0000-0000-0000-0000000000e1' and event = 'ate' and edited;
+  if r.ate_at is not null or n <> 1 then
+    raise exception 'meal_a: an unchanged dish should change nothing';
+  end if;
+
+  perform public.save_meal_feedback(a, p_category => 'thai', p_dish => 'Garlic knots');
+  select ate_at, category_id into r from public.meals where id = a;
+  if r.ate_at is null or r.category_id <> 'thai' then
+    raise exception 'meal_a: the prompt food answer should set ate_at and the eaten category';
+  end if;
   perform public.save_meal_feedback(a, p_stars => 4::smallint);
   perform public.test_expect_error('prompt price after edit',
     format('select public.save_meal_feedback(%L, p_price_tap => 2::smallint)', a));
