@@ -1,6 +1,6 @@
 # What to eat! Requirements
 
-Version 1.6 | November 1, 2026 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
+Version 1.7 | 2026-11-02 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
 
 ## Overview
 
@@ -30,7 +30,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | ID | Requirement | Phase |
 |---|---|---|
 | FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 2 chips: Close to me, I don't mind. | 1 |
-| FR4 | Exactly 3 questions (3 messages) before the first round of recommendations: craving, budget, and distance (company joins the pool with P2-07). The ML6 confidence gate sets their order: weak predictions are asked first; answers the models predict confidently are asked last with their chip pre-selected and editable. The quiz budget is pre-selected even when the budget prediction is weak (it is the user's own answer). Question text is fixed; Muse only parses answers. Cold start: the gate runs on the quiz prior. | 1-2 |
+| FR4 | Exactly 3 questions (3 messages) before the first round of recommendations, chosen by the ML6 confidence gate from craving, budget, distance, and company. Company joins the pool when the user has at least one saved companion, whatever the quiz says. Weak predictions are asked first; answers the models predict confidently are asked last with their chip pre-selected and editable. The quiz budget is pre-selected even when the budget prediction is weak (it is the user's own answer). A new search counts the typed craving as its first answer and asks two more. Question text is fixed; Muse only parses answers. Cold start: the gate runs on the quiz prior. | 1-2 |
 | FR5 | Free-text answers are parsed by Muse into the same structured answers as quick-reply chips (ML7). | 1 |
 
 ### Recommendations
@@ -40,7 +40,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | FR6 | Geoapify Places search (catering categories) from the current location, using the search radius defined in FR-R2. | 1 |
 | FR7 | Each candidate is scored deterministically (ML5); the top 3 are shown, each with a one-line reason written by Muse from the actual evidence (ML7). | 1 |
 | FR8 | The top 3 appear as compact cards and pins on an Apple Map, with "Powered by Geoapify" and "© OpenStreetMap contributors" shown (NFR5). Tapping Directions opens Apple Maps. | 1 |
-| FR9 | The user confirms which place they chose. 'None of these' asks a refinement question and keeps the session open. A session ends as none at the round-4 cap. A session left without a decision keeps no outcome. | 1 |
+| FR9 | The user confirms which place they chose. 'None of these' asks a refinement question and keeps the session open. On the best-so-far round (ML10), 'None of these' ends the session as none. A session left without a decision keeps no outcome. | 1 |
 | FR9b | After the first round, the conversation stays open as long as needed; refinement follows the ML10 loop. | 1 |
 
 ### Feedback
@@ -59,7 +59,7 @@ Background location is out of scope: it needs a development build and a paid App
 | ID | Requirement | Phase |
 |---|---|---|
 | FR14 | Per companion: meal count, likely days of the week, and most likely categories together, derived from the same meal counts as ML3. | 2 |
-| FR15 | Selected companions are ML1 context: they change which questions are asked (ML6) and how places score (ML3). | 2 |
+| FR15 | Selected companions are ML1 context: they change which questions are asked (ML6) and how places score (ML3). Company is asked when the user has at least one saved companion; the quiz's mostly-solo answer only sets the company prior. Companions are recorded on the session and copied to the meal at pick. Companion names stay on the phone and never go to Muse. | 2 |
 
 ### Insights
 
@@ -74,12 +74,12 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 
 | ID | Requirement | Phase |
 |---|---|---|
-| ML1 | Context features: meal slot (breakfast, lunch, dinner, late), weekday or weekend, companions (live data only for now). | 1 |
+| ML1 | Context features: meal slot (breakfast, lunch, dinner, late), weekday or weekend, companions (live and backfill). | 1 |
 | ML2 | Fixed category list, used by backfill, models, and place mapping: Burgers, Pizza, Mexican, Latin, Chinese, Japanese/Sushi, Korean, Thai, Vietnamese, Indian, Mediterranean, Italian, French, American/Diner, BBQ, Chicken/Wings, Sandwiches, Seafood, Salads/Bowls, Breakfast/Brunch, Coffee/Bakery, Smoothies/Juice, Dessert, Pubs/Bars. Mapping is deterministic. Human-verified exact-name overrides come first. Then two passes: first the Geoapify catering categories (from OSM cuisine tags, plus pub, bar, biergarten, and taproom), then a common-chains list and name-keyword rules (e.g. Chipotle to Mexican, "taqueria" to Mexican, "pho" to Vietnamese). An existing cuisine tag always beats a name keyword. A bare cafe tag with no name match goes to Coffee/Bakery. Only places matching none of these go to Other, which is shown but never predicted. | 1 |
-| ML3 | Layer 1, cuisine model: recency-weighted counts per context. Backs off to broader contexts when data is thin: this companion, then user overall, then quiz prior. Outputs a probability per category plus the number of meals behind it. | 2 |
+| ML3 | Layer 1, cuisine model: recency-weighted counts per context, each level smoothed toward the broader one: quiz prior, user overall, meal slot, meal slot and weekday/weekend, then (when companions are selected) meals in this meal slot that included every selected companion. A level counts once it has at least one recency-weighted meal. Outputs a probability per category plus the number of meals behind it. | 2 |
 | ML4 | Layer 2, place model: return score from visits, recency, and 1-5 star ratings; 1-2 stars drop it sharply. New places are scored on category fit and distance fit. Price fit uses the user's own price data for that place; unknown = half. | 2 |
 | ML5 | Scoring: each real candidate is scored deterministically from ML3, ML4, price fit, and distance fit. OSM has no ratings or price levels, so neither is used. Top 3 = 2 familiar picks + 1 discovery slot (best candidate outside the user's usual categories). Phase 1 uses the quiz prior in place of ML3 and ML4. | 1 |
-| ML6 | Confidence gate: a prediction is weak if its top probability is under 0.4 or it rests on fewer than 5 meals in the context (Starting values). The gate orders the 3 questions (weak first) and decides which answers are pre-selected; it never skips a question. Craving uses the cuisine model (ML3); budget uses the user's paid price levels, smoothed toward the quiz budget the same way; distance is treated as weak until it has its own model. | 2 |
+| ML6 | Confidence gate: a prediction is weak if its top probability is under 0.4 or it rests on fewer than 5 meals in the context (Starting values). With 3 questions in the pool, the gate orders them (weak first) and skips none. With 4 (company included), it asks 3 and skips the most confident of the confident predictions, which becomes the answer (ties skip budget); if none is confident, company is skipped and stays unknown. A new search never skips craving. Craving uses the cuisine model (ML3); budget uses the user's paid price levels, smoothed toward the quiz budget the same way; company uses the user's past company (solo or a saved group), starting from the quiz: mostly solo gives solo 0.7 and the observed groups share 0.3 equally, with people gives solo 0.3 and the groups share 0.7, no answer gives equal shares; then the same smoothing and levels. Before any group is observed, solo keeps its quiz share and the rest goes to an "unseen group" that is never an answer: if it is the top prediction, company is weak. Distance is treated as weak until it has its own model. | 2 |
 | ML7 | Muse is language only: parse free text into structured answers, write each pick's one-line reason from the actual evidence, run the conversation. Muse never reorders, removes, or adds places. One Muse call writes all 3 reasons; its output is checked against the candidate IDs. | 1 |
 | ML8 | Funnel logged per recommendation: shown, interested (card or directions tapped), rejected (with reason), picked, went, stars, price tap. | 1 |
 | ML9 | Evaluation: time-ordered replay on backfilled history (predict each meal using only earlier meals). Report cuisine and place top-3 hit rates against two baselines (always most frequent; random), with sample size stated. | 2 |
@@ -108,7 +108,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 - On import, each place name is resolved once to a Geoapify place so backfilled and live visits match. Ambiguous matches are confirmed by Juan.
 - A meal's category is the food eaten, for backfill (the CSV category) and live (the food answer). It never relabels a place: a place's category comes only from the ML2 mapping, including the human-verified exact-name overrides.
 - Backfill places that can't be resolved are stored with the CSV's name, mapped from the name alone, and flagged unresolved. Those meals count for the cuisine model, not for distance or place matching.
-- Backfill tests Layers 1 and 2 by meal slot and day. Companion patterns and star-based return scores learn from live use only. Backfill has no location, so it does not feed the search radius.
+- Backfill tests Layers 1 and 2 by meal slot and day. Companion patterns learn from live and backfill meals; star-based return scores learn from live use only. The offline evaluation (ML9) replays without companions.
 - ML9 place hit rate: the candidate pool for each replayed meal is the set of places seen in earlier meals. A first visit to a new place counts as a miss; the share of new-place meals is reported separately. Parameters are fixed before replay, not tuned on it.
 
 ## Adaptive search radius
@@ -155,6 +155,10 @@ The search area should grow more accurate to the user as usage increases. Values
 - OSM cuisine tags are often missing. The name-keyword and chains pass (ML2) reduces this; places matching neither fall to Other and score lower on category fit.
 - Free-tier cold starts can eat into the 8 second budget (NFR4). Cold-start latency is measured at deploy.
 - The radius thresholds (80th percentile, 1 to 25 miles, 8 candidates) and all starting values above are untested guesses, to be tuned after 2 to 3 days of live data.
+
+## Changes from v1.6
+
+- P2-05 and P2-07: confidence gate, company question, companion context; FR9 wording matches ML10.
 
 ## Changes from v1.5
 
