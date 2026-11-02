@@ -27,3 +27,6 @@ CLAUDE.md
 # Backfill data (real meals stay local)
 data/*.csv
 !data/backfill_template.csv
+
+# Backfill place choices (local only)
+data/backfill_resolutions.json

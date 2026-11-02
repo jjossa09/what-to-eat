@@ -1,2 +1,2 @@
-date,meal_slot,place,category,price,companions
-2000-01-01,lunch,EXAMPLE Fake Taqueria (delete this row),Mexican,12.50,
+date,meal_slot,place,category,price,companions,dish
+2000-01-01,lunch,EXAMPLE Fake Taqueria (delete this row),Mexican,12.50,,carnitas tacos
