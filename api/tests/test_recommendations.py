@@ -182,19 +182,25 @@ def test_full_round():
 
 
 def test_one_call_each_and_parallel_fetch():
-    up = Upstreams()
+    class WithCompanions(Upstreams):
+        def supabase(self, request):
+            if request.method == "GET" and request.url.path.endswith("/companions"):
+                return httpx2.Response(200, json=[])
+            return super().supabase(request)
+
+    up = WithCompanions()
     post(up)
     hosts = up.hosts()
     assert hosts.count("api.geoapify.com") == 1
-    # taste_profiles + meals reads; session insert; places upsert; gate append (P2-05); shown
-    # events insert.
-    assert hosts.count(SUPABASE_HOST) == 6
+    # taste_profiles + meals + companions reads (P2-07); session insert; places upsert; gate
+    # append (P2-05); shown events insert.
+    assert hosts.count(SUPABASE_HOST) == 7
     assert hosts.count("api.meta.ai") == 1
     paths = [r.url.path for r in up.requests]
     assert paths.index("/v1/chat/completions") < paths.index("/rest/v1/recommendation_events")
-    # Places, both history reads, and the session insert overlap; the places upsert overlaps
-    # the Muse call.
-    assert up.max_in_flight == 4
+    # Places, the three history reads, and the session insert overlap; the places upsert
+    # overlaps the Muse call.
+    assert up.max_in_flight == 5
 
 
 def test_history_read_as_user():

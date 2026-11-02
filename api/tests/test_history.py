@@ -62,14 +62,26 @@ def run_load(upstream: Supabase):
 
 def test_reads_as_the_user_with_anon_key_and_user_filter():
     upstream = Supabase()
+    upstream.bodies["companions"] = []  # P2-07: the default load reads companions for everyone
     run_load(upstream)
-    assert {r.url.path for r in upstream.requests} == {"/rest/v1/taste_profiles",
-                                                      "/rest/v1/meals"}
+    assert sorted(r.url.path for r in upstream.requests) == [
+        "/rest/v1/companions", "/rest/v1/meals", "/rest/v1/taste_profiles"]
     for request in upstream.requests:
         assert request.headers["apikey"] == ANON_KEY
         assert request.headers["authorization"] == f"Bearer {TOKEN}"
         assert "must-not-be-used" not in str(request.headers)
         assert request.url.params["user_id"] == f"eq.{USER_ID}"
+
+    # A later round (companions off) still reads exactly the prior and the meals.
+    later = Supabase()
+
+    async def go():
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(later)) as client:
+            return await history.load(USER_ID, TOKEN, client=client, include_companions=False)
+
+    asyncio.run(go())
+    assert sorted(r.url.path for r in later.requests) == [
+        "/rest/v1/meals", "/rest/v1/taste_profiles"]
 
 
 def test_meals_query_counts_confirmed_meals_including_unresolved_places():
