@@ -5,6 +5,7 @@ from datetime import date, datetime
 import pytest
 
 from app.cuisine_model import predict
+from app.place_model import place_scores
 from app.places import Candidate
 from app.scoring import (
     Context,
@@ -17,10 +18,8 @@ from app.scoring import (
     is_weak,
     meal_context,
     merge_candidates,
-    place_stats,
     price_fit,
     rank,
-    return_score,
     usual_categories,
 )
 from app.scoring_rules import CLOSE_M, DONT_MIND_WEIGHTS, WEIGHTS
@@ -50,6 +49,8 @@ def stored(pid, distance_m, name="Stored", tags=("catering.restaurant.thai",)) -
 
 def meal(place, days_ago=1, source="live", category_id=None, price_level=None,
          **kw) -> PastMeal:
+    if source == "live":
+        kw.setdefault("went", True)  # history loads live meals with went = true only
     return PastMeal(place=place, eaten_on=date.fromordinal(TODAY.toordinal() - days_ago),
                     source=source, category_id=category_id, price_level=price_level, **kw)
 
@@ -150,8 +151,12 @@ def test_is_weak():
     assert is_weak(predict(History(meals=mixed), ctx(), TODAY))  # 6 meals, top < 0.4
 
 
-def test_return_score_is_zero_in_v1():
-    assert return_score(None, ctx()) == 0.0
+def test_never_visited_place_has_return_score_zero():
+    history = History(meals=(meal(stored("node/1", 100), 2, source="backfill"),))
+    r = rank([cand("node/1", "thai", 100), cand("new", "thai", 100)], ctx(), history)
+    by_id = {s.place.id: s.evidence for s in r.ranked}
+    assert by_id["new"].return_score == 0.0 and by_id["new"].visits == 0
+    assert by_id["node/1"].return_score > 0 and by_id["node/1"].stars_mean is None
 
 
 @pytest.mark.parametrize(
@@ -360,7 +365,7 @@ def test_unresolved_meals_count_for_cuisine_but_never_become_candidates():
     ))
     merged, ids = merge_candidates([], history, ctx())
     assert [c.id for c in merged] == ["node/1"] and ids == frozenset({"node/1"})
-    assert set(place_stats(history, TODAY)) == {"node/1"}
+    assert set(place_scores(history, TODAY)) == {"node/1"}
     prediction = predict(history, ctx(), TODAY)
     assert prediction.user_counts == {"korean": 2, "pizza": 1}
     r = rank([cand("k", "korean", 900)] + merged, ctx(), history, ids)
@@ -397,3 +402,54 @@ def test_same_input_same_output_regardless_of_candidate_order():
         shuffled = places[:]
         random.Random(seed).shuffle(shuffled)
         assert rank(shuffled, ctx(), history) == first
+
+
+# Place model in the ranking (P2-10).
+
+
+def test_frequent_one_star_place_ranks_below_an_identical_new_place():
+    bad = stored("node/1", 500)
+    history = History(meals=tuple(meal(bad, d, stars=1) for d in range(1, 9)))
+    r = rank([cand("node/1", "thai", 500), cand("node/2", "thai", 500)], ctx(), history)
+    assert [s.place.id for s in r.ranked] == ["node/2", "node/1"]
+    assert r.ranked[1].evidence.return_score < 0 < r.ranked[1].evidence.visits
+    assert r.ranked[1].evidence.stars_mean == 1.0
+
+
+@pytest.mark.parametrize("radius_m", [None, 35000])
+def test_score_is_the_weighted_sum_of_fits_for_a_visited_place(radius_m):
+    place = stored("node/1", 1200)
+    history = History(prior=QuizPrior(budget_level=2),
+                      meals=(meal(place, 3, stars=4, price_level=2),
+                             meal(place, 9, source="backfill", category_id="thai")))
+    context = ctx(radius_m=radius_m, search_radius_m=radius_m or 5000)
+    ev = rank([cand("node/1", "thai", 1200)], context, history).ranked[0].evidence
+    w = DONT_MIND_WEIGHTS if radius_m else WEIGHTS
+    assert sum(w.values()) == pytest.approx(1.0)
+    expected = (w["category"] * ev.category_fit + w["return"] * ev.return_score
+                + w["price"] * ev.price_fit + w["distance"] * ev.distance_fit)
+    score = rank([cand("node/1", "thai", 1200)], context, history).ranked[0].score
+    assert score == pytest.approx(expected)
+    assert ev.return_score > 0 and ev.visits == 2 and ev.price_fit == 1.0
+
+
+def test_return_score_never_lets_a_usual_place_take_the_discovery_slot():
+    loved = stored("node/1", 100)
+    history = History(meals=tuple(meal(loved, d, source="backfill", category_id="thai")
+                                  for d in range(1, 6)))
+    places = [cand("node/1", "thai", 100), cand("t2", "thai", 200), cand("t3", "thai", 300),
+              cand("pizza", "pizza", 4500)]
+    r = rank(places, ctx(), history)
+    assert r.usual == frozenset({"thai"})
+    assert top_ids(r) == ["node/1", "t2", "pizza"]
+    assert r.top3[2].slot == "discovery"
+    # The visited Thai place outscores the far pizza, but discovery is chosen by category.
+    assert r.ranked[0].score > next(s for s in r.ranked if s.place.id == "pizza").score
+
+
+def test_discovery_falls_back_to_a_usual_place_only_when_nothing_else_exists():
+    loved = stored("node/1", 100)
+    history = History(meals=(meal(loved, 1, source="backfill", category_id="thai"),))
+    places = [cand("node/1", "thai", 100), cand("t2", "thai", 200), cand("t3", "thai", 300)]
+    r = rank(places, ctx(), history)
+    assert top_ids(r) == ["node/1", "t2", "t3"]

@@ -19,8 +19,9 @@ from app.auth import current_auth, current_user
 from app.categories import CATEGORY_IDS, OTHER
 from app.config import get_settings
 from app.logs import configure_logging
+from app.place_model import place_scores
 from app.refine import Change
-from app.scoring import Context, History, meal_context, merge_candidates, place_stats, rank
+from app.scoring import Context, History, meal_context, merge_candidates, rank
 
 configure_logging()
 app = FastAPI(title="What to eat! API")
@@ -358,7 +359,10 @@ async def best_so_far_round(
     """
     answers = applied.answers
     user_history = loaded or History()
-    known = {pid: s.price_level for pid, s in place_stats(user_history, new.local_date).items()}
+    known = {
+        pid: s.known_price_level
+        for pid, s in place_scores(user_history, as_of=new.local_date).items()
+    }
     budget = answers.budget_level or user_history.prior.budget_level
     best = refine.best_so_far(ref.shown, answers, new.search_radius_m, body.lat, body.lon,
                               known, budget)

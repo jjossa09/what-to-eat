@@ -429,3 +429,59 @@ def test_template_says_how_often_the_food_was_had():
     line = muse.template_reason(korean)
     assert line.startswith("Korean, you've had it 2 times")
     assert not muse.PAST_VISIT_TERMS.search(line) and len(line) <= muse.MAX_REASON_CHARS
+
+
+# Star ratings (P2-10): only from stars_mean, the user's own rating.
+
+
+def rated_picks(stars=(5, 4)):
+    """node/1 has live visits rated `stars`; the other picks are unvisited and unrated."""
+    stored = StoredPlace(id="node/1", name="Place node/1", lat=LAT + 400 / M_PER_DEG, lon=LON,
+                         geoapify_categories=(), address="1 Main St")
+    meals = tuple(PastMeal(place=stored, eaten_on=date(2026, 10, 28), source="live",
+                           category_id="thai", price_level=None, went=True, stars=s)
+                  for s in stars)
+    context = Context(lat=LAT, lon=LON, local_date=date(2026, 10, 29), meal_slot="dinner",
+                      is_weekend=False, search_radius_m=5000)
+    history = History(prior=QuizPrior(favorites=frozenset({"thai", "pizza"})), meals=meals)
+    candidates = [cand("node/1", "thai", 400), cand("node/2", "pizza", 800),
+                  cand("node/3", "mexican", 1200)]
+    return rank(candidates, context, history).top3
+
+
+def sent_picks(picks):
+    meta = Meta(reply({p.scored.place.id: "Fine." for p in picks}))
+    run(meta, picks=picks)
+    return {p["id"]: p for p in
+            json.loads(json.loads(meta.requests[0].content)["messages"][1]["content"])["picks"]}
+
+
+def test_stars_mean_is_sent_only_for_a_rated_place():
+    by_id = sent_picks(rated_picks())
+    assert by_id["node/1"]["stars_mean"] == 4.5
+    assert "stars_mean" not in by_id["node/2"] and "stars_mean" not in by_id["node/3"]
+    assert "stars_mean" in muse.SYSTEM_PROMPT
+
+
+def test_matching_star_claim_on_a_rated_place_is_fine():
+    picks = rated_picks()
+    lines = {"node/1": "You rated it 4.5 stars, 0.2 mi away.", "node/2": "B.", "node/3": "C."}
+    assert run(Meta(reply(lines)), picks=picks).source == muse.MUSE
+
+
+@pytest.mark.parametrize("lines", [
+    {"node/1": "You rated it 5 stars.", "node/2": "B.", "node/3": "C."},  # it's 4.5
+    {"node/1": "A.", "node/2": "Rated 5 stars by you.", "node/3": "C."},  # unrated
+    {"node/1": "A.", "node/2": "B.", "node/3": "A top rating nearby."},  # unrated
+])
+def test_rating_claims_without_the_rating_use_templates(lines, caplog):
+    caplog.set_level(logging.WARNING)
+    result = run(Meta(reply(lines)), picks=rated_picks())
+    assert result.source == muse.TEMPLATE
+    assert "rejected: rating_claim" in caplog.text
+
+
+def test_whole_star_rating_can_be_stated_as_a_whole_number():
+    picks = rated_picks(stars=(5, 5))
+    lines = {"node/1": "You gave it 5 stars.", "node/2": "B.", "node/3": "C."}
+    assert run(Meta(reply(lines)), picks=picks).source == muse.MUSE
