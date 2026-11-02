@@ -54,7 +54,7 @@ SHORT_QUESTIONS = {
     "craving": "What are you craving?",
     "budget": "Budget this time?",
     "distance": "How far?",
-    "refine": "What should change?",
+    "refine": "What would make it better?",
     "open": "What would make it right?",
 }
 # Used when Muse's line fails a check.

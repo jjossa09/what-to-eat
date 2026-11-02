@@ -111,6 +111,9 @@ class RecommendationsRequest(BaseModel):
     # Current answers from the chat ("not burgers"); a follow-up's change is in refine.
     exclude_categories: list[str] = Field(default_factory=list, max_length=len(refine.CRAVINGS))
     refine: Change | None = None  # a follow-up (chip or parsed text), applied here
+    # The user tapped "None of these" on the previous round before this follow-up (P2-05):
+    # its cards are logged as rejected with none_of_these first in the reason.
+    none_of_these: bool = False
     session_id: UUID | None = None  # omitted on round 1; later rounds continue the session
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
     solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
@@ -266,7 +269,7 @@ async def recommendations(
         if ref
         else asyncio.sleep(0),
         log_transcript(user_id, token, ref, body, client) if ref else asyncio.sleep(0),
-        log_follow_up(user_id, token, ref, new_session, applied.tags, client)
+        log_follow_up(user_id, token, ref, new_session, reject_tags(body, applied), client)
         if ref
         else asyncio.sleep(0),
         # sessions.gate: never part of `logged`, so a failure loses only the gate entry.
@@ -368,6 +371,12 @@ async def log_gate(
     )
 
 
+def reject_tags(body: RecommendationsRequest, applied: refine.Applied) -> tuple[str, ...]:
+    """What the previous round's rejected cards are logged with: none_of_these first when the
+    user tapped it, then what the follow-up changed."""
+    return (("none_of_these",) if body.none_of_these else ()) + applied.tags
+
+
 async def log_follow_up(
     user_id: str, token: str, ref: funnel.RoundRef, new: funnel.NewSession,
     tags: tuple[str, ...], client: httpx2.AsyncClient,
@@ -420,7 +429,7 @@ async def best_so_far_round(
     ]
     saved, followed, gated = await asyncio.gather(
         log_transcript(user_id, token, ref, body, client),
-        log_follow_up(user_id, token, ref, new, applied.tags, client),
+        log_follow_up(user_id, token, ref, new, reject_tags(body, applied), client),
         log_gate(token, ref, gate.CAP_ENTRY, None, client),
     )
     logged = bool(

@@ -122,6 +122,8 @@ export type RoundRequest = {
   exclude_categories: string[];
   /** A follow-up's change; the server applies it to the answers above. */
   refine?: Partial<Change>;
+  /** The user tapped None of these on the previous round (logged as the rejected reason). */
+  none_of_these?: boolean;
   solo: boolean | null;
   session_id?: string;
   exclude_ids: string[];

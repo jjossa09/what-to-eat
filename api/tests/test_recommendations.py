@@ -1006,3 +1006,39 @@ def test_later_rounds_ignore_the_asked_order():
     follow_up(up, refine={"budget": "cheaper"}, asked_order=["craving", "budget", "distance"],
               plan_source="plan")
     assert gate_calls(up)[0]["p_plan"] is None
+
+
+# "None of these" before a follow-up (P2-05) -----------------------------------
+
+
+def test_none_of_these_is_the_first_rejected_reason():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, none_of_these=True, refine={"budget": "cheaper"})
+    rows = rejected_rows(up)
+    assert [r["place_id"] for r in rows] == ["node/1", "node/2", "node/3"]
+    assert {r["reject_reason"] for r in rows} == {"refine:none_of_these,cheaper"}
+
+
+def test_without_none_of_these_the_reason_is_unchanged():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"})
+    assert {r["reject_reason"] for r in rejected_rows(up)} == {"refine:cheaper"}
+
+
+def test_none_of_these_on_the_cap_round_is_in_the_reason():
+    up = Upstreams(shown=THREE_ROUNDS)
+    body = follow_up(up, none_of_these=True, refine={"something_else": True}).json()
+    assert body["best_so_far"] is True
+    assert {r["reject_reason"] for r in rejected_rows(up)} == {
+        "refine:none_of_these,something_else"}
+
+
+def test_none_of_these_on_round_one_logs_no_rejections():
+    up = Upstreams()
+    body = post(up, none_of_these=True).json()
+    assert body["round"] == 1 and body["logged"] is True
+    assert rejected_rows(up) == []
+
+
+def test_none_of_these_must_be_a_boolean():
+    assert post(Upstreams(), none_of_these="maybe").status_code == 422
