@@ -83,6 +83,7 @@ class PastMeal:
     companion_ids: frozenset[str] = frozenset()
     solo: bool | None = None
     stars: int | None = None  # live only, 1-5
+    distance_m: int | None = None  # stored distance from a live session's origin
 
 
 @dataclass(frozen=True)

@@ -171,7 +171,7 @@ def test_full_round():
     assert body["history_used"] is True
     assert body["reasons_source"] == "muse"
     assert body["cold_start"] is False
-    assert body["radius_m"] == 5000
+    assert body["radius_m"] == 11250
     assert len(body["picks"]) == 3
     ids = [p["id"] for p in body["picks"]]
     assert "node/4" not in ids  # hard no
@@ -193,10 +193,10 @@ def test_one_call_each_and_parallel_fetch():
     up = WithCompanions()
     post(up)
     hosts = up.hosts()
-    assert hosts.count("api.geoapify.com") == 1
+    assert hosts.count("api.geoapify.com") == 3
     # taste_profiles + meals + companions reads (P2-07); session insert; places upsert; gate
     # append (P2-05); shown events insert.
-    assert hosts.count(SUPABASE_HOST) == 7
+    assert hosts.count(SUPABASE_HOST) == 8
     assert hosts.count("api.meta.ai") == 1
     paths = [r.url.path for r in up.requests]
     assert paths.index("/v1/chat/completions") < paths.index("/rest/v1/recommendation_events")
@@ -229,7 +229,7 @@ def test_same_inputs_same_top3():
 @pytest.mark.parametrize("chip", [15000, 35000])
 def test_chip_radius_is_searched_nearest_first(chip):
     up = Upstreams()
-    assert post(up, radius_m=chip).json()["radius_m"] == chip
+    assert post(up, radius_m=chip).json()["radius_m"] == {15000: 33750, 35000: 40234}[chip]
     params = up.requests[0].url.params
     assert str(chip) in params["filter"]
     assert params["bias"] == f"proximity:{LON},{LAT}"  # both levels: the nearest 100
@@ -331,7 +331,7 @@ def test_round_one_creates_session_and_logs_shown():
     assert body["session_id"] == SESSION_ID
     assert body["round"] == 1
 
-    (session,) = writes(up, "sessions")  # one POST, no PATCH: the gate goes through its RPC
+    (session, _) = writes(up, "sessions")  # POST plus the widened search radius PATCH
     assert session.method == "POST"
     assert len(gate_calls(up)) == 1
     row = json.loads(session.content)
@@ -611,7 +611,7 @@ def test_cheaper_steps_the_budget_down_and_updates_the_session():
     assert body["answers"] == {"craving": "thai", "budget_level": 1, "radius_m": 35000,
                                "exclude_categories": []}
     assert session_patch(up) == {"craving_category_id": "thai", "budget_level": 1,
-                                 "radius_m": 35000, "search_radius_m": 35000}
+                                 "radius_m": 35000, "search_radius_m": 40234}
 
 
 def test_cheaper_stops_at_one_dollar():
@@ -667,7 +667,7 @@ def test_follow_up_writes_run_alongside_muse():
     up = Upstreams(shown=ROUND_1)
     follow_up(up, refine={"distance": "farther"})
     assert up.hosts().count("api.meta.ai") == 1
-    assert up.hosts().count("api.geoapify.com") == 1
+    assert up.hosts().count("api.geoapify.com") == 2
     paths = [(r.method, r.url.path) for r in up.requests]
     # One session read, one PATCH, one rejected insert, one shown insert, one places upsert.
     assert paths.count(("GET", "/rest/v1/sessions")) == 1
@@ -911,7 +911,7 @@ def test_gate_failure_round_one_logs_everything_else(kw, caplog):
     assert (body["round"], body["logged"], body["gate_logged"]) == (1, True, False)
     assert len(body["picks"]) == 3
     assert [r["place_id"] for r in events(up, "shown")] == [p["id"] for p in body["picks"]]
-    assert [r.method for r in writes(up, "sessions")] == ["POST"]
+    assert [r.method for r in writes(up, "sessions")] == ["POST", "PATCH"]
     assert len(writes(up, "messages")) == 1
     assert len(gate_calls(up)) == 1  # tried once, not retried
     assert "Funnel gate failed" in caplog.text

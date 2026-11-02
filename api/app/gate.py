@@ -10,7 +10,7 @@ Weak predictions are asked first; confident ones are asked last with their chip 
 values: top probability under 0.4, or fewer than 5 meals in the context).
   craving:  the cuisine model (ML3) and scoring.is_weak.
   budget:   predict_budget() below, from what the user paid (meals.price_level).
-  distance: always weak for now (no distance model; P2-03 revisits). Uniform in the gains.
+  distance: confirmed live trips, predicted by app/distance_model.py (P2-03).
 
 Refinement (ML10 v2): after a round, the next question is the one whose answer would change
 the next round's top 3 the most. For question Q with answers a, model probabilities P(a), and
@@ -32,6 +32,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from uuid import UUID
 
+from app import distance_model
 from app.cuisine_model import PREDICTABLE, is_weekend, predict, recency_weight
 from app.places import Candidate
 from app.refine import RADII
@@ -259,7 +260,10 @@ def plan(
     price = predict_budget(history, meal_slot, weekend, as_of)
     lvl, p_lvl = _top(price.probs)
     budget = Question(BUDGET, weak(p_lvl, price.meals), lvl, p_lvl, price.meals, price.level)
-    distance = Question(DISTANCE, True, None, 1 / len(RADII), 0, NONE)
+    trips = distance_model.predict(history, model_context(meal_slot, weekend, as_of), as_of)
+    trip, p_trip = _top(trips.probs)
+    distance = Question(DISTANCE, weak(p_trip, trips.meals), distance_model.CHIPS[trip],
+                        p_trip, trips.meals, trips.level)
     pool = (craving, budget, distance)
     if history.companions:
         pool += (predict_company(history, meal_slot, weekend, as_of),)
@@ -345,9 +349,10 @@ def next_question(
 
     budget_out = ([(budget.probs[lvl], top3(replace(base, budget_level=lvl))) for lvl in LEVELS]
                   if remaining else [])
-    distance_out = ([(1 / len(RADII), top3(replace(base, radius_m=r),
+    trips = distance_model.predict(history, context, context.local_date)
+    distance_out = ([(trips.probs[outcome], top3(replace(base, radius_m=r),
                                            [c for c in remaining if c.distance_m <= r]))
-                     for r in RADII] if remaining else [])
+                     for outcome, r in distance_model.CHIPS.items()] if remaining else [])
 
     gains = {CRAVING: entropy(craving_out), BUDGET: entropy(budget_out),
              DISTANCE: entropy(distance_out)}

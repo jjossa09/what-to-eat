@@ -279,6 +279,15 @@ async def update_answers(
                 params={"id": f"eq.{session_id}", "user_id": f"eq.{user_id}"}, json=row)
 
 
+async def update_search_radius(
+    user_id: str, token: str, session_id: str, radius_m: int, *, client: httpx2.AsyncClient,
+) -> None:
+    """Round 1 widened after opening: change only the successfully searched radius."""
+    await _send(client, "PATCH", "sessions", _user_headers(token),
+                params={"id": f"eq.{session_id}", "user_id": f"eq.{user_id}"},
+                json={"search_radius_m": radius_m})
+
+
 async def append_gate(
     token: str, session_id: str, round_: int, entry: dict, plan: dict | None = None,
     *, client: httpx2.AsyncClient,
