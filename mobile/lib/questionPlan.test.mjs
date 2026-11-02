@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { budgetPick, companySelection, matchCompany, newSearchPlan, planPrefill, skippedAnswers, traceOf } from './questionPlan.ts';
+import { budgetPick, companySelection, matchCompany, planPrefill, skippedAnswers, traceOf } from './questionPlan.ts';
 
 // The exact body POST /questions/plan returned for a history like the device test (confident
 // Chinese at $, slot_weekend), captured from the API through its test client.
@@ -154,63 +154,4 @@ test('a confident skipped company is applied', () => {
     { company: [A] });
   assert.deepEqual(skippedAnswers({ key: 'company', weak: false, predicted: 'solo' }, CATEGORY_IDS, IDS),
     { company: 'solo' });
-});
-
-function question(key, top, meals = 8, predicted = null) {
-  const weak = top < 0.4 || meals < 5;
-  return { key, top_prob: top, meals, weak, predicted, prefill: weak ? null : predicted };
-}
-function searchPlan(budget, company, distance = question('distance', 0.5, 0)) {
-  return newSearchPlan({
-    questions: [budget, distance, company],
-    skipped: question('craving', 0.99, 10, 'chinese'),
-  });
-}
-
-test('new search reserves craving and preserves the new plan pre-selections', () => {
-  const plan = searchPlan(question('budget', 0.8, 8, 1), question('company', 0.7, 8, [A]));
-  assert.deepEqual(plan.questions.map((q) => q.key), ['craving', 'distance', 'company']);
-  assert.equal(plan.skipped.key, 'budget');
-  assert.deepEqual(plan.questions.find((q) => q.key === 'company').prefill, [A]);
-  assert.equal(skippedAnswers(plan.skipped, CATEGORY_IDS, IDS).budget, 1);
-});
-test('new search skips budget on a confidence tie', () => {
-  const plan = searchPlan(question('budget', 0.8), question('company', 0.8));
-  assert.equal(plan.skipped.key, 'budget');
-});
-test('new search skips company as unknown when the remaining questions are weak', () => {
-  const plan = searchPlan(question('budget', 0.9, 3), question('company', 0.3, 8, [A]));
-  assert.deepEqual(plan.questions.map((q) => q.key), ['craving', 'budget', 'distance']);
-  assert.equal(plan.skipped.predicted, null);
-  assert.equal(plan.skipped.reason, 'skipped_weak');
-  assert.deepEqual(skippedAnswers(plan.skipped, CATEGORY_IDS, IDS), {});
-});
-test('new search never skips a weak distance despite high probability', () => {
-  const plan = searchPlan(question('budget', 0.6), question('company', 0.3), question('distance', 0.99, 4));
-  assert.equal(plan.skipped.key, 'budget');
-  assert.ok(plan.questions.some((q) => q.key === 'distance'));
-});
-test('new search may skip a confident distance', () => {
-  const plan = searchPlan(question('budget', 0.6), question('company', 0.3), question('distance', 0.9, 5, 15000));
-  assert.equal(plan.skipped.key, 'distance');
-});
-test('new search may skip confident company', () => {
-  const plan = searchPlan(question('budget', 0.6), question('company', 0.9, 8, [A]));
-  assert.equal(plan.skipped.key, 'company');
-  assert.deepEqual(plan.skipped.predicted, [A]);
-});
-test('new search without company keeps all three answers and skips nothing', () => {
-  const plan = newSearchPlan({ questions: [question('distance', 0.5, 0),
-    question('budget', 0.9, 8, 1), question('craving', 0.7, 8, 'thai')], skipped: null });
-  assert.deepEqual(plan.questions.map((q) => q.key), ['craving', 'distance', 'budget']);
-  assert.equal(plan.skipped, null);
-});
-
-
-test('new search preserves the server skip when rounded probabilities appear tied', () => {
-  const skipped = question('company', 0.8, 8, [A]);
-  const plan = newSearchPlan({ questions: [question('craving', 0.99),
-    question('distance', 0.5, 0), question('budget', 0.8, 8, 1)], skipped });
-  assert.equal(plan.skipped.key, 'company');
-  assert.equal(plan.questions.length, 3);
 });

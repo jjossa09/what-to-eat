@@ -34,7 +34,7 @@ import {
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { remindAfterPick } from '../lib/notify';
 import {
-  budgetPick as pickBudget, companySelection, matchCompany, newSearchPlan, planPrefill,
+  budgetPick as pickBudget, companySelection, matchCompany, planPrefill,
   type Prefill, skippedAnswers, traceOf,
 } from '../lib/questionPlan';
 import {
@@ -104,8 +104,7 @@ function planOrder(plan: PlanResponse | null): { keys: FirstKey[]; source: 'plan
  * default order), never a load error. */
 function loadStart(userId: string) {
   const quiz = loadTastePrior(userId);
-  const people = quiz.then((prior) => prior.mostlySolo === false
-    ? loadCompanionChoices(userId).catch(() => []) : []);
+  const people = loadCompanionChoices(userId);
   return Promise.all([
     loadCategories(),
     quiz,
@@ -503,8 +502,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     answers.current = { ...answers.current, craving: null, exclude: [] };
     companyAnswer.current = null;
     setCompanyPick(null);
-    const usable = planOrder(plan).source === 'plan' && plan
-      ? { ...plan, ...newSearchPlan(plan) } : null;
+    const usable = planOrder(plan).source === 'plan' ? plan : null;
     applyPlan(categories ?? [], prior ?? { favorites: [], budget: null, mostlySolo: null }, usable, companions);
     planSource.current = 'new_search';
     setShowAll(false);

@@ -7,7 +7,7 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL;
 const TIMEOUT_MS = 20_000;
 // The question plan holds up the chat's first question; past this the chat uses the default
 // order (P2-05). History only, so it is fast when the API is warm.
-const PLAN_TIMEOUT_MS = 5_000;
+export const PLAN_TIMEOUT_MS = 5_000;
 
 export type ApiErrorKind = 'network' | 'server' | 'auth' | 'conflict' | 'notfound';
 

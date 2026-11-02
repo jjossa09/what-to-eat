@@ -87,33 +87,3 @@ export function skippedAnswers(
   }
   return planPrefill([{ key: skipped.key, prefill: skipped.predicted }], categoryIds);
 }
-
-type NewSearchQuestion = SkippedQuestionShape & {
-  prefill: unknown; top_prob: number; meals: number;
-};
-
-/** Mirrors gate.arrange(new_search=True): craving plus two, with the same ML6 skip rule. */
-export function newSearchPlan<T extends NewSearchQuestion>(plan: {
-  questions: readonly T[]; skipped: T | null;
-}): { questions: T[]; skipped: T | null } {
-  const order = ['craving', 'budget', 'distance', 'company'];
-  const pool = [...plan.questions, ...(plan.skipped ? [plan.skipped] : [])]
-    .sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
-  // A server plan that already includes craving has already made the same skip decision.
-  // Preserve it: top_prob in the response is rounded and could otherwise create a false tie.
-  let skipped: T | null = plan.skipped?.key === 'craving' ? null : plan.skipped;
-  if (pool.length === 4 && plan.skipped?.key === 'craving') {
-    const confident = pool.filter((q) => q.key !== 'craving' && !q.weak
-      && q.top_prob >= 0.4 && q.meals >= 5);
-    confident.sort((a, b) => b.top_prob - a.top_prob
-      || Number(b.key === 'budget') - Number(a.key === 'budget'));
-    skipped = confident[0] ?? pool.find((q) => q.key === 'company') ?? null;
-  }
-  const questions = pool.filter((q) => q !== skipped).sort((a, b) =>
-    Number(b.key === 'craving') - Number(a.key === 'craving')
-    || Number(b.weak) - Number(a.weak) || order.indexOf(a.key) - order.indexOf(b.key));
-  if (skipped?.weak) {
-    skipped = { ...skipped, predicted: null, prefill: null, reason: 'skipped_weak' };
-  }
-  return { questions, skipped };
-}

@@ -1,3 +1,4 @@
+import { PLAN_TIMEOUT_MS } from './api';
 import { supabase } from './supabase';
 
 export type Category = { id: string; name: string };
@@ -109,11 +110,22 @@ export type Companion = { id: string; name: string };
 
 /** The current user's companions for company chips; names stay on the phone's parse path. */
 export async function loadCompanionChoices(userId: string): Promise<Companion[]> {
-  const { data, error } = await supabase
-    .from('companions')
-    .select('id,name')
-    .eq('user_id', userId)
-    .order('created_at');
-  if (error) throw error;
-  return data ?? [];
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      (async () => {
+        const { data, error } = await supabase.from('companions').select('id,name')
+          .eq('user_id', userId).order('created_at').abortSignal(controller.signal);
+        return error ? [] : data ?? [];
+      })(),
+      new Promise<Companion[]>((resolve) => {
+        timer = setTimeout(() => { resolve([]); controller.abort(); }, PLAN_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }

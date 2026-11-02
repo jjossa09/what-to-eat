@@ -179,6 +179,17 @@ def arrange(questions: tuple[Question, ...], *, new_search: bool = False) -> Pla
     return Plan(tuple(asked), skipped)
 
 
+UNSEEN_GROUP = "unseen_group"
+
+
+def company_prior(mostly_solo: bool | None, groups) -> dict:
+    """Quiz mass over solo and observed groups; unseen company is never an answer."""
+    outcomes = sorted(set(groups)) or [UNSEEN_GROUP]
+    solo = (QUIZ_FAVORITES_MASS if mostly_solo is True else
+            1 - QUIZ_FAVORITES_MASS if mostly_solo is False else 1 / (len(outcomes) + 1))
+    return {"solo": solo, **{g: (1 - solo) / len(outcomes) for g in outcomes}}
+
+
 def predict_company(history: History, meal_slot: str, weekend: bool, as_of: date) -> Question:
     """Fixed support across levels: solo plus observed, still-valid groups.
 
@@ -197,10 +208,8 @@ def predict_company(history: History, meal_slot: str, weekend: bool, as_of: date
             group = tuple(sorted(m.companion_ids))
             groups.add(group)
         observed.append((m, group, recency_weight((as_of - m.eaten_on).days)))
-    if not observed:
-        return Question(COMPANY, True, None, 0.0, 0, NONE)
-    outcomes = ["solo", *sorted(groups)]
-    probs = dict.fromkeys(outcomes, 1 / len(outcomes))
+    probs = company_prior(history.prior.mostly_solo, groups)
+    outcomes = list(probs)
     levels = ((USER, lambda m: True),
               (SLOT, lambda m: m.meal_slot == meal_slot),
               (SLOT_WEEKEND, lambda m: m.meal_slot == meal_slot and is_weekend(m) == weekend))
@@ -221,6 +230,8 @@ def predict_company(history: History, meal_slot: str, weekend: bool, as_of: date
     if not any(group is not None for _, group, _ in observed):
         return Question(COMPANY, True, None, 0.0, meals, level)
     group, probability = _top(probs)
+    if group == UNSEEN_GROUP:
+        return Question(COMPANY, True, None, probability, meals, level)
     predicted = group if group == "solo" else list(group)
     return Question(COMPANY, weak(probability, meals), predicted, probability, meals, level)
 
@@ -250,7 +261,7 @@ def plan(
     budget = Question(BUDGET, weak(p_lvl, price.meals), lvl, p_lvl, price.meals, price.level)
     distance = Question(DISTANCE, True, None, 1 / len(RADII), 0, NONE)
     pool = (craving, budget, distance)
-    if history.prior.mostly_solo is False and history.companions:
+    if history.companions:
         pool += (predict_company(history, meal_slot, weekend, as_of),)
     return arrange(pool, new_search=new_search)
 

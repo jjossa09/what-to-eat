@@ -508,7 +508,8 @@ async def log_pick(
     )
     if companions:
         if not rows or not isinstance(rows[0], dict) or not rows[0].get("id"):
-            raise FunnelUpstreamError
+            logger.warning("Funnel meal_companions skipped: meal insert returned no id")
+            return
         await _write_companions(client, "meal_companions", headers,
                                 [{"meal_id": rows[0]["id"], "companion_id": cid, "user_id": user_id}
                                  for cid in companions])

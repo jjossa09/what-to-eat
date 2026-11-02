@@ -110,13 +110,13 @@ def test_one_observed_group_never_has_probability_one(company_pool, monkeypatch)
     assert company["predicted"] == [A] and company["weak"] is False
 
 
-def test_deleted_companion_groups_are_not_predicted(monkeypatch):
+def test_companion_deletion_cascade_changes_historical_group(monkeypatch):
+    # Known limitation: deleting B cascades {A, B} meal links to {A}; history loses B.
     monkeypatch.setattr(rec, "PRIOR", [{"mostly_solo": False}])
     monkeypatch.setattr(rec, "MEALS", company_meals(10, 10))
-    response = rec.plan_post(Upstreams(companions=[B]))
+    response = rec.plan_post(Upstreams(companions=[A]))
     assert response.status_code == 200
-    company = company_question(response.json())
-    assert company["predicted"] is None and company["weak"] is True
+    assert company_question(response.json())["predicted"] == [A]
 
 
 class FailedSessionLinks(Upstreams):
@@ -254,4 +254,51 @@ def test_new_search_plan_endpoint_matches_round_one_gate(company_pool, monkeypat
     (call,) = rec.gate_calls(company_pool)
     assert call["p_plan"]["questions"] == body["questions"]
     assert call["p_plan"]["skipped"] == body["skipped"]
+
+
+
+def test_failed_companions_read_preserves_other_history(monkeypatch):
+    from tests import test_history as ht
+    from tests.test_companion_context import HistoryFake
+
+    class FailedRead(HistoryFake):
+        def __call__(self, request):
+            if request.url.path.endswith("/companions"):
+                self.requests.append(request)
+                return httpx2.Response(503)
+            return super().__call__(request)
+
+    up = FailedRead(prior=[{"budget_level": 2}], meals=[ht.meal_row()])
+    loaded = ht.run_load(up)
+    assert loaded.companions == frozenset()
+    assert loaded.prior.budget_level == 2 and len(loaded.meals) == 1
+
+
+@pytest.mark.parametrize("rows", [[], [{}]])
+def test_missing_meal_id_skips_companion_copy(rows, caplog):
+    class MissingId(FunnelFake):
+        def __call__(self, request):
+            if request.method == "POST" and request.url.path.endswith("/meals"):
+                self.requests.append(request)
+                return httpx2.Response(201, json=rows)
+            return super().__call__(request)
+
+    up = MissingId(session_companions=[A])
+    response = funnel_t.send(up, "picked", {"round": 1, "place_id": funnel_t.PLACE_ID})
+    assert response.status_code == 200
+    assert len(up.calls("POST", "meals")) == 1
+    assert up.calls("POST", "meal_companions") == []
+    assert "meal insert returned no id" in caplog.text
+
+
+def test_six_older_company_meals_confidently_skip_company(company_pool, monkeypatch):
+    # Pinned current behavior: raw meal count determines confidence, despite recency decay.
+    rows = company_meals(6, 6)
+    for row, days in zip(rows, range(40, 66, 5), strict=True):
+        row["eaten_on"] = (TODAY - timedelta(days=days)).isoformat()
+    monkeypatch.setattr(rec, "MEALS", rows)
+    skipped = rec.plan_post(company_pool).json()["skipped"]
+    assert skipped["key"] == "company" and skipped["predicted"] == [A]
+    assert skipped["meals"] == 6 and skipped["weak"] is False
+    assert skipped["top_prob"] >= 0.4
 

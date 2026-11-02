@@ -185,15 +185,22 @@ async def load(
         "limit": MEALS_LIMIT,
     }
     prior_params = {"select": PRIOR_SELECT, "user_id": f"eq.{user_id}", "limit": 1}
-    prior_rows, meal_rows = await asyncio.gather(
+    async def companions_read():
+        if not include_companions:
+            return frozenset()
+        try:
+            rows = await _get(client, f"{base}/companions",
+                              {"select": "id", "user_id": f"eq.{user_id}"}, headers, timeout)
+            return read_ids(rows, "id")
+        except HistoryError as error:
+            logger.warning("Companions read failed: %s", type(error).__name__)
+            return frozenset()
+
+    prior_rows, meal_rows, companions = await asyncio.gather(
         _get(client, f"{base}/taste_profiles", prior_params, headers, timeout),
         _get(client, f"{base}/meals", meals_params, headers, timeout),
+        companions_read(),
     )
     meals = (parse_meal(r) for r in meal_rows if isinstance(r, dict))
-    prior = parse_prior(prior_rows)
-    companions = frozenset()
-    if include_companions and prior.mostly_solo is False:
-        rows = await _get(client, f"{base}/companions",
-                          {"select": "id", "user_id": f"eq.{user_id}"}, headers, timeout)
-        companions = read_ids(rows, "id")
-    return History(prior=prior, meals=tuple(m for m in meals if m), companions=companions)
+    return History(prior=parse_prior(prior_rows), meals=tuple(m for m in meals if m),
+                   companions=companions)
