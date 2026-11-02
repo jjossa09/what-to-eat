@@ -115,6 +115,8 @@ def supabase(self, request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(self.history_status, json=rows)
     if f"{request.method} {table}" in self.fail:
         return httpx2.Response(500, json={"message": "secret upstream detail"})
+    if request.method == "GET" and table == "companions":
+        return httpx2.Response(200, json=[])
     if request.method == "POST" and table == "sessions":
         return httpx2.Response(201, json=[{"id": SESSION_ID}])
     if request.method == "GET" and table == "sessions":

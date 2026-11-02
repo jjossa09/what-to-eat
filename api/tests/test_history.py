@@ -41,7 +41,7 @@ class Supabase:
 
     def __init__(self, prior=None, meals=None, status=200, exc=None):
         self.bodies = {"taste_profiles": [] if prior is None else prior,
-                       "meals": [] if meals is None else meals}
+                       "meals": [] if meals is None else meals, "companions": []}
         self.status, self.exc, self.requests = status, exc, []
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
