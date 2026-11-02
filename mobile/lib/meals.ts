@@ -100,13 +100,13 @@ export async function editMeal(mealId: string, edit: MealEdit): Promise<void> {
 }
 
 /**
- * The category eaten most, counting the meals the scoring counts (backfill, or live with
- * went = true). Ties go to the most recent. Null when there are none.
+ * The category eaten most, counting the meals the cuisine model counts (backfill, or live with
+ * went = true and a food answer). Ties go to the most recent. Null when there are none.
  */
 export function mostEatenCategory(meals: Meal[]): string | null {
   const counts = new Map<string, { n: number; firstIndex: number }>();
   meals.forEach((m, i) => {
-    const counted = m.source === 'backfill' || m.went === true;
+    const counted = m.source === 'backfill' || (m.went === true && m.ateAnswered);
     if (!counted || !m.category || m.category === 'other') return;
     const entry = counts.get(m.category);
     if (entry) entry.n += 1;

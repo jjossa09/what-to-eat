@@ -1,4 +1,4 @@
-import { resumePlan } from './feedbackPlan';
+import { type ResumePlan, resumePlan } from './feedbackPlan';
 import { getPositionIfAllowed } from './location';
 import { distanceM } from './places';
 import { supabase } from './supabase';
@@ -22,13 +22,15 @@ export type PendingMeal = {
   placeName: string;
   pickedAt: Date;
   categoryId: string | null; // the place's category at pick time; pre-selects "What did you have?"
+  dish: string | null; // saved from the meal card's Edit (P1-24); prefills "What did you have?"
+  askStars: boolean; // false when stars are already saved (meal card Edit): food answer only
   askPrice: boolean; // false when a price is already saved (e.g. from the meal card's Edit, P1-24)
 };
 
 /**
  * What to do on app open: nothing, ask "Did you go?", an auto-detected visit, or resume a meal
- * that has went = true: at "What did you have?" (no food answer yet) or "How was it?" (food
- * answered, no stars yet).
+ * that has went = true: at "What did you have?" (no food answer yet, even if stars or a price
+ * were set from the meal card) or "How was it?" (food answered, no stars yet).
  */
 export type FeedbackStart =
   | { kind: 'none' }
@@ -42,6 +44,7 @@ type Row = {
   picked_at: string;
   went: boolean | null;
   category_id: string | null;
+  dish: string | null;
   ate_at: string | null;
   stars: number | null;
   price_tap: number | null;
@@ -51,22 +54,23 @@ type Row = {
 type Pending = {
   meal: PendingMeal;
   went: boolean | null;
-  ateAnswered: boolean;
+  plan: ResumePlan;
   lat: number | null;
   lon: number | null;
 };
 
 /**
  * The latest live pick still waiting for an answer, read under RLS: went = null, or went = true
- * with no stars yet (the flow was left before rating). A skipped price is never asked again.
+ * with no food answer or no stars yet (the flow was left early, or the meal card set stars
+ * first). A skipped price is never asked again.
  */
 async function latestPending(userId: string): Promise<Pending | null> {
   const { data, error } = await supabase
     .from('meals')
-    .select('id,picked_at,went,category_id,ate_at,stars,price_tap,places(name,lat,lon)')
+    .select('id,picked_at,went,category_id,dish,ate_at,stars,price_tap,places(name,lat,lon)')
     .eq('user_id', userId)
     .eq('source', 'live')
-    .or('went.is.null,and(went.eq.true,stars.is.null)')
+    .or('went.is.null,and(went.eq.true,ate_at.is.null),and(went.eq.true,stars.is.null)')
     .not('picked_at', 'is', null)
     .order('picked_at', { ascending: false })
     .limit(1)
@@ -86,10 +90,12 @@ async function latestPending(userId: string): Promise<Pending | null> {
       placeName: row.places.name,
       pickedAt: new Date(row.picked_at),
       categoryId: row.category_id,
+      dish: row.dish,
+      askStars: plan.kind === 'food' ? plan.askStars : true,
       askPrice: plan.kind === 'food' || plan.kind === 'stars' ? plan.askPrice : true,
     },
     went: row.went,
-    ateAnswered: row.ate_at !== null,
+    plan,
     lat: row.places.lat,
     lon: row.places.lon,
   };
@@ -119,7 +125,9 @@ export async function checkFeedback(
 async function startFor(pending: Pending, ageH: number): Promise<FeedbackStart> {
   // Steps already answered anywhere (the prompt or the meal card's Edit) are skipped.
   if (pending.went === true) {
-    return { kind: pending.ateAnswered ? 'resumeStars' : 'resumeFood', meal: pending.meal };
+    if (pending.plan.kind === 'food') return { kind: 'resumeFood', meal: pending.meal };
+    if (pending.plan.kind === 'stars') return { kind: 'resumeStars', meal: pending.meal };
+    return { kind: 'none' };
   }
 
   if (ageH <= FEEDBACK_CONFIG.likelyVisitWindowH && pending.lat !== null && pending.lon !== null) {
