@@ -13,11 +13,20 @@ WEIGHTS: dict[str, float] = {
     "distance": 0.20,
 }
 
-# Category fit v1 (quiz prior, ML5 Phase 1). P2-02 replaces it with the cuisine model.
-FAVORITE_FIT = 1.0  # a quiz favorite
-NON_FAVORITE_FIT = 0.5  # any other allowed category, when the user has favorites
-UNIFORM_FIT = 1.0  # every allowed category, when there are no favorites (cold start)
+# Cuisine model (P2-02, ML3, app/cuisine_model.py). Fixed before evaluation (ML9), never
+# tuned on the backfill. Category fit = p(category) / max p, so the top category fits 1.0.
+HALF_LIFE_DAYS = 30  # recency weight = 0.5 ** (age_days / HALF_LIFE_DAYS)
+SMOOTHING_K = 3  # p = (weighted count + K * parent p) / (weighted n + K)
+QUIZ_FAVORITES_MASS = 0.7  # quiz prior: favorites share 0.7, other allowed categories 0.3
+LEVEL_MIN_N_EFF = 1.0  # the reported level is the deepest with this much weighted data
 OTHER_FIT = 0.0  # Other is shown but never predicted (ML2)
+
+# Usual categories (ML5): at least this raw recency-weighted share of the user's meals.
+USUAL_MIN_SHARE = 0.15
+
+# Weak prediction (ML6): top probability under this, or fewer raw meals at the level.
+WEAK_TOP_PROB = 0.4
+WEAK_MIN_MEALS = 5
 
 # Craving answer: the craved category fits fully; every other category is scaled down.
 CRAVING_MATCH_FIT = 1.0

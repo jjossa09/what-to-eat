@@ -393,3 +393,39 @@ def test_templates_never_claim_a_past_visit_for_unvisited_places():
         for pick in picks:
             if pick.scored.evidence.visits == 0:
                 assert not muse.PAST_VISIT_TERMS.search(muse.template_reason(pick))
+
+
+# Food-category evidence (P2-02): a raw meal count of the food, never place visits.
+
+
+def category_picks():
+    """Two Korean meals at unresolved places (no place to visit); candidates are unvisited."""
+    meals = tuple(PastMeal(place=None, eaten_on=date(2026, 10, d), source="backfill",
+                           category_id="korean", price_level=None) for d in (20, 25))
+    context = Context(lat=LAT, lon=LON, local_date=date(2026, 10, 29), meal_slot="dinner",
+                      is_weekend=False, search_radius_m=5000)
+    history = History(prior=QuizPrior(favorites=frozenset({"thai"})), meals=meals)
+    candidates = [cand("node/1", "korean", 400), cand("node/2", "thai", 800),
+                  cand("node/3", "mexican", 1200)]
+    return rank(candidates, context, history).top3
+
+
+def test_evidence_sends_the_food_category_count_and_signals():
+    picks = category_picks()
+    meta = Meta(reply({p.scored.place.id: "Fine." for p in picks}))
+    run(meta, picks=picks)
+    sent = json.loads(json.loads(meta.requests[0].content)["messages"][1]["content"])["picks"]
+    by_id = {p["id"]: p for p in sent}
+    assert by_id["node/1"]["times_had_category"] == 2 and by_id["node/1"]["visits"] == 0
+    assert "usual_category" in by_id["node/1"]["signals"]
+    # A quiz favorite keeps its signal after meals exist.
+    assert "favorite_category" in by_id["node/2"]["signals"]
+    assert by_id["node/2"]["times_had_category"] == 0
+    assert "times_had_category" in muse.SYSTEM_PROMPT
+
+
+def test_template_says_how_often_the_food_was_had():
+    korean = next(p for p in category_picks() if p.scored.place.id == "node/1")
+    line = muse.template_reason(korean)
+    assert line.startswith("Korean, you've had it 2 times")
+    assert not muse.PAST_VISIT_TERMS.search(line) and len(line) <= muse.MAX_REASON_CHARS

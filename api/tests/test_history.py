@@ -72,13 +72,15 @@ def test_reads_as_the_user_with_anon_key_and_user_filter():
         assert request.url.params["user_id"] == f"eq.{USER_ID}"
 
 
-def test_meals_query_counts_only_resolved_confirmed_meals():
+def test_meals_query_counts_confirmed_meals_including_unresolved_places():
     upstream = Supabase()
     run_load(upstream)
     meals = next(r for r in upstream.requests if r.url.path.endswith("/meals"))
     params = meals.url.params
-    assert "places!inner(" in params["select"]
-    assert params["places.unresolved"] == "is.false"
+    assert "places(" in params["select"] and "places!inner(" not in params["select"]
+    assert {"meal_slot", "is_weekend", "dish", "ate_at"} <= set(
+        params["select"].split("places(")[0].strip(",").split(","))
+    assert "places.unresolved" not in params
     assert params["or"] == "(source.eq.backfill,went.is.true)"
     assert params["order"].startswith("eaten_on.desc")
 
@@ -98,21 +100,39 @@ def test_parses_prior_and_drops_unknown_categories_and_levels():
 
 
 def test_parses_meals_and_drops_malformed_rows():
+    unresolved = {"id": "unresolved:x", "name": "Corner Spot", "lat": None, "lon": None,
+                  "geoapify_categories": [], "address": None, "unresolved": True}
     meals = [
-        meal_row(source="backfill", category_id="vietnamese", price_level=3),
-        meal_row(place=place_row("node/2", unresolved=True)),
+        meal_row(source="backfill", category_id="vietnamese", price_level=3,
+                 meal_slot="lunch", is_weekend=False, dish=" pho "),
+        meal_row(place=unresolved, source="backfill", category_id="korean"),
         meal_row(place=place_row("node/3", lat=None)),
         meal_row(place=place_row("node/4"), eaten_on="not a date"),
         meal_row(place=place_row("node/5"), source="other"),
+        meal_row(place=place_row("node/6", unresolved=None)),
         "not a row",
     ]
     result = run_load(Supabase(meals=meals))
-    assert len(result.meals) == 1
-    meal = result.meals[0]
+    assert len(result.meals) == 2
+    meal, kept = result.meals
     assert meal.place.id == "node/1" and meal.place.geoapify_categories == (
         "catering.restaurant.thai",)
     assert (meal.source, meal.category_id, meal.price_level) == ("backfill", "vietnamese", 3)
     assert meal.eaten_on == date(2026, 10, 28)
+    assert (meal.meal_slot, meal.is_weekend, meal.dish) == ("lunch", False, "pho")
+    assert kept.place is None and kept.category_id == "korean"
+
+
+def test_food_answer_flag_and_bad_context_fields():
+    meals = [
+        meal_row(ate_at="2026-10-28T20:00:00+00:00", meal_slot="dinner", is_weekend=True),
+        meal_row(ate_at=None, meal_slot="brunch", is_weekend="yes", dish=""),
+    ]
+    answered, unanswered = run_load(Supabase(meals=meals)).meals
+    assert answered.food_answered and (answered.meal_slot, answered.is_weekend) == (
+        "dinner", True)
+    assert not unanswered.food_answered
+    assert (unanswered.meal_slot, unanswered.is_weekend, unanswered.dish) == (None, None, None)
 
 
 def test_missing_settings_raise_not_configured(monkeypatch):
