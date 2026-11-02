@@ -281,3 +281,35 @@ def next_question(
 
 # The cap round (ML10): after 3 rounds without a pick, the open question, by rule, not by gain.
 CAP_ENTRY: dict = {"key": "open", "rule": "cap"}
+
+
+# What the phone asked (round 1): its order and whether it came from the plan or the fallback.
+PLAN_SOURCES = ("plan", "fallback")
+OK, MISSING, INVALID = "ok", "missing", "invalid"
+
+
+def asked_log(order: object, source: object, recomputed: Plan) -> dict:
+    """The phone's question order and plan source, checked, next to the recomputed plan.
+
+    Valid order: exactly craving, budget, and distance, once each. Valid source: "plan" or
+    "fallback". Neither sent (an older app): missing. Anything else: invalid; a bad value is
+    never logged as given, only as None. matches_plan compares a valid order with the plan
+    the server recomputed now (it can differ after a fallback or a meal slot change).
+    """
+    keys = order if isinstance(order, list) else None
+    valid_order = (keys is not None and len(keys) == len(QUESTIONS)
+                   and all(isinstance(k, str) for k in keys) and set(keys) == set(QUESTIONS))
+    valid_source = isinstance(source, str) and source in PLAN_SOURCES
+    if order is None and source is None:
+        status = MISSING
+    elif valid_order and valid_source:
+        status = OK
+    else:
+        status = INVALID
+    return {
+        "status": status,
+        "order": list(keys) if valid_order else None,
+        "source": source if valid_source else None,
+        "matches_plan": list(recomputed.order) == keys if valid_order else None,
+    }
+

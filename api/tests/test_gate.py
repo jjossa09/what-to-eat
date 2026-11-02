@@ -279,3 +279,51 @@ def test_100_candidates_is_fast():
     print(f"\nnext_question, 100 candidates: {per_call * 1000:.1f} ms per call ({nq.key})")
     assert nq.key is not None
     assert per_call < 0.5  # generous ceiling so CI noise never flakes; measured is far lower
+
+
+# What the phone asked (round 1) ------------------------------------------------
+
+PLAN = gate.plan(History(), "dinner", False, TODAY)  # craving, budget, distance
+
+
+def test_asked_plan_used_matches():
+    log = gate.asked_log(["craving", "budget", "distance"], "plan", PLAN)
+    assert log == {"status": "ok", "order": ["craving", "budget", "distance"],
+                   "source": "plan", "matches_plan": True}
+
+
+def test_asked_fallback_is_logged_as_such():
+    log = gate.asked_log(["craving", "budget", "distance"], "fallback", PLAN)
+    assert (log["status"], log["source"], log["matches_plan"]) == ("ok", "fallback", True)
+
+
+def test_asked_mismatch_with_the_recomputed_plan():
+    log = gate.asked_log(["budget", "distance", "craving"], "plan", PLAN)
+    assert (log["status"], log["matches_plan"]) == ("ok", False)
+    assert log["order"] == ["budget", "distance", "craving"]
+
+
+def test_asked_missing_from_an_older_app():
+    assert gate.asked_log(None, None, PLAN) == {
+        "status": "missing", "order": None, "source": None, "matches_plan": None}
+
+
+@pytest.mark.parametrize("order", [
+    ["craving", "craving", "budget"],  # duplicate
+    ["craving", "budget"],  # too short
+    ["craving", "budget", "distance", "company"],  # too long
+    ["craving", "budget", "company"],  # unknown key
+    ["craving", "budget", 3],  # not a string
+    "craving,budget,distance",  # not a list
+    [],
+])
+def test_asked_invalid_order_is_never_logged_as_given(order):
+    log = gate.asked_log(order, "plan", PLAN)
+    assert log == {"status": "invalid", "order": None, "source": "plan", "matches_plan": None}
+
+
+@pytest.mark.parametrize("source", ["Plan", "guess", 1, None, ["plan"]])
+def test_asked_invalid_source(source):
+    log = gate.asked_log(["craving", "budget", "distance"], source, PLAN)
+    assert (log["status"], log["source"]) == ("invalid", None)
+    assert log["order"] == ["craving", "budget", "distance"]  # the valid part is kept

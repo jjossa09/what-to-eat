@@ -15,11 +15,15 @@ import {
   ApiError,
   type Change,
   deviceTimezone,
+  type FirstKey,
+  getQuestionPlan,
   getRecommendations,
   localTimeIso,
+  type NextQuestion,
   parseAnswer,
   type ParseResponse,
   type Pick,
+  type PlanResponse,
   type QuestionKey,
   type RoundRequest,
   type RoundResponse,
@@ -41,7 +45,12 @@ import ScrollWithBar from './ScrollWithBar';
 import TypingBubble from './TypingBubble';
 import { Chip, GlassScreen } from './ui';
 
-// Chat (P1-09) with the fixed Phase 1 questions (P1-10): craving, budget, distance.
+// Chat (P1-09) with the 3 questions (P1-10): craving, budget, distance. P2-05: their order and
+// pre-selected chips come from the confidence gate (POST /questions/plan): weak predictions
+// first, confident ones last with their chip pre-selected (editable). The quiz budget is
+// pre-selected even when budget is weak (it is the user's own answer). If the plan call fails,
+// the order is craving, budget, distance as before. After a round, next_question (highest
+// information gain, ML10) replaces the follow-up chips; when it is null, the fixed chips show.
 // Company is not asked: it comes from the quiz prior (mostly_solo). One question per message (R1).
 // Typed answers are parsed by Muse into the same answers as the chips (P1-21). After a round,
 // the chat stays open: Cheaper / Closer / Something else or a typed follow-up runs a new round
@@ -54,12 +63,32 @@ import { Chip, GlassScreen } from './ui';
 // two chips: Close to me (15 km) and I don't mind (35 km).
 
 type Step = 'craving' | 'budget' | 'distance' | 'loading' | 'results' | 'error';
-type FirstKey = 'craving' | 'budget' | 'distance';
 type Problem = 'denied' | 'nofix' | 'network' | 'server' | 'auth' | 'load';
 type Bubble = { id: number; role: 'assistant' | 'user'; text: string; error?: boolean };
 type Radius = RoundRequest['radius_m'];
 type Round = { bubbleId: number; picks: Pick[]; sessionId: string | null; round: number | null };
 type Answers = { craving: string | null; budget: number; radius: Radius; exclude: string[] };
+
+// The order when there is no plan (plan call failed): the Phase 1 order.
+const DEFAULT_ORDER: FirstKey[] = ['craving', 'budget', 'distance'];
+
+/** The plan's order if it is exactly the 3 questions, else the default order (a fallback). */
+function planOrder(plan: PlanResponse | null): { keys: FirstKey[]; source: 'plan' | 'fallback' } {
+  const keys = plan?.questions.map((q) => q.key) ?? [];
+  const valid = keys.length === DEFAULT_ORDER.length && DEFAULT_ORDER.every((k) => keys.includes(k));
+  return valid ? { keys, source: 'plan' } : { keys: DEFAULT_ORDER, source: 'fallback' };
+}
+
+/** The prior, categories, name, and the gate's plan, together. A failed plan is null (the
+ * default order), never a load error. */
+function loadStart(userId: string) {
+  return Promise.all([
+    loadCategories(),
+    loadTastePrior(userId),
+    loadDisplayName(userId).catch(() => null),
+    getQuestionPlan(localTimeIso()).catch(() => null),
+  ]);
+}
 
 const QUESTIONS = {
   craving: 'What are you craving?',
@@ -144,12 +173,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [unsent, setUnsent] = useState<{ text: string; problem: Problem } | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [keyboard, setKeyboard] = useState(false);
-  // Pre-selected chips for later questions, from a typed answer that covered them (FR4).
-  const [preset, setPreset] = useState<{ budget?: number; radius?: Radius }>({});
+  // Pre-selected chips: from the plan (confident predictions, P2-05) or a typed answer that
+  // covered a later question (FR4).
+  const [preset, setPreset] = useState<{ craving?: string; budget?: number; radius?: Radius }>({});
+  // After a round: the information-gain question (ML10), or null for the fixed chips.
+  const [nextQuestion, setNextQuestion] = useState<NextQuestion | null>(null);
 
   // Unsent chat lines: sent with the next round, then cleared (R3).
   const transcript = useRef<TranscriptMessage[]>([]);
   const answers = useRef<Answers>({ craving: null, budget: 2, radius: CLOSE, exclude: [] });
+  const order = useRef<FirstKey[]>(DEFAULT_ORDER); // the 3 questions in asking order
+  const planSource = useRef<'plan' | 'fallback'>('fallback'); // sent with round 1 (P2-05)
   const sessionId = useRef<string | null>(null);
   const shownIds = useRef<string[]>([]);
   const pendingChange = useRef<Partial<Change> | undefined>(undefined);
@@ -185,21 +219,40 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     transcript.current.push({ role: 'user', body, question_key: key, answer: value, input_mode: mode });
   }
 
-  // Start: the prior and categories for the chips, and location in the background so it is
-  // usually ready by the third answer.
+  /** Applies the plan (or the default order) and returns the first question. */
+  function applyPlan(rows: Category[], quiz: TastePrior, plan: PlanResponse | null): FirstKey {
+    const chosen = planOrder(plan);
+    order.current = chosen.keys;
+    planSource.current = chosen.source;
+    const known = new Set(rows.map((c) => c.id));
+    const pre: { craving?: string; budget?: number; radius?: Radius } = {};
+    for (const q of plan?.questions ?? []) {
+      if (q.prefill === null) continue;
+      if (q.key === 'craving' && typeof q.prefill === 'string' && known.has(q.prefill)) pre.craving = q.prefill;
+      if (q.key === 'budget' && typeof q.prefill === 'number' && q.prefill >= 1 && q.prefill <= 4) pre.budget = q.prefill;
+      if (q.key === 'distance' && typeof q.prefill === 'number' && isRadius(q.prefill)) pre.radius = q.prefill;
+    }
+    setPreset(pre); // a weak budget falls back to the quiz budget (budgetPick below)
+    if (quiz.budget) answers.current.budget = quiz.budget;
+    return order.current[0];
+  }
+
+  // Start: the prior, categories, and plan for the chips, and location in the background so it
+  // is usually ready by the third answer.
   useEffect(() => {
     let live = true;
     location.current = getPosition();
-    Promise.all([loadCategories(), loadTastePrior(userId), loadDisplayName(userId).catch(() => null)])
-      .then(([rows, quiz, shownName]) => {
+    loadStart(userId)
+      .then(([rows, quiz, shownName, plan]) => {
         if (!live) return;
         setCategories(rows);
         setPrior(quiz);
         setName(shownName);
-        if (quiz.budget) answers.current.budget = quiz.budget;
+        const first = applyPlan(rows, quiz, plan);
         nextId.current += 1;
-        setBubbles([{ id: nextId.current, role: 'assistant', text: QUESTIONS.craving }]);
-        transcript.current = [{ role: 'assistant', body: QUESTIONS.craving, question_key: 'craving' }];
+        setBubbles([{ id: nextId.current, role: 'assistant', text: QUESTIONS[first] }]);
+        transcript.current = [{ role: 'assistant', body: QUESTIONS[first], question_key: first }];
+        setStep(first);
       })
       .catch(() => {
         if (!live) return;
@@ -225,6 +278,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   const names = new Map((categories ?? []).map((c) => [c.id, c.name]));
   const favorites = (prior?.favorites ?? []).filter((id) => names.has(id));
+  const cravingPick = preset.craving ?? null;
   const budgetPick = preset.budget ?? prior?.budget ?? null;
   const radiusPick = preset.radius ?? null;
 
@@ -234,27 +288,41 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   // The 3 questions ------------------------------------------------------------
 
+  /** The questions after key in this search's order. */
+  function laterThan(key: FirstKey): FirstKey[] {
+    return order.current.slice(order.current.indexOf(key) + 1);
+  }
+
+  /** After answering key: the next question in the order, or the round after the last one. */
+  function advance(key: FirstKey) {
+    const next = laterThan(key)[0];
+    if (next) {
+      ask(next);
+      setStep(next);
+    } else {
+      fetchRound();
+    }
+  }
+
   function chooseCraving(id: string | null, label: string) {
     if (busy.current) return;
     answers.current.craving = id;
-    record('craving', label, { craving: id }, 'chip');
-    ask('budget');
-    setStep('budget');
+    record('craving', label, { craving: id }, id !== null && cravingPick === id ? 'prefill' : 'chip');
+    advance('craving');
   }
 
   function chooseBudget(level: number, label: string) {
     if (busy.current) return;
     answers.current.budget = level;
     record('budget', label, { budget_level: level }, budgetPick === level ? 'prefill' : 'chip');
-    ask('distance');
-    setStep('distance');
+    advance('budget');
   }
 
   function chooseDistance(radius: Radius, label: string) {
     if (busy.current) return;
     answers.current.radius = radius;
     record('distance', label, { radius_m: radius }, radiusPick === radius ? 'prefill' : 'chip');
-    fetchRound();
+    advance('distance');
   }
 
   /** What a typed first answer said about later questions: pre-selects their chips (FR4). */
@@ -262,11 +330,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     for (const c of a.exclude_categories) {
       if (!answers.current.exclude.includes(c)) answers.current.exclude.push(c);
     }
+    const later = laterThan(key);
     setPreset((prev) => {
-      const later = { ...prev };
-      if (key === 'craving' && typeof a.budget === 'number') later.budget = a.budget;
-      if (key !== 'distance' && typeof a.distance === 'number') later.radius = a.distance;
-      return later;
+      const next = { ...prev };
+      if (later.includes('craving') && a.craving && a.craving !== 'anything' && names.has(a.craving)) {
+        next.craving = a.craving;
+      }
+      if (later.includes('budget') && typeof a.budget === 'number') next.budget = a.budget;
+      if (later.includes('distance') && typeof a.distance === 'number') next.radius = a.distance;
+      return next;
     });
   }
 
@@ -277,34 +349,40 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       const id = a.craving === 'anything' ? null : a.craving;
       answers.current.craving = id;
       record('craving', cravingLabel(id), a, 'text', text);
-      ask('budget');
-      setStep('budget');
+      advance('craving');
     } else if (key === 'budget' && typeof a.budget === 'number') {
       answers.current.budget = a.budget;
       record('budget', BUDGETS[a.budget - 1].label, a, 'text', text);
-      ask('distance');
-      setStep('distance');
+      advance('budget');
     } else if (key === 'distance' && typeof a.distance === 'number') {
       const radius = a.distance;
       answers.current.radius = radius;
       record('distance', DISTANCES.find((d) => d.radius === radius)?.label ?? 'Close to me', a, 'text', text);
-      fetchRound();
+      advance('distance');
     }
   }
 
   // Follow-ups -----------------------------------------------------------------
 
-  function followUp(change: Partial<Change>, shown: string, mode: 'chip' | 'text', body: string = shown) {
-    const key: QuestionKey = nextIsOpen.current ? 'open' : 'refine';
+  /** A follow-up answer. asked: the information-gain question it answers (a chip), logged
+   * under that question's key; otherwise 'refine' (or 'open' after the best so far). */
+  function followUp(
+    change: Partial<Change>,
+    shown: string,
+    mode: 'chip' | 'text',
+    body: string = shown,
+    asked?: FirstKey,
+  ) {
+    const key: QuestionKey = asked ?? (nextIsOpen.current ? 'open' : 'refine');
     nextIsOpen.current = false;
     record(key, shown, change, mode, body);
     fetchRound(change);
   }
 
-  function chooseFollowUp(change: Partial<Change>, label: string) {
+  function chooseFollowUp(change: Partial<Change>, label: string, asked?: FirstKey) {
     if (busy.current) return;
     setUnsent(null);
-    followUp(change, label, 'chip');
+    followUp(change, label, 'chip', label, asked);
   }
 
   /** After a pick or None of these: a new session that starts at the craving. */
@@ -315,8 +393,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     pendingChange.current = undefined;
     nextIsOpen.current = false;
     firstOfSearch.current = true;
+    setNextQuestion(null);
     answers.current = { ...answers.current, craving: null, exclude: [] };
-    // Budget and distance are asked again, preselected from the last search.
+    // The typed text is the craving, so it goes first; budget and distance follow in this
+    // session's plan order, asked again and preselected from the last search.
+    order.current = ['craving', ...order.current.filter((k) => k !== 'craving')];
     setPreset({ budget: answers.current.budget, radius: answers.current.radius });
     setShowAll(false);
     setDecided(false);
@@ -405,7 +486,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         exclude_categories: answers.current.exclude,
         ...(change ? { refine: change } : {}),
         solo: prior?.mostlySolo ?? null,
-        ...(sessionId.current ? { session_id: sessionId.current } : {}),
+        // Round 1 logs the order this chat actually asked, next to the server's plan.
+        ...(sessionId.current
+          ? { session_id: sessionId.current }
+          : { asked_order: order.current, plan_source: planSource.current }),
         exclude_ids: shownIds.current,
         transcript: transcript.current,
       });
@@ -435,6 +519,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         ask('open');
         nextIsOpen.current = true;
       }
+      // The information-gain question (P2-05, ML10): asked as one line, its options as chips.
+      // Only with at least one usable chip; otherwise the fixed chips show.
+      const candidate = result.best_so_far || !result.picks.length ? null : (result.next_question ?? null);
+      const asked = candidate && questionChips(candidate).length ? candidate : null;
+      setNextQuestion(asked);
+      if (asked) ask(asked.key);
       setStep('results');
     } catch (e) {
       const kind = e instanceof ApiError ? e.kind : 'network';
@@ -456,14 +546,14 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       onSignOut();
     } else if (problem === 'load') {
       setProblem(null);
-      setStep('craving');
-      Promise.all([loadCategories(), loadTastePrior(userId), loadDisplayName(userId).catch(() => null)])
-        .then(([rows, quiz, shownName]) => {
+      loadStart(userId)
+        .then(([rows, quiz, shownName, plan]) => {
           setCategories(rows);
           setPrior(quiz);
           setName(shownName);
-          if (quiz.budget) answers.current.budget = quiz.budget;
-          ask('craving');
+          const first = applyPlan(rows, quiz, plan);
+          ask(first);
+          setStep(first);
         })
         .catch(() => fail('load'));
     } else {
@@ -475,11 +565,18 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   // which is always there (P1-19).
   let chips: ReactNode = null;
   if (step === 'craving' && categories) {
-    const list = showAll ? categories.map((c) => c.id) : favorites;
+    const shown = showAll ? categories.map((c) => c.id) : favorites;
+    // A pre-selected craving outside the favorites still gets its chip, first.
+    const list = cravingPick && !shown.includes(cravingPick) ? [cravingPick, ...shown] : shown;
     chips = (
       <>
         {list.map((id) => (
-          <Chip key={id} label={cravingLabel(id)} onPress={() => chooseCraving(id, cravingLabel(id))} />
+          <Chip
+            key={id}
+            label={cravingLabel(id)}
+            selected={cravingPick === id}
+            onPress={() => chooseCraving(id, cravingLabel(id))}
+          />
         ))}
         <Chip label="Anything" onPress={() => chooseCraving(null, 'Anything')} />
         {!showAll && <Chip label="More" onPress={() => setShowAll(true)} />}
@@ -503,6 +600,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         onPress={() => chooseDistance(d.radius, d.label)}
       />
     ));
+  } else if (step === 'results' && !decided && nextQuestion) {
+    chips = questionChips(nextQuestion).map((f) => (
+      <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label, nextQuestion.key)} />
+    ));
   } else if (step === 'results' && !decided) {
     chips = followUps(lastRound.radius, lastRound.empty).map((f) => (
       <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label)} />
@@ -514,6 +615,24 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         <Chip label={problem === 'auth' ? 'Sign in' : 'Try again'} onPress={retry} />
       </>
     );
+  }
+
+  /** The information-gain question's options as chips, each the same Change a typed answer
+   * would give. Unknown options are dropped. */
+  function questionChips(q: NextQuestion): FollowUp[] {
+    const out: FollowUp[] = [];
+    for (const option of q.options) {
+      if (q.key === 'craving' && typeof option === 'string' && names.has(option)) {
+        out.push({ label: cravingLabel(option), change: { craving: option } });
+      } else if (q.key === 'budget' && typeof option === 'number') {
+        const b = BUDGETS.find((x) => x.level === option);
+        if (b) out.push({ label: b.label, change: { budget: b.level } });
+      } else if (q.key === 'distance' && typeof option === 'number') {
+        const d = DISTANCES.find((x) => x.radius === option);
+        if (d) out.push({ label: d.label, change: { distance: d.radius } });
+      }
+    }
+    return out;
   }
 
   // A typed message that failed to send: its fix comes first, the step's chips still work.

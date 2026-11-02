@@ -931,3 +931,68 @@ def test_gate_failure_round_four_still_caps(kw):
     assert len(writes(up, "sessions")) == 1  # the answers' PATCH
     assert len(writes(up, "messages")) == 1
     assert "api.geoapify.com" not in up.hosts() and "api.meta.ai" not in up.hosts()
+
+
+# What the phone asked, next to the recomputed plan (round 1) -------------------
+# The quiz-only fixture recomputes craving, budget, distance.
+
+def asked(up: Upstreams) -> dict:
+    return gate_calls(up)[0]["p_plan"]["asked"]
+
+
+def test_round_one_logs_the_plan_the_phone_used():
+    up = Upstreams()
+    body = post(up, asked_order=["craving", "budget", "distance"], plan_source="plan").json()
+    assert body["gate_logged"] is True
+    assert asked(up) == {"status": "ok", "order": ["craving", "budget", "distance"],
+                         "source": "plan", "matches_plan": True}
+    plan = gate_calls(up)[0]["p_plan"]
+    assert [q["key"] for q in plan["questions"]] == ["craving", "budget", "distance"]
+
+
+def test_round_one_logs_a_fallback():
+    up = Upstreams()
+    post(up, asked_order=["craving", "budget", "distance"], plan_source="fallback")
+    assert (asked(up)["status"], asked(up)["source"]) == ("ok", "fallback")
+
+
+def test_round_one_logs_a_mismatch_with_the_recomputed_plan():
+    # E.g. the phone's plan came from an earlier meal slot.
+    up = Upstreams()
+    post(up, asked_order=["budget", "distance", "craving"], plan_source="plan")
+    assert asked(up) == {"status": "ok", "order": ["budget", "distance", "craving"],
+                         "source": "plan", "matches_plan": False}
+
+
+@pytest.mark.parametrize(("order", "source", "kept_order", "kept_source"), [
+    (["craving", "craving", "budget"], "plan", None, "plan"),
+    (["craving", "budget", "company"], "plan", None, "plan"),
+    (["craving", "budget"], "plan", None, "plan"),
+    ([1, {"a": 2}, None], "plan", None, "plan"),
+    (["craving", "budget", "distance"], "guess", ["craving", "budget", "distance"], None),
+    (["craving", "budget", "distance"], {"nested": [1, 2]}, ["craving", "budget", "distance"],
+     None),
+])
+def test_round_one_invalid_order_is_logged_never_refused(order, source, kept_order, kept_source):
+    up = Upstreams()
+    response = post(up, asked_order=order, plan_source=source)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["logged"] is True and body["gate_logged"] is True
+    log = asked(up)
+    assert log["status"] == "invalid"
+    assert (log["order"], log["source"]) == (kept_order, kept_source)  # bad values never logged
+    assert log["matches_plan"] == (None if kept_order is None else True)
+
+
+def test_round_one_without_asked_order_is_missing():
+    up = Upstreams()
+    post(up)
+    assert asked(up)["status"] == "missing"
+
+
+def test_later_rounds_ignore_the_asked_order():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"}, asked_order=["craving", "budget", "distance"],
+              plan_source="plan")
+    assert gate_calls(up)[0]["p_plan"] is None

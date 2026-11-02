@@ -5,6 +5,9 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL;
 
 // Covers a Vercel cold start plus the ~8 s first round (NFR4).
 const TIMEOUT_MS = 20_000;
+// The question plan holds up the chat's first question; past this the chat uses the default
+// order (P2-05). History only, so it is fast when the API is warm.
+const PLAN_TIMEOUT_MS = 5_000;
 
 export type ApiErrorKind = 'network' | 'server' | 'auth' | 'conflict' | 'notfound';
 
@@ -15,14 +18,19 @@ export class ApiError extends Error {
 }
 
 /** One authenticated call to our API. Throws ApiError with a kind, never upstream detail. */
-async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: 'GET' | 'POST',
+  path: string,
+  body?: unknown,
+  timeoutMs: number = TIMEOUT_MS,
+): Promise<T> {
   if (!API_URL) throw new ApiError('server');
   const { data } = await supabase.auth.getSession();
   const token = data.session?.access_token;
   if (!token) throw new ApiError('auth');
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response: Response;
   try {
     response = await fetch(`${API_URL.replace(/\/$/, '')}${path}`, {
@@ -51,6 +59,40 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
 }
 
 export type QuestionKey = 'craving' | 'budget' | 'distance' | 'refine' | 'open';
+
+/** The 3 questions before round 1 (FR4). */
+export type FirstKey = 'craving' | 'budget' | 'distance';
+
+/** One question of the confidence gate's plan (P2-05, ML6), in asking order. */
+export type PlanQuestion = {
+  key: FirstKey;
+  weak: boolean;
+  /** The pre-selected chip: a category id, a budget level, or a radius. Null when weak. */
+  prefill: string | number | null;
+  predicted: string | number | null;
+  top_prob: number;
+  meals: number;
+  level: string;
+};
+
+export type PlanResponse = {
+  history_used: boolean;
+  meal_slot: string;
+  questions: PlanQuestion[];
+};
+
+/** The 3 questions in asking order, weak first (P2-05). History only: no places, no Muse. */
+export function getQuestionPlan(localTime: string): Promise<PlanResponse> {
+  return request<PlanResponse>('POST', '/questions/plan', { local_time: localTime }, PLAN_TIMEOUT_MS);
+}
+
+/** The refinement question with the highest information gain (ML10); its options are chips. */
+export type NextQuestion = {
+  key: FirstKey;
+  /** Category ids (craving), levels 1-4 (budget), or radii 15000 / 35000 (distance). */
+  options: (string | number)[];
+  gains: Record<FirstKey, number>;
+};
 
 /** What one answer changes (chips or Muse-parsed text). Steps apply on the server. */
 export type Change = {
@@ -84,6 +126,9 @@ export type RoundRequest = {
   session_id?: string;
   exclude_ids: string[];
   transcript: TranscriptMessage[];
+  /** Round 1 only (P2-05): the question order the chat used, and where it came from. */
+  asked_order?: FirstKey[];
+  plan_source?: 'plan' | 'fallback';
 };
 
 export type Pick = {
@@ -114,6 +159,10 @@ export type RoundResponse = {
   best_so_far: boolean;
   /** The answers this round ran with; the next round continues from them. */
   answers: RoundAnswers;
+  /** Null: no question would change the picks (or the cap round); show the fixed chips. */
+  next_question: NextQuestion | null;
+  /** The gate entry was saved (P2-05); never affects the round. */
+  gate_logged: boolean;
   picks: Pick[];
 };
 

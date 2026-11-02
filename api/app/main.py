@@ -3,14 +3,14 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator
 
 from app import funnel, gate, history, muse, places, refine
 from app.answers import QuestionKey as ParseKey
@@ -115,6 +115,10 @@ class RecommendationsRequest(BaseModel):
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
     solo: bool | None = None  # from the quiz prior in Phase 1 (company is not asked)
     transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=8)
+    # Round 1 (P2-05): the question order the phone used and where it came from ("plan" or
+    # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
+    asked_order: list[JsonValue] | None = Field(default=None, max_length=10)
+    plan_source: JsonValue = None
 
     @field_validator("timezone")
     @classmethod
@@ -267,8 +271,8 @@ async def recommendations(
         else asyncio.sleep(0),
         # sessions.gate: never part of `logged`, so a failure loses only the gate entry.
         log_gate(token, ref, chosen.as_log(),
-                 gate.plan(user_history, slot, is_weekend, local_date) if ref.round == 1
-                 else None, client)
+                 round_one_plan(body, user_history, slot, is_weekend, local_date)
+                 if ref.round == 1 else None, client)
         if ref
         else asyncio.sleep(0),
     )
@@ -341,15 +345,25 @@ async def log_transcript(
     )
 
 
+def round_one_plan(
+    body: RecommendationsRequest, user_history: History, slot: str, is_weekend: bool,
+    local_date: date,
+) -> dict:
+    """Round 1's plan log: the plan recomputed from the same history and context as
+    /questions/plan, and next to it what the phone actually asked (gate.asked_log)."""
+    recomputed = gate.plan(user_history, slot, is_weekend, local_date)
+    return {**recomputed.as_log(),
+            "asked": gate.asked_log(body.asked_order, body.plan_source, recomputed)}
+
+
 async def log_gate(
-    token: str, ref: funnel.RoundRef, entry: dict, first: gate.Plan | None,
+    token: str, ref: funnel.RoundRef, entry: dict, plan_log: dict | None,
     client: httpx2.AsyncClient,
 ):
-    """This round's gate entry; round 1 adds the plan, recomputed from the same history and
-    context as /questions/plan. True when written, None on any failure (logged, not raised)."""
+    """This round's gate entry; round 1 adds the plan log. True when written, None on any
+    failure (logged, not raised)."""
     return await quietly(
-        funnel.append_gate(token, ref.session_id, ref.round, entry,
-                           first.as_log() if first else None, client=client),
+        funnel.append_gate(token, ref.session_id, ref.round, entry, plan_log, client=client),
         "gate",
     )
 
