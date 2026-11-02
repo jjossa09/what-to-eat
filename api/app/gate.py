@@ -3,8 +3,9 @@
 Pure functions, no I/O, no clock: the caller passes as_of. Muse never sees any of this; it only
 parses answers. The question text is fixed in the app.
 
-The 3 questions (FR4): always craving, budget, and distance, one message each. Weak
-predictions are asked first; confident ones are asked last with their chip pre-selected
+The gate asks three questions (FR4); company joins for with-people profiles with companions.
+With four candidates it skips the strongest confident prediction, or company if all are weak.
+Weak predictions are asked first; confident ones are asked last with their chip pre-selected
 (editable). Ties keep the order craving, budget, distance. Weak = scoring.weak() (Starting
 values: top probability under 0.4, or fewer than 5 meals in the context).
   craving:  the cuisine model (ML3) and scoring.is_weak.
@@ -29,6 +30,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date
+from uuid import UUID
 
 from app.cuisine_model import PREDICTABLE, is_weekend, predict, recency_weight
 from app.places import Candidate
@@ -49,6 +51,8 @@ from app.scoring_rules import (
     SCORE_DIGITS,
     SMOOTHING_K,
 )
+
+COMPANY = "company"
 
 CRAVING, BUDGET, DISTANCE = "craving", "budget", "distance"
 QUESTIONS: tuple[str, ...] = (CRAVING, BUDGET, DISTANCE)  # tie order
@@ -120,13 +124,13 @@ def predict_budget(
 class Question:
     key: str
     weak: bool
-    predicted: str | int | None  # the model's top answer (None: no prediction)
+    predicted: str | int | list[str] | None  # the model's top answer (None: no prediction)
     top_prob: float
     meals: int  # raw meals behind the reported level
     level: str  # model level, "none" for distance
 
     @property
-    def prefill(self) -> str | int | None:
+    def prefill(self) -> str | int | list[str] | None:
         """The pre-selected chip: only for a confident prediction (FR4)."""
         return None if self.weak else self.predicted
 
@@ -145,13 +149,80 @@ class Question:
 @dataclass(frozen=True)
 class Plan:
     questions: tuple[Question, ...]  # asking order
+    skipped: Question | None = None
 
     @property
     def order(self) -> tuple[str, ...]:
         return tuple(q.key for q in self.questions)
 
     def as_log(self) -> dict:
-        return {"questions": [q.as_dict() for q in self.questions]}
+        skipped = self.skipped.as_dict() if self.skipped else None
+        if skipped and self.skipped.weak:
+            skipped.update(predicted=None, reason="skipped_weak")
+        return {"questions": [q.as_dict() for q in self.questions], "skipped": skipped}
+
+
+def arrange(questions: tuple[Question, ...], *, new_search: bool = False) -> Plan:
+    """Ask three; a new search reserves craving as its first answer."""
+    skipped = None
+    if len(questions) == 4:
+        eligible = [q for q in questions if not (new_search and q.key == CRAVING)]
+        confident = [q for q in eligible if not q.weak and not weak(q.top_prob, q.meals)]
+        skipped = (max(confident, key=lambda q: (q.top_prob, q.key == BUDGET))
+                   if confident else next(q for q in eligible if q.key == COMPANY))
+    order = (*QUESTIONS, COMPANY)
+    asked = sorted((q for q in questions if q is not skipped),
+                   key=lambda q: (not (new_search and q.key == CRAVING),
+                                  not q.weak, order.index(q.key)))
+    if skipped and skipped.weak:
+        skipped = replace(skipped, predicted=None)
+    return Plan(tuple(asked), skipped)
+
+
+def predict_company(history: History, meal_slot: str, weekend: bool, as_of: date) -> Question:
+    """Fixed support across levels: solo plus observed, still-valid groups.
+
+    Unknown company contributes to each level's denominator, but votes for no outcome.
+    The resulting missing probability mass represents unknown company, not a guessed group.
+    """
+    observed = []
+    groups = set()
+    for m in history.meals:
+        if m.eaten_on >= as_of:
+            continue
+        group = None
+        if m.solo is True:
+            group = "solo"
+        elif m.companion_ids and m.companion_ids <= history.companions:
+            group = tuple(sorted(m.companion_ids))
+            groups.add(group)
+        observed.append((m, group, recency_weight((as_of - m.eaten_on).days)))
+    if not observed:
+        return Question(COMPANY, True, None, 0.0, 0, NONE)
+    outcomes = ["solo", *sorted(groups)]
+    probs = dict.fromkeys(outcomes, 1 / len(outcomes))
+    levels = ((USER, lambda m: True),
+              (SLOT, lambda m: m.meal_slot == meal_slot),
+              (SLOT_WEEKEND, lambda m: m.meal_slot == meal_slot and is_weekend(m) == weekend))
+    level, meals = NONE, 0
+    for name, match in levels:
+        weighted = dict.fromkeys(outcomes, 0.0)
+        raw, n = 0, 0.0
+        for m, group, w in observed:
+            if match(m):
+                n += w
+                raw += 1
+                if group is not None:
+                    weighted[group] += w
+        probs = {g: (weighted[g] + SMOOTHING_K * probs[g]) / (n + SMOOTHING_K)
+                 for g in outcomes}
+        if n >= LEVEL_MIN_N_EFF:
+            level, meals = name, raw
+    if not any(group is not None for _, group, _ in observed):
+        return Question(COMPANY, True, None, 0.0, meals, level)
+    group, probability = _top(probs)
+    predicted = group if group == "solo" else list(group)
+    return Question(COMPANY, weak(probability, meals), predicted, probability, meals, level)
 
 
 def model_context(meal_slot: str, weekend: bool, as_of: date) -> Context:
@@ -166,7 +237,9 @@ def _top(probs: dict) -> tuple[object, float]:
     return key, probs[key]
 
 
-def plan(history: History, meal_slot: str, weekend: bool, as_of: date) -> Plan:
+def plan(
+    history: History, meal_slot: str, weekend: bool, as_of: date, *, new_search: bool = False,
+) -> Plan:
     """The 3 questions in asking order: weak first, then confident (pre-filled)."""
     cuisine = predict(history, model_context(meal_slot, weekend, as_of), as_of)
     category, p_cat = _top({c: cuisine.probs[c] for c in PREDICTABLE})
@@ -176,8 +249,10 @@ def plan(history: History, meal_slot: str, weekend: bool, as_of: date) -> Plan:
     lvl, p_lvl = _top(price.probs)
     budget = Question(BUDGET, weak(p_lvl, price.meals), lvl, p_lvl, price.meals, price.level)
     distance = Question(DISTANCE, True, None, 1 / len(RADII), 0, NONE)
-    # sorted() is stable: ties keep craving, budget, distance.
-    return Plan(tuple(sorted((craving, budget, distance), key=lambda q: not q.weak)))
+    pool = (craving, budget, distance)
+    if history.prior.mostly_solo is False and history.companions:
+        pool += (predict_company(history, meal_slot, weekend, as_of),)
+    return arrange(pool, new_search=new_search)
 
 
 # Refinement question (ML10 v2) -----------------------------------------------
@@ -293,14 +368,18 @@ OK, MISSING, INVALID = "ok", "missing", "invalid"
 def asked_log(order: object, source: object, recomputed: Plan) -> dict:
     """The phone's question order and plan source, checked, next to the recomputed plan.
 
-    Valid order: exactly craving, budget, and distance, once each. Valid source: one of
+    Valid order: three distinct keys from the recomputed pool. Valid source: one of
     PLAN_SOURCES. Neither sent (an older app): missing. Anything else: invalid; a bad value is
     never logged as given, only as None. matches_plan compares a valid order with the plan
     the server recomputed now (it can differ after a fallback or a meal slot change).
     """
     keys = order if isinstance(order, list) else None
-    valid_order = (keys is not None and len(keys) == len(QUESTIONS)
-                   and all(isinstance(k, str) for k in keys) and set(keys) == set(QUESTIONS))
+    pool = {q.key for q in recomputed.questions}
+    if recomputed.skipped:
+        pool.add(recomputed.skipped.key)
+    valid_order = (keys is not None and len(keys) == 3
+                   and all(isinstance(k, str) for k in keys)
+                   and len(set(keys)) == 3 and set(keys) <= pool)
     valid_source = isinstance(source, str) and source in PLAN_SOURCES
     if order is None and source is None:
         status = MISSING
@@ -345,3 +424,25 @@ def prefilled_log(value: object) -> dict:
         return {"status": INVALID, "received": None, "shown": None}
     return {"status": OK, **{s: {k: value[s][k] for k in QUESTIONS} for s in PREFILL_SETS}}
 
+
+def company_prefilled_log(value: object) -> dict:
+    """Separate optional company trace. Invalid telemetry never rejects the round."""
+    empty = {"received": None, "shown": None}
+    if not isinstance(value, dict) or set(value) != set(PREFILL_SETS):
+        return {"status": INVALID, **empty}
+    cleaned = {}
+    for key in PREFILL_SETS:
+        item = value[key]
+        if item is None or item == "solo":
+            cleaned[key] = item
+        elif isinstance(item, list) and all(isinstance(v, str) for v in item):
+            try:
+                ids = [str(UUID(v)) for v in item]
+            except ValueError:
+                return {"status": INVALID, **empty}
+            if len(set(ids)) != len(ids):
+                return {"status": INVALID, **empty}
+            cleaned[key] = ids
+        else:
+            return {"status": INVALID, **empty}
+    return {"status": OK, **cleaned}

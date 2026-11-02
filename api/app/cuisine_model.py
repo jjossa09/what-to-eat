@@ -10,8 +10,8 @@ Recency-weighted counts per context, each level smoothed toward the broader one:
   slot_weekend:  same meal slot and weekday/weekend, smoothed toward slot
 p(c) = (weighted count of c + K * parent p(c)) / (weighted n + K).
 
-P2-07 hook: the companion level goes after slot_weekend in context_levels() (this companion,
-same slot and weekday/weekend), smoothed toward slot_weekend. Nothing else changes.
+The companion_slot level follows slot_weekend: same slot, including every selected
+companion, on either day type. No selected companions leaves the original chain unchanged.
 
 Constants are in app/scoring_rules.py, fixed before evaluation and never tuned on it.
 """
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 # Other is shown but never predicted (ML2).
 PREDICTABLE: tuple[str, ...] = tuple(c for c in CATEGORY_IDS if c != OTHER)
+
+COMPANION_SLOT = "companion_slot"
 
 QUIZ, USER, SLOT, SLOT_WEEKEND = "quiz", "user", "slot", "slot_weekend"
 
@@ -104,15 +106,18 @@ def smooth(weighted: dict[str, float], parent: dict[str, float]) -> dict[str, fl
 
 def context_levels(context: Context) -> tuple[tuple[str, Callable[[PastMeal], bool]], ...]:
     """Narrowing levels after quiz, broadest first. Each filters the counted meals."""
-    return (
+    levels = (
         (USER, lambda m: True),
         (SLOT, lambda m: m.meal_slot == context.meal_slot),
         (
             SLOT_WEEKEND,
             lambda m: m.meal_slot == context.meal_slot and is_weekend(m) == context.is_weekend,
         ),
-        # P2-07: (COMPANION, this companion + same slot + weekday/weekend) goes here.
     )
+    if context.companion_ids:
+        levels += ((COMPANION_SLOT, lambda m: m.meal_slot == context.meal_slot
+                    and context.companion_ids <= m.companion_ids),)
+    return levels
 
 
 def predict(history: History, context: Context, as_of: date) -> CuisinePrediction:

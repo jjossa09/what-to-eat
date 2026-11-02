@@ -45,6 +45,7 @@ class QuizPrior:
     favorites: frozenset[str] = frozenset()
     hard_nos: frozenset[str] = frozenset()
     budget_level: int | None = None  # 1-4
+    mostly_solo: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,8 @@ class PastMeal:
     dish: str | None = None  # loaded, not scored
     food_answered: bool = False  # live: the food answer was given (meals.ate_at)
     went: bool | None = None  # live: True for every loaded live meal; None for backfill
+    companion_ids: frozenset[str] = frozenset()
+    solo: bool | None = None
     stars: int | None = None  # live only, 1-5
 
 
@@ -86,6 +89,7 @@ class PastMeal:
 class History:
     prior: QuizPrior = QuizPrior()
     meals: tuple[PastMeal, ...] = ()
+    companions: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

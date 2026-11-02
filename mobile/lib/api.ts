@@ -58,18 +58,21 @@ async function request<T>(
   }
 }
 
-export type QuestionKey = 'craving' | 'budget' | 'distance' | 'refine' | 'open';
+export type ParseQuestionKey = 'craving' | 'budget' | 'distance' | 'refine' | 'open';
+export type QuestionKey = ParseQuestionKey | 'company';
+export type CompanyAnswer = 'solo' | string[] | null;
 
 /** The 3 questions before round 1 (FR4). */
-export type FirstKey = 'craving' | 'budget' | 'distance';
+export type FirstKey = 'craving' | 'budget' | 'distance' | 'company';
+export type RefinementKey = Exclude<FirstKey, 'company'>;
 
 /** One question of the confidence gate's plan (P2-05, ML6), in asking order. */
 export type PlanQuestion = {
   key: FirstKey;
   weak: boolean;
   /** The pre-selected chip: a category id, a budget level, or a radius. Null when weak. */
-  prefill: string | number | null;
-  predicted: string | number | null;
+  prefill: string | number | string[] | null;
+  predicted: string | number | string[] | null;
   top_prob: number;
   meals: number;
   level: string;
@@ -79,19 +82,20 @@ export type PlanResponse = {
   history_used: boolean;
   meal_slot: string;
   questions: PlanQuestion[];
+  skipped: PlanQuestion | null;
 };
 
 /** The 3 questions in asking order, weak first (P2-05). History only: no places, no Muse. */
-export function getQuestionPlan(localTime: string): Promise<PlanResponse> {
-  return request<PlanResponse>('POST', '/questions/plan', { local_time: localTime }, PLAN_TIMEOUT_MS);
+export function getQuestionPlan(localTime: string, newSearch = false): Promise<PlanResponse> {
+  return request<PlanResponse>('POST', '/questions/plan', { local_time: localTime, new_search: newSearch }, PLAN_TIMEOUT_MS);
 }
 
 /** The refinement question with the highest information gain (ML10); its options are chips. */
 export type NextQuestion = {
-  key: FirstKey;
+  key: RefinementKey;
   /** Category ids (craving), levels 1-4 (budget), or radii 15000 / 35000 (distance). */
   options: (string | number)[];
-  gains: Record<FirstKey, number>;
+  gains: Record<RefinementKey, number>;
 };
 
 /** What one answer changes (chips or Muse-parsed text). Steps apply on the server. */
@@ -125,6 +129,7 @@ export type RoundRequest = {
   /** The user tapped None of these on the previous round (logged as the rejected reason). */
   none_of_these?: boolean;
   solo: boolean | null;
+  companion_ids?: string[];
   session_id?: string;
   exclude_ids: string[];
   transcript: TranscriptMessage[];
@@ -135,6 +140,7 @@ export type RoundRequest = {
   /** Round 1 only (P2-05 trace): the plan's pre-fills as received, and the chip that was
    * highlighted when each question was answered. Null = none. */
   prefilled?: { received: PrefillValues; shown: PrefillValues };
+  company_prefilled?: { received: CompanyAnswer; shown: CompanyAnswer };
 };
 
 export type PrefillValues = {
@@ -188,7 +194,7 @@ export type ParseResponse = {
 };
 
 /** Typed text -> the same change a chip gives, not sure, or a chat line. One Muse call. */
-export function parseAnswer(questionKey: QuestionKey, text: string): Promise<ParseResponse> {
+export function parseAnswer(questionKey: ParseQuestionKey, text: string): Promise<ParseResponse> {
   return request<ParseResponse>('POST', '/answers/parse', { question_key: questionKey, text });
 }
 

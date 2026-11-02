@@ -103,3 +103,17 @@ export async function loadCompanions(userId: string): Promise<string[]> {
   if (error) throw error;
   return (data ?? []).map((row) => row.name as string);
 }
+
+
+export type Companion = { id: string; name: string };
+
+/** The current user's companions for company chips; names stay on the phone's parse path. */
+export async function loadCompanionChoices(userId: string): Promise<Companion[]> {
+  const { data, error } = await supabase
+    .from('companions')
+    .select('id,name')
+    .eq('user_id', userId)
+    .order('created_at');
+  if (error) throw error;
+  return data ?? [];
+}

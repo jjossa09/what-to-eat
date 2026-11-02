@@ -14,6 +14,8 @@ import {
 import {
   ApiError,
   type Change,
+  type CompanyAnswer,
+  type RefinementKey,
   deviceTimezone,
   type FirstKey,
   getQuestionPlan,
@@ -31,9 +33,14 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { remindAfterPick } from '../lib/notify';
-import { budgetPick as pickBudget, planPrefill, type Prefill, traceOf } from '../lib/questionPlan';
+import {
+  budgetPick as pickBudget, companySelection, matchCompany, newSearchPlan, planPrefill,
+  type Prefill, skippedAnswers, traceOf,
+} from '../lib/questionPlan';
 import {
   type Category,
+  type Companion,
+  loadCompanionChoices,
   loadCategories,
   loadDisplayName,
   loadTastePrior,
@@ -56,7 +63,7 @@ import { Chip, GlassScreen } from './ui';
 // better?" with the fixed chips when it is null. Typed text after a round runs the next round
 // right away. The cap round (best so far) keeps its open question; None of these there ends
 // the session as none.
-// Company is not asked: it comes from the quiz prior (mostly_solo). One question per message (R1).
+// Company is asked only when included by the gate; typed names are matched locally.
 // Typed answers are parsed by Muse into the same answers as the chips (P1-21). After a round,
 // the chat stays open: Cheaper / Closer / Something else or a typed follow-up runs a new round
 // that skips every place already shown (P1-14). Round 4 without a pick is the best so far.
@@ -67,7 +74,7 @@ import { Chip, GlassScreen } from './ui';
 // spots…" for rounds). Errors are a line in the thread under the user's bubble. Distance is
 // two chips: Close to me (15 km) and I don't mind (35 km).
 
-type Step = 'craving' | 'budget' | 'distance' | 'loading' | 'results' | 'error';
+type Step = 'craving' | 'budget' | 'distance' | 'company' | 'loading' | 'results' | 'error';
 type Problem = 'denied' | 'nofix' | 'network' | 'server' | 'auth' | 'load';
 type Bubble = { id: number; role: 'assistant' | 'user'; text: string; error?: boolean };
 type Radius = RoundRequest['radius_m'];
@@ -86,23 +93,30 @@ const DEFAULT_ORDER: FirstKey[] = ['craving', 'budget', 'distance'];
 /** The plan's order if it is exactly the 3 questions, else the default order (a fallback). */
 function planOrder(plan: PlanResponse | null): { keys: FirstKey[]; source: 'plan' | 'fallback' } {
   const keys = plan?.questions.map((q) => q.key) ?? [];
-  const valid = keys.length === DEFAULT_ORDER.length && DEFAULT_ORDER.every((k) => keys.includes(k));
+  const pool = [...DEFAULT_ORDER, 'company'];
+  const valid = keys.length === 3 && new Set(keys).size === 3 && keys.every((k) => pool.includes(k))
+    && (!keys.includes('company') || !!plan?.skipped)
+    && (!plan?.skipped || (pool.includes(plan.skipped.key) && !keys.includes(plan.skipped.key)));
   return valid ? { keys, source: 'plan' } : { keys: DEFAULT_ORDER, source: 'fallback' };
 }
 
 /** The prior, categories, name, and the gate's plan, together. A failed plan is null (the
  * default order), never a load error. */
 function loadStart(userId: string) {
+  const quiz = loadTastePrior(userId);
+  const people = quiz.then((prior) => prior.mostlySolo === false
+    ? loadCompanionChoices(userId).catch(() => []) : []);
   return Promise.all([
     loadCategories(),
-    loadTastePrior(userId),
+    quiz,
     loadDisplayName(userId).catch(() => null),
     getQuestionPlan(localTimeIso()).catch(() => null),
+    people,
   ]);
 }
 
 // Refinement lines (P2-05): fixed, separate from the round-1 wording. No Muse call.
-const REFINE_QUESTIONS: Record<FirstKey, string> = {
+const REFINE_QUESTIONS: Record<RefinementKey, string> = {
   craving: 'What sounds better?',
   budget: 'What price works better?',
   distance: 'How far would you go?',
@@ -113,6 +127,7 @@ const QUESTIONS = {
   craving: 'What are you craving?',
   budget: 'Budget this time?',
   distance: 'How far?',
+  company: 'Who are you eating with?',
   open: 'What would make it right?',
 } as const;
 
@@ -165,7 +180,7 @@ function isRadius(value: number | null): value is Radius {
 }
 
 function isFirst(step: Step): step is FirstKey {
-  return step === 'craving' || step === 'budget' || step === 'distance';
+  return step === 'craving' || step === 'budget' || step === 'distance' || step === 'company';
 }
 
 type ChatProps = {
@@ -195,6 +210,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   // Pre-selected chips: from the plan (confident predictions, P2-05) or a typed answer that
   // covered a later question (FR4).
   const [preset, setPreset] = useState<Prefill>({});
+  const [companions, setCompanions] = useState<Companion[]>([]);
+  const [companyPick, setCompanyPick] = useState<CompanyAnswer>(null);
+  const companyAnswer = useRef<CompanyAnswer>(null);
+  const companyTrace = useRef<{ received: CompanyAnswer; shown: CompanyAnswer }>({
+    received: null, shown: null,
+  });
+  const companyInPool = useRef(false);
   // After a round: the information-gain question (ML10), or null for the fixed chips. Asked
   // only once refining (after None of these).
   const [nextQuestion, setNextQuestion] = useState<NextQuestion | null>(null);
@@ -252,15 +274,31 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   }
 
   /** Applies the plan (or the default order) and returns the first question. */
-  function applyPlan(rows: Category[], quiz: TastePrior, plan: PlanResponse | null): FirstKey {
-    const chosen = planOrder(plan);
+  function applyPlan(rows: Category[], quiz: TastePrior, plan: PlanResponse | null, people: Companion[]): FirstKey {
+    const candidate = planOrder(plan);
+    const ids = new Set(people.map((p) => p.id));
+    // Never show a company question without usable chips.
+    const chosen = candidate.keys.includes('company') && !people.length
+      ? { keys: DEFAULT_ORDER, source: 'fallback' as const } : candidate;
+    const usable = chosen.source === 'plan' ? plan : null;
+    companyInPool.current = !!usable && (usable.questions.some((q) => q.key === 'company')
+      || usable.skipped?.key === 'company');
+    const received = companySelection(usable?.questions.find((q) => q.key === 'company')?.prefill, ids);
+    companyTrace.current = { received, shown: null };
+    companyAnswer.current = null;
+    setCompanyPick(received);
     order.current = chosen.keys;
     planSource.current = chosen.source;
-    const pre = planPrefill(plan?.questions, new Set(rows.map((c) => c.id)));
+    const pre = planPrefill(usable?.questions, new Set(rows.map((c) => c.id)));
     prefillReceived.current = pre;
     prefillShown.current = {};
     setPreset(pre); // a weak budget falls back to the quiz budget (budgetPick below)
     if (quiz.budget) answers.current.budget = quiz.budget;
+    const inferred = skippedAnswers(usable?.skipped, new Set(rows.map((c) => c.id)), ids);
+    companyAnswer.current = inferred.company ?? null;
+    if (inferred.craving) answers.current.craving = inferred.craving;
+    if (inferred.budget) answers.current.budget = inferred.budget;
+    if (inferred.radius) answers.current.radius = inferred.radius;
     return order.current[0];
   }
 
@@ -270,12 +308,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     let live = true;
     location.current = getPosition();
     loadStart(userId)
-      .then(([rows, quiz, shownName, plan]) => {
+      .then(([rows, quiz, shownName, plan, people]) => {
         if (!live) return;
         setCategories(rows);
         setPrior(quiz);
         setName(shownName);
-        const first = applyPlan(rows, quiz, plan);
+        setCompanions(people);
+        const first = applyPlan(rows, quiz, plan, people);
         nextId.current += 1;
         setBubbles([{ id: nextId.current, role: 'assistant', text: QUESTIONS[first] }]);
         transcript.current = [{ role: 'assistant', body: QUESTIONS[first], question_key: first }];
@@ -338,6 +377,18 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     if (key === 'budget') shown.budget = budgetPick ?? undefined;
     if (key === 'distance') shown.radius = radiusPick ?? undefined;
     prefillShown.current = shown;
+  }
+
+  function chooseCompany(value: Exclude<CompanyAnswer, null>, text?: string) {
+    if (busy.current) return;
+    companyTrace.current.shown = companyPick;
+    companyAnswer.current = value;
+    const label = value === 'solo' ? 'Solo' : value.length > 2 ? `${value.length} companions`
+      : companions.filter((c) => value.includes(c.id)).map((c) => c.name).join(', ');
+    const same = JSON.stringify(value) === JSON.stringify(companyTrace.current.received);
+    record('company', label, { solo: value === 'solo', companion_ids: value === 'solo' ? [] : value },
+      text !== undefined ? 'text' : same ? 'prefill' : 'chip', text ?? label);
+    advance('company');
   }
 
   function chooseCraving(id: string | null, label: string) {
@@ -422,7 +473,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     shown: string,
     mode: 'chip' | 'text',
     body: string = shown,
-    asked?: FirstKey,
+    asked?: RefinementKey,
   ) {
     const key: QuestionKey = asked ?? (nextIsOpen.current ? 'open' : 'refine');
     nextIsOpen.current = false;
@@ -430,14 +481,14 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     fetchRound(change);
   }
 
-  function chooseFollowUp(change: Partial<Change>, label: string, asked?: FirstKey) {
+  function chooseFollowUp(change: Partial<Change>, label: string, asked?: RefinementKey) {
     if (busy.current) return;
     setUnsent(null);
     followUp(change, label, 'chip', label, asked);
   }
 
   /** After a pick or None of these: a new session that starts at the craving. */
-  function startNewSearch() {
+  function startNewSearch(plan: PlanResponse | null) {
     sessionId.current = null;
     shownIds.current = [];
     transcript.current = [];
@@ -447,14 +498,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     setNextQuestion(null);
     setRefining(false);
     noneOfThese.current = false;
-    prefillReceived.current = {}; // a new search has no plan of its own
+    prefillReceived.current = {}; // reset before loading this search's plan
     prefillShown.current = {};
     answers.current = { ...answers.current, craving: null, exclude: [] };
-    // The typed text is the craving, so it goes first; budget and distance follow in this
-    // session's plan order, asked again and preselected from the last search.
-    order.current = ['craving', ...order.current.filter((k) => k !== 'craving')];
+    companyAnswer.current = null;
+    setCompanyPick(null);
+    const usable = planOrder(plan).source === 'plan' && plan
+      ? { ...plan, ...newSearchPlan(plan) } : null;
+    applyPlan(categories ?? [], prior ?? { favorites: [], budget: null, mostlySolo: null }, usable, companions);
     planSource.current = 'new_search';
-    setPreset({ budget: answers.current.budget, radius: answers.current.radius });
     setShowAll(false);
     setDecided(false);
     setStep('craving');
@@ -472,13 +524,23 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     setUnsent(null);
     const fresh = step === 'results' && decided; // the text is a new search's craving
     const first: FirstKey | null = fresh ? 'craving' : isFirst(step) ? step : null;
-    const key: QuestionKey = first ?? (nextIsOpen.current ? 'open' : 'refine');
+    if (first === 'company') {
+      const matched = matchCompany(text, companions);
+      if (matched === null) say('assistant', NOT_SURE);
+      else chooseCompany(matched, text);
+      return;
+    }
+    const key = first ?? (nextIsOpen.current ? 'open' : 'refine');
     busy.current = true;
     setParsing(true);
     let result: ParseResponse | null = null;
+    let freshPlan: PlanResponse | null = null;
     let failed: Problem | null = null;
     try {
-      result = await parseAnswer(key, text);
+      [result, freshPlan] = await Promise.all([
+        parseAnswer(key, text),
+        fresh ? getQuestionPlan(localTimeIso(), true).catch(() => null) : Promise.resolve(null),
+      ]);
     } catch (e) {
       const kind = e instanceof ApiError ? e.kind : 'network';
       failed = kind === 'auth' ? 'auth' : 'network';
@@ -498,7 +560,21 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       return;
     }
     const parsed: Change | null = result?.status === 'ok' ? result.answer : null;
-    if (fresh) startNewSearch();
+    if (fresh) {
+      startNewSearch(freshPlan);
+      // This typed answer has no displayed craving chip; do not trace the previous search's.
+      if (parsed && parsed.craving !== null) {
+        prefill('craving', parsed);
+        answers.current.craving = parsed.craving === 'anything' ? null : parsed.craving;
+        record('craving', text, parsed, 'text', text);
+        advance('craving');
+      } else {
+        say('assistant', "Didn't catch that.");
+        ask('craving');
+        setStep('craving');
+      }
+      return;
+    }
     if (!parsed) {
       // Not sure, but it may have answered later questions (FR4 prefill).
       const partial = result?.status === 'not_sure' ? result.answer : null;
@@ -542,7 +618,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         exclude_categories: answers.current.exclude,
         ...(change ? { refine: change } : {}),
         ...(noneOfThese.current ? { none_of_these: true } : {}),
-        solo: prior?.mostlySolo ?? null,
+        solo: companyAnswer.current === 'solo' ? true : Array.isArray(companyAnswer.current) ? false : null,
+        companion_ids: Array.isArray(companyAnswer.current) ? companyAnswer.current : [],
         // Round 1 logs the order this chat actually asked, next to the server's plan.
         ...(sessionId.current
           ? { session_id: sessionId.current }
@@ -550,6 +627,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               asked_order: order.current,
               plan_source: planSource.current,
               prefilled: { received: traceOf(prefillReceived.current), shown: traceOf(prefillShown.current) },
+              ...(companyInPool.current ? { company_prefilled: companyTrace.current } : {}),
             }),
         exclude_ids: shownIds.current,
         transcript: transcript.current,
@@ -613,11 +691,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     } else if (problem === 'load') {
       setProblem(null);
       loadStart(userId)
-        .then(([rows, quiz, shownName, plan]) => {
+        .then(([rows, quiz, shownName, plan, people]) => {
           setCategories(rows);
           setPrior(quiz);
           setName(shownName);
-          const first = applyPlan(rows, quiz, plan);
+          setCompanions(people);
+          const first = applyPlan(rows, quiz, plan, people);
           ask(first);
           setStep(first);
         })
@@ -646,6 +725,26 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         ))}
         <Chip label="Anything" onPress={() => chooseCraving(null, 'Anything')} />
         {!showAll && <Chip label="More" onPress={() => setShowAll(true)} />}
+      </>
+    );
+  } else if (step === 'company') {
+    const selected = Array.isArray(companyPick) ? companyPick : [];
+    chips = (
+      <>
+        {companions.map((c) => (
+          <Chip
+            key={c.id}
+            label={c.name}
+            selected={selected.includes(c.id)}
+            onPress={() => {
+              if (busy.current) return;
+              setCompanyPick(selected.includes(c.id)
+                ? selected.filter((id) => id !== c.id) : [...selected, c.id].sort());
+            }}
+          />
+        ))}
+        <Chip label="Solo" selected={companyPick === 'solo'} onPress={() => chooseCompany('solo')} />
+        {selected.length > 0 && <Chip label="Continue" onPress={() => chooseCompany(selected)} />}
       </>
     );
   } else if (step === 'budget') {

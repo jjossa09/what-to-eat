@@ -8,8 +8,8 @@ Data
 - QuizPrior.mostly_solo: bool | None = None             (taste_profiles.mostly_solo)
 - History.companions: frozenset[str] = frozenset()      (ids of the user's companions)
 - history.load reads meals.solo and meal_companions(companion_id) on the meals query, and
-  taste_profiles.mostly_solo. It reads the companions table only when mostly_solo is False
-  (otherwise company never joins the gate, and the existing two-query load is unchanged).
+  taste_profiles.mostly_solo. It reads the companions table for every user, whatever the
+  quiz says (saved companions decide whether company joins the gate).
   Live and backfill companions both count (decision ii).
 
 Cuisine model (ML3)
@@ -20,8 +20,9 @@ Cuisine model (ML3)
 - Empty companion_ids (no company answer, or solo): exactly today's prediction.
 
 Gate (ML6, FR15), key "company"
-- Company joins the pool only when prior.mostly_solo is False and History.companions is
-  non-empty. Pool of 3 (no company): exactly today's plan, nothing skipped.
+- Company joins the pool when History.companions is non-empty (at least one saved companion),
+  whatever the quiz says. prior.mostly_solo only feeds the company prior. Pool of 3 (no
+  company): exactly today's plan, nothing skipped.
 - Pool of 4: ask 3. Skip the most confident question (highest top_prob) among the confident
   ones (not weak by the ML6 rule). Ties skip budget. If none is confident, skip company.
   The 3 asked keep today's order rule: weak first, then the order craving, budget, distance,
@@ -279,13 +280,14 @@ def test_companions_are_read_only_when_the_quiz_says_with_people():
     assert read.headers["authorization"] == f"Bearer {history_t.TOKEN}"
 
 
-@pytest.mark.parametrize("prior", [[{"mostly_solo": True}], [{}], []])
-def test_solo_or_unknown_quiz_makes_no_companions_read(prior):
+@pytest.mark.parametrize("prior", [[{"mostly_solo": True}], [{"mostly_solo": False}], [{}], []])
+def test_no_saved_companions_loads_an_empty_set_for_any_quiz(prior):
     require(History, "companions")
-    up = HistoryFake(prior=prior, companions=[A])
+    up = HistoryFake(prior=prior, companions=[])
     loaded = history_t.run_load(up)
     assert loaded.companions == frozenset()
-    assert not [r for r in up.requests if r.url.path.endswith("/companions")]
+    (read,) = [r for r in up.requests if r.url.path.endswith("/companions")]
+    assert read.url.params["user_id"] == f"eq.{history_t.USER_ID}"
 
 
 # Gate: company in the pool (decision 1) -----------------------------------------------------
@@ -364,12 +366,20 @@ def device_history(prior, companions=()) -> History:
                 companions=companions)
 
 
-def test_plan_no_company_when_the_quiz_says_solo():
+def test_plan_no_company_without_saved_companions_when_the_quiz_says_solo():
     require(QuizPrior, "mostly_solo")
-    plan = gate.plan(device_history(QuizPrior(mostly_solo=True, budget_level=2), [A]),
+    plan = gate.plan(device_history(QuizPrior(mostly_solo=True, budget_level=2)),
                      "dinner", False, TODAY)
     assert plan.order == ("distance", "craving", "budget")
     assert skipped_key(plan) is None
+
+
+def test_plan_company_joins_when_the_quiz_says_solo_but_companions_exist():
+    require(QuizPrior, "mostly_solo")
+    plan = gate.plan(device_history(QuizPrior(mostly_solo=True, budget_level=2), [A]),
+                     "dinner", False, TODAY)
+    assert len(plan.order) == 3
+    assert COMPANY in plan.order or skipped_key(plan) == COMPANY
 
 
 def test_plan_no_company_without_companions():
