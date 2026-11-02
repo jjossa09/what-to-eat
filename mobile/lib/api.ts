@@ -132,6 +132,15 @@ export type RoundRequest = {
   asked_order?: FirstKey[];
   /** new_search: a search after a pick, craving first (the typed text is the craving). */
   plan_source?: 'plan' | 'fallback' | 'new_search';
+  /** Round 1 only (P2-05 trace): the plan's pre-fills as received, and the chip that was
+   * highlighted when each question was answered. Null = none. */
+  prefilled?: { received: PrefillValues; shown: PrefillValues };
+};
+
+export type PrefillValues = {
+  craving: string | null;
+  budget: number | null;
+  distance: 15000 | 35000 | null;
 };
 
 export type Pick = {

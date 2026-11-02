@@ -335,3 +335,32 @@ def test_asked_invalid_source(source):
     log = gate.asked_log(["craving", "budget", "distance"], source, PLAN)
     assert (log["status"], log["source"]) == ("invalid", None)
     assert log["order"] == ["craving", "budget", "distance"]  # the valid part is kept
+
+
+# Pre-fill trace ----------------------------------------------------------------
+
+
+def test_prefilled_valid_keeps_both_sets_in_question_order():
+    trace = {"shown": {"distance": None, "budget": 2, "craving": None},
+             "received": {"budget": 1, "craving": "chinese", "distance": 15000}}
+    log = gate.prefilled_log(trace)
+    assert log == {"status": "ok",
+                   "received": {"craving": "chinese", "budget": 1, "distance": 15000},
+                   "shown": {"craving": None, "budget": 2, "distance": None}}
+
+
+def test_prefilled_missing():
+    assert gate.prefilled_log(None) == {"status": "missing", "received": None, "shown": None}
+
+
+@pytest.mark.parametrize("bad", [
+    {"craving": "Chinese", "budget": None, "distance": None},
+    {"craving": "other", "budget": None, "distance": None},  # Other is never predicted
+    {"craving": None, "budget": 0, "distance": None},
+    {"craving": None, "budget": 2.0, "distance": None},
+    {"craving": None, "budget": None, "distance": 1500},
+    {"craving": None, "budget": None, "distance": None, "company": None},
+])
+def test_prefilled_invalid_values(bad):
+    ok = {"craving": None, "budget": None, "distance": None}
+    assert gate.prefilled_log({"received": ok, "shown": bad})["status"] == "invalid"

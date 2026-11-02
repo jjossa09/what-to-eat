@@ -122,6 +122,9 @@ class RecommendationsRequest(BaseModel):
     # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
     asked_order: list[JsonValue] | None = Field(default=None, max_length=10)
     plan_source: JsonValue = None
+    # Round 1 trace: the plan's pre-fills as the phone received them, and the chips it showed
+    # selected at each answer. Loosely typed like the two above.
+    prefilled: JsonValue = None
 
     @field_validator("timezone")
     @classmethod
@@ -355,8 +358,9 @@ def round_one_plan(
     """Round 1's plan log: the plan recomputed from the same history and context as
     /questions/plan, and next to it what the phone actually asked (gate.asked_log)."""
     recomputed = gate.plan(user_history, slot, is_weekend, local_date)
+    asked = gate.asked_log(body.asked_order, body.plan_source, recomputed)
     return {**recomputed.as_log(),
-            "asked": gate.asked_log(body.asked_order, body.plan_source, recomputed)}
+            "asked": {**asked, "prefilled": gate.prefilled_log(body.prefilled)}}
 
 
 async def log_gate(

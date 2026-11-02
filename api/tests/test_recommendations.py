@@ -937,7 +937,14 @@ def test_gate_failure_round_four_still_caps(kw):
 # The quiz-only fixture recomputes craving, budget, distance.
 
 def asked(up: Upstreams) -> dict:
-    return gate_calls(up)[0]["p_plan"]["asked"]
+    """The asked block without the pre-fill trace (tested on its own below)."""
+    block = dict(gate_calls(up)[0]["p_plan"]["asked"])
+    block.pop("prefilled")
+    return block
+
+
+def prefilled(up: Upstreams) -> dict:
+    return gate_calls(up)[0]["p_plan"]["asked"]["prefilled"]
 
 
 def test_round_one_logs_the_plan_the_phone_used():
@@ -1042,3 +1049,59 @@ def test_none_of_these_on_round_one_logs_no_rejections():
 
 def test_none_of_these_must_be_a_boolean():
     assert post(Upstreams(), none_of_these="maybe").status_code == 422
+
+
+
+# Pre-fill trace (round 1): what the phone received and what it showed selected --------
+
+TRACE = {"received": {"craving": "chinese", "budget": 1, "distance": None},
+         "shown": {"craving": "chinese", "budget": 1, "distance": None}}
+
+
+def test_round_one_logs_the_prefill_trace():
+    up = Upstreams()
+    post(up, asked_order=["distance", "craving", "budget"], plan_source="plan", prefilled=TRACE)
+    assert prefilled(up) == {"status": "ok", **TRACE}
+
+
+def test_a_received_prefill_that_was_not_shown_is_visible():
+    # The case the trace exists for: the plan's $ arrived, but no budget chip was highlighted.
+    trace = {"received": TRACE["received"],
+             "shown": {"craving": None, "budget": None, "distance": None}}
+    up = Upstreams()
+    post(up, asked_order=["distance", "craving", "budget"], plan_source="plan", prefilled=trace)
+    log = prefilled(up)
+    assert log["received"]["budget"] == 1 and log["shown"]["budget"] is None
+
+
+def test_round_one_without_a_trace_is_missing():
+    up = Upstreams()
+    post(up, asked_order=["craving", "budget", "distance"], plan_source="plan")
+    assert prefilled(up) == {"status": "missing", "received": None, "shown": None}
+
+
+@pytest.mark.parametrize("trace", [
+    {"received": TRACE["received"]},  # no shown
+    {**TRACE, "extra": {}},  # unknown set
+    {**TRACE, "shown": {"craving": "Chinese", "budget": 1, "distance": None}},  # label, not id
+    {**TRACE, "shown": {"craving": "chinese", "budget": "1", "distance": None}},  # string level
+    {**TRACE, "shown": {"craving": "chinese", "budget": 5, "distance": None}},  # no such chip
+    {**TRACE, "shown": {"craving": "chinese", "budget": True, "distance": None}},  # a bool
+    {**TRACE, "shown": {"craving": "chinese", "budget": 1, "distance": 5000}},  # old radius
+    {**TRACE, "shown": {"craving": "chinese", "budget": 1}},  # a key missing
+    "not an object",
+    [1, 2],
+])
+def test_an_invalid_trace_is_logged_as_invalid_never_refused(trace):
+    up = Upstreams()
+    response = post(up, asked_order=["craving", "budget", "distance"], plan_source="plan",
+                    prefilled=trace)
+    assert response.status_code == 200 and response.json()["gate_logged"] is True
+    assert prefilled(up) == {"status": "invalid", "received": None, "shown": None}
+    assert asked(up)["status"] == "ok"  # the order check is independent
+
+
+def test_later_rounds_ignore_the_trace():
+    up = Upstreams(shown=ROUND_1)
+    follow_up(up, refine={"budget": "cheaper"}, prefilled=TRACE)
+    assert gate_calls(up)[0]["p_plan"] is None

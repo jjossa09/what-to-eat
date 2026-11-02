@@ -31,6 +31,7 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { remindAfterPick } from '../lib/notify';
+import { budgetPick as pickBudget, planPrefill, type Prefill, traceOf } from '../lib/questionPlan';
 import {
   type Category,
   loadCategories,
@@ -193,7 +194,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [keyboard, setKeyboard] = useState(false);
   // Pre-selected chips: from the plan (confident predictions, P2-05) or a typed answer that
   // covered a later question (FR4).
-  const [preset, setPreset] = useState<{ craving?: string; budget?: number; radius?: Radius }>({});
+  const [preset, setPreset] = useState<Prefill>({});
   // After a round: the information-gain question (ML10), or null for the fixed chips. Asked
   // only once refining (after None of these).
   const [nextQuestion, setNextQuestion] = useState<NextQuestion | null>(null);
@@ -212,6 +213,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const firstOfSearch = useRef(true); // the next round is this search's first ("3 spots")
   const nextIsOpen = useRef(false); // the next follow-up answers "What would make it right?"
   const noneOfThese = useRef(false); // sent with the next round: its rejected reason
+  // Trace (P2-05), sent with round 1: the plan's pre-fills as received, and the chip that was
+  // highlighted when each question was answered (read from that render).
+  const prefillReceived = useRef<Prefill>({});
+  const prefillShown = useRef<Prefill>({});
   const busy = useRef(false); // one answer at a time (a chip tap during a parse is ignored)
   const location = useRef<Promise<LocationResult> | null>(null);
   const nextId = useRef(0);
@@ -251,14 +256,9 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     const chosen = planOrder(plan);
     order.current = chosen.keys;
     planSource.current = chosen.source;
-    const known = new Set(rows.map((c) => c.id));
-    const pre: { craving?: string; budget?: number; radius?: Radius } = {};
-    for (const q of plan?.questions ?? []) {
-      if (q.prefill === null) continue;
-      if (q.key === 'craving' && typeof q.prefill === 'string' && known.has(q.prefill)) pre.craving = q.prefill;
-      if (q.key === 'budget' && typeof q.prefill === 'number' && q.prefill >= 1 && q.prefill <= 4) pre.budget = q.prefill;
-      if (q.key === 'distance' && typeof q.prefill === 'number' && isRadius(q.prefill)) pre.radius = q.prefill;
-    }
+    const pre = planPrefill(plan?.questions, new Set(rows.map((c) => c.id)));
+    prefillReceived.current = pre;
+    prefillShown.current = {};
     setPreset(pre); // a weak budget falls back to the quiz budget (budgetPick below)
     if (quiz.budget) answers.current.budget = quiz.budget;
     return order.current[0];
@@ -306,7 +306,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const names = new Map((categories ?? []).map((c) => [c.id, c.name]));
   const favorites = (prior?.favorites ?? []).filter((id) => names.has(id));
   const cravingPick = preset.craving ?? null;
-  const budgetPick = preset.budget ?? prior?.budget ?? null;
+  const budgetPick = pickBudget(preset, prior?.budget);
   const radiusPick = preset.radius ?? null;
 
   function cravingLabel(id: string | null): string {
@@ -331,8 +331,18 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     }
   }
 
+  /** Trace: the chip this render highlighted for key (the one on screen at the answer). */
+  function noteShown(key: FirstKey) {
+    const shown = { ...prefillShown.current };
+    if (key === 'craving') shown.craving = cravingPick ?? undefined;
+    if (key === 'budget') shown.budget = budgetPick ?? undefined;
+    if (key === 'distance') shown.radius = radiusPick ?? undefined;
+    prefillShown.current = shown;
+  }
+
   function chooseCraving(id: string | null, label: string) {
     if (busy.current) return;
+    noteShown('craving');
     answers.current.craving = id;
     record('craving', label, { craving: id }, id !== null && cravingPick === id ? 'prefill' : 'chip');
     advance('craving');
@@ -340,6 +350,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseBudget(level: number, label: string) {
     if (busy.current) return;
+    noteShown('budget');
     answers.current.budget = level;
     record('budget', label, { budget_level: level }, budgetPick === level ? 'prefill' : 'chip');
     advance('budget');
@@ -347,6 +358,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseDistance(radius: Radius, label: string) {
     if (busy.current) return;
+    noteShown('distance');
     answers.current.radius = radius;
     record('distance', label, { radius_m: radius }, radiusPick === radius ? 'prefill' : 'chip');
     advance('distance');
@@ -371,6 +383,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   /** A parsed first answer: the typed bubble stays; the answer is logged like its chip. */
   function typedFirst(key: FirstKey, a: Change, text: string) {
+    noteShown(key);
     prefill(key, a);
     if (key === 'craving') {
       const id = a.craving === 'anything' ? null : a.craving;
@@ -434,6 +447,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     setNextQuestion(null);
     setRefining(false);
     noneOfThese.current = false;
+    prefillReceived.current = {}; // a new search has no plan of its own
+    prefillShown.current = {};
     answers.current = { ...answers.current, craving: null, exclude: [] };
     // The typed text is the craving, so it goes first; budget and distance follow in this
     // session's plan order, asked again and preselected from the last search.
@@ -531,7 +546,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         // Round 1 logs the order this chat actually asked, next to the server's plan.
         ...(sessionId.current
           ? { session_id: sessionId.current }
-          : { asked_order: order.current, plan_source: planSource.current }),
+          : {
+              asked_order: order.current,
+              plan_source: planSource.current,
+              prefilled: { received: traceOf(prefillReceived.current), shown: traceOf(prefillShown.current) },
+            }),
         exclude_ids: shownIds.current,
         transcript: transcript.current,
       });

@@ -315,3 +315,33 @@ def asked_log(order: object, source: object, recomputed: Plan) -> dict:
         "matches_plan": list(recomputed.order) == keys if valid_order else None,
     }
 
+
+# Trace (round 1): the pre-fills the phone received and the chips it highlighted.
+PREFILL_SETS = ("received", "shown")
+
+
+def _prefill_value(key: str, value: object) -> bool:
+    """A pre-fill a chip can hold: a category id, a level 1-4, a radius chip, or None."""
+    if value is None:
+        return True
+    if key == CRAVING:
+        return isinstance(value, str) and value in PREDICTABLE
+    if key == BUDGET:
+        return isinstance(value, int) and not isinstance(value, bool) and value in LEVELS
+    return isinstance(value, int) and not isinstance(value, bool) and value in RADII
+
+
+def prefilled_log(value: object) -> dict:
+    """The phone's pre-fill trace, checked. Valid: {"received": {...}, "shown": {...}}, each
+    with exactly the keys craving, budget, distance, values a chip can hold or None. Not sent:
+    missing. Anything else: invalid, and nothing of it is logged."""
+    if value is None:
+        return {"status": MISSING, "received": None, "shown": None}
+    ok = (isinstance(value, dict) and set(value) == set(PREFILL_SETS)
+          and all(isinstance(value[s], dict) and set(value[s]) == set(QUESTIONS)
+                  and all(_prefill_value(k, v) for k, v in value[s].items())
+                  for s in PREFILL_SETS))
+    if not ok:
+        return {"status": INVALID, "received": None, "shown": None}
+    return {"status": OK, **{s: {k: value[s][k] for k in QUESTIONS} for s in PREFILL_SETS}}
+
