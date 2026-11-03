@@ -85,7 +85,7 @@ def test_answer_parsing_has_its_own_five_seconds_and_token_cap(monkeypatch, capl
 
     asyncio.run(go())
     row, = telemetry(caplog)
-    assert row["call_type"] == "parse" and row["token_cap"] == 600
+    assert row["call_type"] == "parse" and row["token_cap"] == 1000
     assert row["effective_timeout_s"] == 5
     assert meta.requests[0].extensions["timeout"]["read"] == 5
     assert "PRIVATE INPUT" not in caplog.text

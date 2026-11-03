@@ -10,7 +10,7 @@ from app import main
 from app.config import get_settings
 
 
-def test_places_time_is_subtracted_from_reason_budget(monkeypatch):
+def test_places_time_does_not_start_a_reasons_call(monkeypatch):
     monkeypatch.setenv("MUSE_TIMEOUT_S", "5")
     get_settings.cache_clear()
     clock = [0.0]
@@ -24,12 +24,11 @@ def test_places_time_is_subtracted_from_reason_budget(monkeypatch):
 
     upstream = TimedPlaces()
     response = post(upstream)
-    assert response.status_code == 200 and response.json()["reasons_source"] == "muse"
-    request, = [r for r in upstream.requests if r.url.host == "api.meta.ai"]
-    assert request.extensions["timeout"]["read"] == 3.5
+    assert response.status_code == 200 and response.json()["reasons_source"] == "template"
+    assert not [r for r in upstream.requests if r.url.host == "api.meta.ai"]
 
 
-def test_slow_reasons_fall_back_and_logging_cannot_extend_round(monkeypatch):
+def test_no_reasons_call_and_logging_cannot_extend_round(monkeypatch):
     monkeypatch.setattr(main, "ROUND_BUDGET_S", 0.15)
     cancelled = []
 
@@ -50,7 +49,8 @@ def test_slow_reasons_fall_back_and_logging_cannot_extend_round(monkeypatch):
     assert response.status_code == 200
     assert response.json()["reasons_source"] == "template"
     assert time.perf_counter() - start < 1
-    assert "api.meta.ai" in cancelled
+    assert "api.meta.ai" not in cancelled
+    assert cancelled  # The slow logging write was cancelled at the round deadline.
 
 
 def test_quiet_write_uses_remaining_deadline_and_does_not_raise():

@@ -94,8 +94,7 @@ SYSTEM_PROMPT = (
     "if stars_mean is absent, never mention stars or ratings. "
     "Do not repeat the place name. No health, nutrition, calorie, or diet claims. "
     f"Each reason is one plain sentence of at most {MAX_REASON_CHARS} characters. "
-    'Reply with JSON only: {"reasons": [{"id": "<pick id>", "line": "<reason>"}]}, '
-    "exactly one entry per pick id given."
+    "Return exactly one entry per pick id given."
 )
 
 RESPONSE_FORMAT = {
@@ -215,7 +214,6 @@ def pick_evidence(pick: Pick) -> dict:
     price = next((r for r in e.reasons if r.startswith("price_")), None)
     return {
         "id": place.id,
-        "name": place.name,
         "category": CATEGORY_LABELS.get(e.category) if e.category != OTHER else None,
         "distance": format_distance(e.distance_m),
         "craving": CATEGORY_LABELS.get(e.craving) if e.craving else None,
@@ -241,7 +239,11 @@ def star_claims_ok(line: str, stars_mean: float | None) -> bool:
 
 
 def request_body(picks: tuple[Pick, ...]) -> dict:
-    evidence = {"picks": [pick_evidence(p) for p in picks]}
+    return evidence_request_body([pick_evidence(p) for p in picks])
+
+
+def evidence_request_body(picks: list[dict]) -> dict:
+    evidence = {"picks": picks}
     return {
         "model": MODEL,
         "messages": [
@@ -411,8 +413,8 @@ async def call(
     with a short warning. Never logs the key, the request, or the response text.
     """
     settings = get_settings()
-    cap = {"reasons": min(5.0, settings.MUSE_TIMEOUT_S),
-           "parse": min(5.0, settings.MUSE_PARSE_TIMEOUT_S),
+    cap = {"reasons": min(12.0, settings.MUSE_TIMEOUT_S),
+           "parse": min(10.0, settings.MUSE_PARSE_TIMEOUT_S),
            "takeaway": min(8.0, settings.MUSE_TAKEAWAY_TIMEOUT_S)}[call_type]
     timeout = max(0.0, min(cap, timeout_s)) if timeout_s is not None else max(0.0, cap)
     trace = CallTelemetry(call_type, timeout, body["max_completion_tokens"])

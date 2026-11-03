@@ -30,7 +30,7 @@ export default function TypingBubble() {
   }, [reduceMotion, values]);
 
   return (
-    <View style={styles.bubble} accessibilityLabel="Typing" accessibilityRole="text">
+    <View style={styles.bubble} accessibilityLabel="Thinking..." accessibilityRole="text">
       {reduceMotion ? (
         <Text style={styles.still}>…</Text>
       ) : (

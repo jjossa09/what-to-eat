@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # code that needs one calls require(), which fails with the variable name only.
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
+    REASONS_SIGNING_SECRET: SecretStr | None = None
     META_API_KEY: SecretStr | None = None
     GEOAPIFY_API_KEY: SecretStr | None = None
     SUPABASE_URL: str | None = None
@@ -24,8 +25,8 @@ class Settings(BaseSettings):
     PLACES_RADIUS_M: int = 5000  # FR-R3 cold-start radius
     PLACES_TIMEOUT_S: float = 4.0  # leaves room for Muse in the ~8 s first round (NFR4)
     SUPABASE_TIMEOUT_S: float = 2.0  # history reads run alongside the places search
-    MUSE_TIMEOUT_S: float = 5.0  # reasons cap; also bounded by the remaining round time
-    MUSE_PARSE_TIMEOUT_S: float = 5.0
+    MUSE_TIMEOUT_S: float = 12.0  # independent reasons enhancement
+    MUSE_PARSE_TIMEOUT_S: float = 10.0
     MUSE_TAKEAWAY_TIMEOUT_S: float = 8.0
     MUSE_TAKEAWAY_DAILY_CAP: int = 10  # under the shared cap, per UTC day and instance
     MUSE_DAILY_CAP: int = 200  # Muse calls per UTC day, per instance (see app/muse.py)
