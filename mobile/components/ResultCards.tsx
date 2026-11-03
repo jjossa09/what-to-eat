@@ -1,9 +1,11 @@
-import { useRef, useState } from 'react';
-import { Linking, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Animated, Linking, StyleSheet, Text, View } from 'react-native';
 
-import { ApiError, logInterested, logNone, logPicked, type Pick } from '../lib/api';
+import { useReduceMotion } from '../lib/accessibility';
+import { ApiError, getReasons, logInterested, logNone, logPicked, type Pick } from '../lib/api';
 import type { Position } from '../lib/location';
 import { directionsUrl } from '../lib/places';
+import { type ReasonsCache, swapReason, type ReasonsEnvelope } from '../lib/reasons';
 import { colors, emojiFor, radii, spacing, type } from '../theme';
 import { Attribution, MiniMap } from './PlaceMap';
 import PressScale from './PressScale';
@@ -23,6 +25,11 @@ function miles(meters: number): string {
 type Decision = 'open' | 'saving' | 'done';
 
 type Props = {
+  envelope?: ReasonsEnvelope | null;
+  reasonsCache: ReasonsCache;
+  generation: number;
+  userId: string;
+  onDecisionStart: () => void;
   picks: Pick[];
   user: Position | null;
   /** Null when the round was not logged: then picks can't be recorded, so those buttons hide. */
@@ -45,6 +52,7 @@ type Props = {
 
 export default function ResultCards({
   picks,
+  envelope, reasonsCache, generation, userId, onDecisionStart,
   user,
   sessionId,
   round,
@@ -55,6 +63,16 @@ export default function ResultCards({
   final = false,
   onNoneOfThese,
 }: Props) {
+  const [enhanced, setEnhanced] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (envelope && sessionId && round !== null && !final && !readOnly
+      && reasonsCache.isCurrent(generation)) {
+      return reasonsCache.watch(`${userId}:${sessionId}:${round}`, picks.map((p) => p.id),
+        generation, () => getReasons(envelope), (result) => {
+          setEnhanced(Object.fromEntries(result.reasons.map((r) => [r.id, r.line])));
+        });
+    }
+  }, [envelope, sessionId, round, final, readOnly, reasonsCache, generation, userId, picks]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision>('open');
   const [failed, setFailed] = useState<(() => void) | null>(null);
@@ -81,6 +99,7 @@ export default function ResultCards({
   }
 
   async function decide(save: () => Promise<unknown>, done: string, after?: () => void) {
+    onDecisionStart();
     setDecision('saving');
     setFailed(null);
     try {
@@ -135,7 +154,8 @@ export default function ResultCards({
               </Text>
               <Text style={styles.distance}>{miles(p.distance_m)}</Text>
             </View>
-            <Text style={styles.reason}>{p.reason}</Text>
+            <ReasonText template={p.reason} enhanced={enhanced[p.id]}
+              cache={reasonsCache} generation={generation} />
             <View style={styles.actions}>
               {canRecord && open && <Chip label="Pick this" onPress={() => pick(p)} />}
               <Chip label="Directions" onPress={() => directions(p)} />
@@ -158,6 +178,26 @@ export default function ResultCards({
       {!readOnly && <Attribution quiet />}
     </View>
   );
+}
+
+function ReasonText({ template, enhanced, cache, generation }: {
+  template: string; enhanced?: string; cache: ReasonsCache; generation: number;
+}) {
+  const reduceMotion = useReduceMotion();
+  const [line, setLine] = useState(template);
+  const [opacity] = useState(() => new Animated.Value(1));
+  useEffect(() => {
+    opacity.setValue(1);
+    if (!enhanced || enhanced === template) return;
+    const stop = swapReason(reduceMotion, () => cache.isCurrent(generation),
+      () => setLine(enhanced), (toValue, duration, done) => {
+        const animation = Animated.timing(opacity, { toValue, duration, useNativeDriver: true });
+        animation.start(({ finished }) => { if (finished) done(); });
+        return () => animation.stop();
+      });
+    return () => { stop(); opacity.setValue(1); };
+  }, [enhanced, template, reduceMotion, cache, generation, opacity]);
+  return <Animated.Text style={[styles.reason, { opacity }]}>{line}</Animated.Text>;
 }
 
 const styles = StyleSheet.create({

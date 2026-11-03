@@ -10,9 +10,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
-from app import funnel, gate, history, insights, muse, places, refine, takeaway, widening
+from app import funnel, gate, history, insights, muse, places, reasons, refine, takeaway, widening
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -24,7 +27,37 @@ from app.refine import Change
 from app.scoring import Context, History, meal_context, models_for
 
 configure_logging()
+PARSE_DEADLINE_S = 13.0
+REASONS_DEADLINE_S = 15.0
+NOT_SURE = {"status": "not_sure", "answer": None, "source": "none", "reply": None}
+
+
+class LanguageRoute(APIRoute):
+    """Whole endpoint deadline, including request parsing and auth dependencies."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def bounded(request):
+            path = request.url.path
+            if path not in ("/reasons", "/answers/parse"):
+                return await handler(request)
+            seconds = REASONS_DEADLINE_S if path == "/reasons" else PARSE_DEADLINE_S
+            try:
+                async with asyncio.timeout(seconds):
+                    return await handler(request)
+            except TimeoutError:
+                return JSONResponse(reasons.EMPTY if path == "/reasons" else NOT_SURE)
+            except RequestValidationError:
+                if path == "/reasons":
+                    return JSONResponse({"detail": "Invalid reasons envelope"}, status_code=400)
+                raise
+
+        return bounded
+
+
 app = FastAPI(title="What to eat! API")
+app.router.route_class = LanguageRoute
 logger = logging.getLogger(__name__)
 
 # FR-R2 upper clamp: 25 miles.
@@ -312,11 +345,10 @@ async def recommendations(
         ranking, context, user_history, merged_ids, models,
         gate.predict_budget(user_history, slot, is_weekend, local_date),
     )
-    # The shown places are cached while Muse writes; the events need their rows.
+    # Cache places before shown events; language enhancement is a separate request.
     # The transcript and a later round's follow-up writes go alongside them.
-    reasons, cached, saved, followed, gated, _ = await asyncio.gather(
-        muse.write_reasons(ranking.top3, client=client,
-                           timeout_s=max(0.0, deadline - time.perf_counter())),
+    template_lines = tuple(muse.template_reason(p) for p in ranking.top3)
+    cached, saved, followed, gated, _ = await asyncio.gather(
         quietly(funnel.upsert_places(shown, client=client), "places", deadline=deadline)
         if ref
         else asyncio.sleep(0),
@@ -344,7 +376,7 @@ async def recommendations(
         and followed
         and await quietly(
             funnel.log_shown(
-                user_id, token, ref, ranking.top3, reasons.lines, reasons.source, client=client
+                user_id, token, ref, ranking.top3, template_lines, muse.TEMPLATE, client=client
             ),
             "shown",
             deadline=deadline,
@@ -354,7 +386,7 @@ async def recommendations(
     logger.info(
         "Recommendations round in %d ms (reasons: %s)",
         (time.perf_counter() - started) * 1000,
-        reasons.source,
+        muse.TEMPLATE,
     )
     return {
         "session_id": ref.session_id if ref else session_id,
@@ -362,7 +394,9 @@ async def recommendations(
         "logged": logged,
         "gate_logged": bool(gated),
         "history_used": loaded is not None,
-        "reasons_source": reasons.source,
+        "reasons_source": muse.TEMPLATE,
+        "reasons_envelope": reasons.envelope(
+            user_id, ref.session_id if ref else None, ref.round if ref else None, ranking.top3),
         "cold_start": ranking.cold_start,
         "radius_m": result.radius_m,
         "truncated": result.truncated,
@@ -382,7 +416,7 @@ async def recommendations(
                 "address": pick.scored.place.address,
                 "reason": reason,
             }
-            for pick, reason in zip(ranking.top3, reasons.lines, strict=True)
+            for pick, reason in zip(ranking.top3, template_lines, strict=True)
         ],
     }
 
@@ -541,6 +575,15 @@ async def best_so_far_round(
 
 def best_reason(meters: int) -> str:
     return f"One of your best so far, {muse.format_distance(meters)} away."
+
+
+@app.post("/reasons")
+async def enhance_reasons(
+    body: reasons.Envelope,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    return await reasons.response(body, *auth, client=client)
 
 
 # The 3 questions (P2-05, FR4, ML6) -------------------------------------------

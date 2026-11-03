@@ -1,7 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { supabase } from './supabase';
 import { withInsightsDeadline } from './insights';
+import { languageRequest, type ReasonsEnvelope, type ReasonsResponse } from './reasons';
+import { supabase } from './supabase';
 import { loadTakeaway, requestTakeaway, type TakeawayResult } from './takeaway';
 
 // Our own API (EXPO_PUBLIC_API_URL). Every call carries the user's Supabase JWT.
@@ -266,6 +267,7 @@ export type RoundAnswers = {
 };
 
 export type RoundResponse = {
+  reasons_envelope?: ReasonsEnvelope | null;
   session_id: string | null;
   round: number | null;
   logged: boolean;
@@ -289,9 +291,28 @@ export type ParseResponse = {
   reply: string | null;
 };
 
-/** Typed text -> the same change a chip gives, not sure, or a chat line. One Muse call. */
-export function parseAnswer(questionKey: ParseQuestionKey, text: string): Promise<ParseResponse> {
-  return request<ParseResponse>('POST', '/answers/parse', { question_key: questionKey, text });
+/** Language calls bound auth, transport, and body reading with one deadline. */
+async function languageCall<T>(path: string, body: unknown, timeout: number): Promise<T> {
+  return languageRequest<T>(`${API_URL?.replace(/\/$/, '')}${path}`, body, async () => {
+    if (!API_URL) throw new ApiError('server');
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) throw new ApiError('auth');
+    return data.session.access_token;
+  }, withInsightsDeadline, timeout);
+}
+
+export async function parseAnswer(questionKey: ParseQuestionKey, text: string): Promise<ParseResponse> {
+  try {
+    return await languageCall<ParseResponse>('/answers/parse', { question_key: questionKey, text }, 16_000);
+  } catch (error) {
+    if ((error instanceof ApiError && error.kind === 'auth')
+      || (error instanceof Error && error.message === 'auth')) throw new ApiError('auth');
+    return { status: 'not_sure', answer: null, source: 'none', reply: null };
+  }
+}
+
+export function getReasons(envelope: ReasonsEnvelope): Promise<ReasonsResponse> {
+  return languageCall('/reasons', envelope, 18_000);
 }
 
 export function getRecommendations(body: RoundRequest): Promise<RoundResponse> {

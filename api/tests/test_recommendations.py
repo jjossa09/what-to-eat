@@ -169,7 +169,7 @@ def test_full_round():
     assert response.status_code == 200
     body = response.json()
     assert body["history_used"] is True
-    assert body["reasons_source"] == "muse"
+    assert body["reasons_source"] == "template"
     assert body["cold_start"] is False
     assert body["radius_m"] == 11250
     assert len(body["picks"]) == 3
@@ -177,8 +177,9 @@ def test_full_round():
     assert "node/4" not in ids  # hard no
     assert [p["rank"] for p in body["picks"]] == [1, 2, 3]
     assert [p["slot"] for p in body["picks"]] == ["familiar", "familiar", "discovery"]
-    # Muse answered in reverse; our order holds.
-    assert [p["reason"] for p in body["picks"]] == [f"Reason for {i}." for i in ids]
+    # Templates arrive without a language call; ordering is still the ranking order.
+    assert all(p["reason"] for p in body["picks"])
+    assert "api.meta.ai" not in up.hosts()
     assert set(body["picks"][0]) == {"rank", "slot", "id", "name", "lat", "lon", "distance_m",
                                      "category", "address", "reason"}
 
@@ -197,11 +198,9 @@ def test_one_call_each_and_parallel_fetch():
     # taste_profiles + meals + companions reads (P2-07); session insert; places upsert; gate
     # append (P2-05); shown events insert.
     assert hosts.count(SUPABASE_HOST) == 8
-    assert hosts.count("api.meta.ai") == 1
-    paths = [r.url.path for r in up.requests]
-    assert paths.index("/v1/chat/completions") < paths.index("/rest/v1/recommendation_events")
+    assert hosts.count("api.meta.ai") == 0
     # Places, the three history reads, and the session insert overlap; the places upsert
-    # overlaps the Muse call.
+    # runs before shown events.
     assert up.max_in_flight == 5
 
 
@@ -351,7 +350,7 @@ def test_round_one_creates_session_and_logs_shown():
         assert (row["rank"], row["slot"], row["pick_reason"]) == (
             pick["rank"], pick["slot"], pick["reason"])
         assert isinstance(row["score"], float)
-        assert row["reasons_source"] == "muse"
+        assert row["reasons_source"] == "template"
 
 
 def test_shown_places_are_cached_first():
@@ -663,10 +662,10 @@ def test_follow_up_after_a_decision_is_a_conflict():
     assert "api.geoapify.com" not in up.hosts() and "api.meta.ai" not in up.hosts()
 
 
-def test_follow_up_writes_run_alongside_muse():
+def test_follow_up_writes_run_without_muse():
     up = Upstreams(shown=ROUND_1)
     follow_up(up, refine={"distance": "farther"})
-    assert up.hosts().count("api.meta.ai") == 1
+    assert up.hosts().count("api.meta.ai") == 0
     assert up.hosts().count("api.geoapify.com") == 2
     paths = [(r.method, r.url.path) for r in up.requests]
     # One session read, one PATCH, one rejected insert, one shown insert, one places upsert.
@@ -854,7 +853,7 @@ def test_next_question_from_information_gain(monkeypatch):
     assert nq["key"] == "craving" and nq["gains"]["craving"] > 0
     assert set(nq["options"]) <= {"thai", "pizza", "mexican", "indian"}
     assert gate_calls(up)[0]["p_entry"]["key"] == "craving"
-    assert up.hosts().count("api.meta.ai") == 1  # no extra Muse call for the question
+    assert up.hosts().count("api.meta.ai") == 0  # no extra Muse call for the question
     assert up.hosts().count("api.geoapify.com") == 1
 
 

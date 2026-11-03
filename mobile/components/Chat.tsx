@@ -46,6 +46,7 @@ import {
   loadTastePrior,
   type TastePrior,
 } from '../lib/profile';
+import { ReasonsCache, type ReasonsEnvelope } from '../lib/reasons';
 import { colors, radii, spacing, type } from '../theme';
 import Composer from './Composer';
 import ResultCards from './ResultCards';
@@ -83,6 +84,8 @@ type Round = {
   picks: Pick[];
   sessionId: string | null;
   round: number | null;
+  envelope?: ReasonsEnvelope | null;
+  generation: number;
   final: boolean; // the cap round: None of these ends the session
 };
 type Answers = { craving: string | null; budget: number; radius: Radius; exclude: string[] };
@@ -190,6 +193,8 @@ type ChatProps = {
 };
 
 export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
+  const [reasonsCache] = useState(() => new ReasonsCache());
+  useEffect(() => () => reasonsCache.clear(), [reasonsCache, userId]);
   const [categories, setCategories] = useState<Category[] | null>(null);
   const [prior, setPrior] = useState<TastePrior | null>(null);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
@@ -457,6 +462,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   /** None of these before the cap: the session stays open; the refinement question follows. */
   function rejectRound(): boolean {
     if (busy.current) return false;
+    reasonsCache.invalidate();
     noneOfThese.current = true;
     record('refine', 'None of these', { none_of_these: true }, 'chip');
     if (nextQuestion) askLine(REFINE_QUESTIONS[nextQuestion.key], nextQuestion.key);
@@ -488,6 +494,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   /** After a pick or None of these: a new session that starts at the craving. */
   function startNewSearch(plan: PlanResponse | null) {
+    reasonsCache.invalidate();
     sessionId.current = null;
     shownIds.current = [];
     transcript.current = [];
@@ -531,6 +538,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     const key = first ?? (nextIsOpen.current ? 'open' : 'refine');
     busy.current = true;
     setParsing(true);
+    if (!first || fresh) reasonsCache.invalidate();
     let result: ParseResponse | null = null;
     let freshPlan: PlanResponse | null = null;
     let failed: Problem | null = null;
@@ -593,6 +601,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   }
 
   async function fetchRound(change?: Partial<Change>) {
+    reasonsCache.invalidate();
     pendingChange.current = change;
     busy.current = true;
     setProblem(null);
@@ -653,7 +662,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         const round = result.session_id ? result.round : null;
         setRounds((prev) => [
           ...prev,
-          { bubbleId: id, picks: result.picks, sessionId: result.session_id, round, final: result.best_so_far },
+          { bubbleId: id, picks: result.picks, sessionId: result.session_id, round, final: result.best_so_far,
+            envelope: result.reasons_envelope, generation: reasonsCache.current() },
         ]);
       }
       if (result.best_so_far) {
@@ -841,6 +851,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                   <ResultCards
                     key={`cards-${b.id}`}
                     picks={r.picks}
+                    envelope={r.envelope}
+                    reasonsCache={reasonsCache}
+                    generation={r.generation}
+                    userId={userId}
+                    onDecisionStart={() => reasonsCache.invalidate()}
                     user={user}
                     sessionId={r.sessionId}
                     round={r.round}
