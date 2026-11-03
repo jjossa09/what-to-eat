@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { Animated, StyleSheet, Text, View } from 'react-native';
 
 import type { InsightCard } from '../../lib/insights';
-import { colors, radii, spacing, type } from '../../theme';
+import { chart, colors, radii, spacing, type } from '../../theme';
 import { GlassCard } from '../ui';
 import { useOpeningProgress } from './OpeningMotion';
 
@@ -19,10 +19,11 @@ export function ChartCard({ title, data, variant = 'card', children }: ChartProp
   return variant === 'card' ? <GlassCard>{content}</GlassCard> : content;
 }
 
-function BarFill({ id, fraction }: { id: string; fraction: number }) {
+function BarFill({ id, fraction, color }: { id: string; fraction: number; color?: string }) {
   const progress = useOpeningProgress(id);
   return <Animated.View style={[styles.fill, {
-    width: `${fraction * 100}%`, transform: [{ scaleX: progress }],
+    width: `${fraction * 100}%`, backgroundColor: color ?? chart.neutral,
+    transform: [{ scaleX: progress }],
   }]} />;
 }
 
@@ -54,7 +55,8 @@ export default function BarChart({
                 <Text style={styles.value}>{bar.valueLabel}</Text>
               </View>
               <View style={styles.track} accessibilityElementsHidden>
-                <BarFill id={`${chartId}:${group.id}:${bar.id}`} fraction={bar.value / maximum} />
+                <BarFill id={`${chartId}:${group.id}:${bar.id}`} fraction={bar.value / maximum}
+                  color={bar.color} />
               </View>
             </View>
           ))}

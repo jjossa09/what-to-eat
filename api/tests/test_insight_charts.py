@@ -51,11 +51,18 @@ def test_i2_distance_odd_even_zero_and_exclusions():
             for i, distance in enumerate((1000, 3000, 8000))]
     body = get(Upstream(rows)).json()
     assert section(body, "distance_by_slot") == {
-        "meal_slot": "dinner", "median_m": 3000, "measured_meal_count": 3}
+        "meal_slot": "dinner", "median_m": 3000, "measured_meal_count": 3,
+        "points": [{"eaten_on": "2026-11-02", "distance_m": 1000},
+                   {"eaten_on": "2026-11-02", "distance_m": 3000},
+                   {"eaten_on": "2026-11-02", "distance_m": 8000}]}
     rows += [row(4, source="live", distance_m=0), row(5), row(6, source="live")]
     body = get(Upstream(rows)).json()
     assert section(body, "distance_by_slot") == {
-        "meal_slot": "dinner", "median_m": 2000, "measured_meal_count": 4}
+        "meal_slot": "dinner", "median_m": 2000, "measured_meal_count": 4,
+        "points": [{"eaten_on": "2026-11-02", "distance_m": 1000},
+                   {"eaten_on": "2026-11-02", "distance_m": 3000},
+                   {"eaten_on": "2026-11-02", "distance_m": 8000},
+                   {"eaten_on": "2026-11-02", "distance_m": 0}]}
     assert body["coverage"]["backfill_distance_meals"] == 1
     assert body["coverage"]["missing_distance_meals"] == 1
 
@@ -178,3 +185,29 @@ def test_company_share_uses_surviving_saved_companions():
     body = get(Upstream([row(1)], companions=(B,))).json()
     assert body["companions"]["with_company_meal_count"] == 0
     assert body["companions"]["coverage"]["unlinked_meals"] == 1
+
+
+def test_distance_points_order_eligibility_privacy_and_unchanged_summary():
+    rows = [row(3, source="live", eaten_on="2026-11-04", distance_m=8000),
+            row(2, source="live", eaten_on="2026-11-02", distance_m=3000),
+            row(1, source="live", eaten_on="2026-11-02", distance_m=1000),
+            row(4, source="live", eaten_on="2026-10-25", distance_m=0),
+            row(5, source="live", went=False, distance_m=20000),
+            row(6, source="live", went=None, distance_m=20000),
+            row(7, distance_m=20000), row(8, source="live"),
+            row(9, source="live", eaten_on="2026-11-05", distance_m=20000),
+            row(10, source="live", slot=None, distance_m=20000)]
+    body = get(Upstream(rows)).json()
+    dinner = section(body, "distance_by_slot")
+    assert dinner == {
+        "meal_slot": "dinner", "median_m": 2000, "measured_meal_count": 4,
+        "points": [{"eaten_on": "2026-10-25", "distance_m": 0},
+                   {"eaten_on": "2026-11-02", "distance_m": 1000},
+                   {"eaten_on": "2026-11-02", "distance_m": 3000},
+                   {"eaten_on": "2026-11-04", "distance_m": 8000}]}
+    reordered = get(Upstream(list(reversed(rows)))).json()["distance_by_slot"]
+    assert reordered == body["distance_by_slot"]
+    assert all(set(p) == {"eaten_on", "distance_m"} for p in dinner["points"])
+    assert all(s["points"] == [] and s["median_m"] is None and s["measured_meal_count"] == 0
+               for s in body["distance_by_slot"] if s["meal_slot"] != "dinner")
+    assert all(s["points"] == [] for s in get(Upstream()).json()["distance_by_slot"])

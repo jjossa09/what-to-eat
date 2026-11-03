@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
   createOpeningMotion, EMPTY_TEXT, loadInsights, localInsightsDate, mapInsights,
-  mealCount, motionConfig, openingRows, withInsightsDeadline,
+  defaultDistanceSlot, formatMiles, mealCount, motionConfig, openingRows, timelineGeometry,
+  timelineRows, withInsightsDeadline,
 } from './insights.ts';
+import { chart, colors } from '../theme.ts';
 
 const A = 'aaaaaaaa-1111-4111-8111-000000000001';
 const DATE = '2026-11-04';
@@ -20,7 +23,7 @@ function response() {
     price_by_slot: SLOTS.map((meal_slot) => ({ meal_slot, missing_meal_count: 0,
       levels: [1, 2, 3, 4].map((level) => ({ level, paid_count: 0, budget_count: 0 })) })),
     food_by_slot: SLOTS.map((meal_slot) => ({ meal_slot, category_meal_count: 0, leaders: [] })),
-    distance_by_slot: SLOTS.map((meal_slot) => ({ meal_slot, measured_meal_count: 0, median_m: null })),
+    distance_by_slot: SLOTS.map((meal_slot) => ({ meal_slot, measured_meal_count: 0, median_m: null, points: [] })),
     top_categories: [], coverage: { unknown_slot_meals: 0, missing_price_meals: 0,
       backfill_distance_meals: 0, missing_distance_meals: 0 },
   };
@@ -39,7 +42,11 @@ function populated() {
   body.price_by_slot[2].missing_meal_count = 2;
   body.coverage.missing_price_meals = 2;
   body.coverage.missing_distance_meals = 2;
-  body.distance_by_slot[2] = { meal_slot: 'dinner', measured_meal_count: 3, median_m: 3000 };
+  body.distance_by_slot[2] = { meal_slot: 'dinner', measured_meal_count: 3, median_m: 3000,
+    points: [{ eaten_on: '2026-11-01', distance_m: 1000 },
+      { eaten_on: '2026-11-02', distance_m: 3000 }, { eaten_on: '2026-11-04', distance_m: 8000 }] };
+  body.companions.companions[0].weekdays = [1, 2, 3, 4, 5, 6, 7].map((iso_day) => ({ iso_day,
+    meal_count: ({ 1: 3, 3: 1, 7: 1 })[iso_day] ?? 0 }));
   return body;
 }
 
@@ -150,24 +157,30 @@ test('Profile most eaten preserves all tied API leaders without recounting meals
 
 test('price slots are 100 percent stacks, keeping paid and budget evidence separate', () => {
   const state = mapInsights(populated(), NAMES, CATEGORIES);
-  assert.equal(state.cards.price.note, 'Includes budgets');
+  assert.equal(state.cards.price.note, undefined);
   const dinner = state.cards.price.groups.find((g) => g.id === 'dinner');
   assert.equal(dinner.detail, '2 missing');
   assert.deepEqual(dinner.bars, []);
   assert.deepEqual(dinner.segments[1], { level: 2, label: '$$', paidCount: 2, budgetCount: 0,
-    fraction: 2 / 3, paidFraction: 1, budgetFraction: 0 });
+    fraction: 2 / 3 });
   assert.deepEqual(dinner.segments[2], { level: 3, label: '$$$', paidCount: 0, budgetCount: 1,
-    fraction: 1 / 3, paidFraction: 0, budgetFraction: 1 });
+    fraction: 1 / 3 });
+  assert.equal(dinner.budgetNote, '1 from budgets');
+  assert.ok(state.cards.price.groups.filter((g) => g.id !== 'dinner').every((g) => g.budgetNote === undefined));
   assert.equal(dinner.segments.reduce((n, s) => n + s.fraction, 0), 1);
 });
 
 test('distance uses the API median, formats miles, and preserves a measured zero', () => {
   const body = populated();
-  body.distance_by_slot[1] = { meal_slot: 'lunch', measured_meal_count: 1, median_m: 0 };
+  body.distance_by_slot[1] = { meal_slot: 'lunch', measured_meal_count: 1, median_m: 0,
+    points: [{ eaten_on: '2026-11-02', distance_m: 0 }] };
   const card = mapInsights(body, NAMES, CATEGORIES).cards.distance;
   assert.equal(card.note, 'Straight-line');
-  assert.deepEqual(card.groups[0].bars.map((b) => b.valueLabel), ['0.0 mi · 1 meal', '1.9 mi · 3 meals']);
-  assert.deepEqual(card.groups[0].bars.map((b) => b.value), [0, 3000]);
+  assert.equal(card.timeline[1].median_m, 0);
+  assert.equal(card.timeline[2].median_m, 3000);
+  assert.equal(card.timeline[1].points[0].distance_m, 0);
+  assert.equal(formatMiles(card.timeline[1].median_m), '0 mi');
+  assert.equal(formatMiles(card.timeline[2].median_m), '1.9 mi');
 });
 
 test('a saved companion with zero meals still has a named zero bar', () => {
@@ -202,21 +215,25 @@ test('empty price slots remain visible with missing counts and no fabricated sta
   assert.equal(card.note, undefined);
 });
 
-test('mixed evidence within a price level retains its internal paid/budget proportions', () => {
+test('mixed evidence uses a solid level segment with a separate per-slot budget count', () => {
   const body = populated();
   body.price_by_slot[2].levels[1].budget_count = 1;
   body.price_by_slot[2].levels[2].budget_count = 0;
-  const segments = mapInsights(body, NAMES, CATEGORIES).cards.price.groups[2].segments;
+  const group = mapInsights(body, NAMES, CATEGORIES).cards.price.groups[2];
+  const segments = group.segments;
   assert.equal(segments[1].fraction, 1);
-  assert.equal(segments[1].paidFraction, 2 / 3);
-  assert.equal(segments[1].budgetFraction, 1 / 3);
+  assert.equal(segments[1].paidCount, 2);
+  assert.equal(segments[1].budgetCount, 1);
+  assert.equal(group.budgetNote, '1 from budgets');
 });
 
 test('the budget note is absent when every price is paid evidence', () => {
   const body = populated();
   body.price_by_slot[2].levels[2].budget_count = 0;
   body.price_by_slot[2].missing_meal_count = 3;
-  assert.equal(mapInsights(body, NAMES, CATEGORIES).cards.price.note, undefined);
+  const card = mapInsights(body, NAMES, CATEGORIES).cards.price;
+  assert.equal(card.note, undefined);
+  assert.ok(card.groups.every((g) => g.budgetNote === undefined));
 });
 
 test('meal counts use singular only for one, including food and distance labels', () => {
@@ -286,7 +303,7 @@ test('opening uses 400 ms bars, 50 ms stagger, and one 500 ms ring', () => {
     [{ id: 'price:dinner', kind: 'bar', index: 0 }]);
   const { motion, calls } = fakeMotion();
   motion.begin(rows, false);
-  const bars = calls.filter((c) => c.config.useNativeDriver);
+  const bars = calls.filter((_, i) => rows[i].kind === 'bar');
   assert.ok(bars.length > 0);
   assert.ok(bars.every((c) => c.config.duration === 400));
   assert.deepEqual(bars.slice(0, 2).map((c) => c.config.delay), [0, 50]);
@@ -331,4 +348,190 @@ test('enabling reduce motion stops active animations at final values without rep
   const count = calls.length;
   motion.begin(rows, false);
   assert.equal(calls.length, count);
+});
+
+test('distance defaults to the most points, with canonical slot order breaking ties', () => {
+  const slots = mapInsights(populated(), NAMES, CATEGORIES).cards.distance.timeline;
+  assert.equal(defaultDistanceSlot(slots), 'dinner');
+  const tied = slots.map((s) => ({ ...s, points: slots[2].points }));
+  assert.equal(defaultDistanceSlot(tied), 'breakfast');
+  assert.equal(defaultDistanceSlot([...tied].reverse()), 'breakfast');
+  assert.equal(defaultDistanceSlot(mapInsights(response(), [], []).cards.distance.timeline), 'breakfast');
+});
+
+test('timeline uses actual calendar-date spacing and keeps the API median', () => {
+  const slot = mapInsights(populated(), NAMES, CATEGORIES).cards.distance.timeline[2];
+  const geometry = timelineGeometry(slot);
+  assert.deepEqual(geometry.points.map((p) => p.x), [0, 1 / 3, 1]);
+  assert.deepEqual(geometry.points.map((p) => p.y), [0.875, 0.625, 0]);
+  assert.equal(geometry.maximum, 8000);
+  assert.equal(geometry.medianY, 0.625);
+  assert.equal(geometry.message, undefined);
+});
+
+test('one date is centered, single points ask for two meals, and zero stays on the baseline', () => {
+  const single = { id: 'lunch', label: 'Lunch', median_m: 0, measured_meal_count: 1,
+    points: [{ eaten_on: DATE, distance_m: 0 }] };
+  const geometry = timelineGeometry(single);
+  assert.equal(geometry.points[0].x, 0.5);
+  assert.equal(geometry.points[0].y, 1);
+  assert.equal(geometry.maximum, 0);
+  assert.equal(geometry.message, '2 meals needed for a trend');
+  const sameDay = timelineGeometry({ ...single, measured_meal_count: 2, median_m: 500,
+    points: [...single.points, { eaten_on: DATE, distance_m: 1000 }] });
+  assert.deepEqual(sameDay.points.map((p) => p.x), [0.5, 0.5]);
+  assert.equal(sameDay.message, undefined);
+  assert.equal(formatMiles(1), '<0.1 mi');
+});
+
+test('empty timelines have no fabricated points, median or positive maximum', () => {
+  const slot = mapInsights(response(), [], []).cards.distance.timeline[0];
+  const geometry = timelineGeometry(slot);
+  assert.equal(slot.median_m, null);
+  assert.deepEqual(geometry.points, []);
+  assert.equal(geometry.maximum, 0);
+  assert.equal(geometry.message, 'No distances yet');
+});
+
+test('timeline phases are axes, trace, Typical; slot switches replay only those phases', () => {
+  const cards = mapInsights(populated(), NAMES, CATEGORIES).cards;
+  const rows = openingRows(cards);
+  const { motion, calls } = fakeMotion();
+  motion.begin(rows, false);
+  const count = calls.length;
+  motion.switchTimeline(3, false);
+  assert.deepEqual(calls.slice(count).map((c) => c.config), [
+    { initial: 0, duration: 200, delay: 0, useNativeDriver: true },
+    { initial: 0, duration: 600, delay: 200, useNativeDriver: false },
+    { initial: 0, duration: 200, delay: 800, useNativeDriver: true },
+  ]);
+  motion.begin(rows, false); // Refreshed data preserves both selection and progress.
+  assert.equal(calls.length, count + 3);
+  motion.switchTimeline(1, false);
+  assert.deepEqual(calls.slice(-2).map((c) => c.config.delay), [0, 200]);
+  const beforeEmpty = calls.length;
+  motion.switchTimeline(0, false);
+  assert.equal(calls.length, beforeEmpty);
+  assert.equal(motion.value('distance:trace').current, 1);
+});
+
+test('Reduce Motion makes every timeline phase final on opening and slot changes', () => {
+  const { motion, calls } = fakeMotion();
+  const rows = timelineRows(3);
+  motion.begin(rows, true);
+  motion.switchTimeline(4, true);
+  assert.equal(calls.length, 0);
+  assert.ok(rows.every((r) => motion.value(r.id).current === 1));
+  assert.ok(rows.every((r) => motionConfig(r, true).duration === 0));
+});
+
+test('budgets are reported per slot with no global note or opacity-based fractions', () => {
+  const body = populated();
+  body.price_by_slot[2].levels[1].paid_count = 1;
+  body.price_by_slot[2].levels[1].budget_count = 1;
+  const card = mapInsights(body, NAMES, CATEGORIES).cards.price;
+  assert.equal(card.note, undefined);
+  assert.equal(card.groups[2].budgetNote, '2 from budgets');
+  assert.ok(card.groups.filter((g) => g.id !== 'dinner').every((g) => !g.budgetNote));
+  assert.ok(card.groups.every((g) => g.segments.every((s) => !('budgetFraction' in s))));
+});
+
+const CATEGORY_IDS = [...readFileSync(new URL('../../api/app/categories.py', import.meta.url), 'utf8')
+  .match(/CATEGORY_IDS[^=]*= \(([\s\S]*?)\)/)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+function channels(hex) {
+  return [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16) / 255);
+}
+function linear(c) { return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }
+function luminance(c) { return c.map(linear).reduce((n, v, i) => n + v * [0.2126, 0.7152, 0.0722][i], 0); }
+function contrast(a, b) {
+  const [low, high] = [luminance(a), luminance(b)].sort((x, y) => x - y);
+  return (high + 0.05) / (low + 0.05);
+}
+function blend(a, b, alpha) { return a.map((v, i) => alpha * v + (1 - alpha) * b[i]); }
+function lab(hex) {
+  const [r, g, b] = channels(hex).map(linear);
+  const xyz = [(0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047,
+    0.2126729 * r + 0.7151522 * g + 0.0721750 * b,
+    (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883];
+  const [x, y, z] = xyz.map((v) => v > (6 / 29) ** 3 ? Math.cbrt(v) : v / (3 * (6 / 29) ** 2) + 4 / 29);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+
+// CIEDE2000, independently checked against the published Sharma reference pair below.
+function deltaE00([l1, a1, b1], [l2, a2, b2]) {
+  const rad = (d) => d * Math.PI / 180;
+  const cos = (d) => Math.cos(rad(d));
+  const sin = (d) => Math.sin(rad(d));
+  const cm = (Math.hypot(a1, b1) + Math.hypot(a2, b2)) / 2;
+  const g = 0.5 * (1 - Math.sqrt(cm ** 7 / (cm ** 7 + 25 ** 7)));
+  const ap1 = (1 + g) * a1, ap2 = (1 + g) * a2;
+  const cp1 = Math.hypot(ap1, b1), cp2 = Math.hypot(ap2, b2);
+  const hp1 = (Math.atan2(b1, ap1) * 180 / Math.PI + 360) % 360;
+  const hp2 = (Math.atan2(b2, ap2) * 180 / Math.PI + 360) % 360;
+  let dh = hp2 - hp1;
+  if (cp1 * cp2 === 0) dh = 0;
+  else if (dh > 180) dh -= 360;
+  else if (dh < -180) dh += 360;
+  const dhp = 2 * Math.sqrt(cp1 * cp2) * sin(dh / 2);
+  const lm = (l1 + l2) / 2, cpm = (cp1 + cp2) / 2;
+  let hm;
+  if (cp1 * cp2 === 0) hm = hp1 + hp2;
+  else if (Math.abs(hp1 - hp2) <= 180) hm = (hp1 + hp2) / 2;
+  else if (hp1 + hp2 < 360) hm = (hp1 + hp2 + 360) / 2;
+  else hm = (hp1 + hp2 - 360) / 2;
+  const t = 1 - 0.17 * cos(hm - 30) + 0.24 * cos(2 * hm)
+    + 0.32 * cos(3 * hm + 6) - 0.20 * cos(4 * hm - 63);
+  const sl = 1 + 0.015 * (lm - 50) ** 2 / Math.sqrt(20 + (lm - 50) ** 2);
+  const sc = 1 + 0.045 * cpm, sh = 1 + 0.015 * cpm * t;
+  const rt = -2 * Math.sqrt(cpm ** 7 / (cpm ** 7 + 25 ** 7))
+    * sin(60 * Math.exp(-(((hm - 275) / 25) ** 2)));
+  const dl = (l2 - l1) / sl, dc = (cp2 - cp1) / sc, dH = dhp / sh;
+  return Math.sqrt(dl * dl + dc * dc + dH * dH + rt * dc * dH);
+}
+
+test('the CIEDE2000 check matches a published reference pair', () => {
+  assert.ok(Math.abs(deltaE00([50, 2.6772, -79.7751], [50, 0, -82.7485]) - 2.0425) < 0.0001);
+});
+
+test('all 25 category IDs have unique fixed colors shared by both category charts', () => {
+  assert.equal(CATEGORY_IDS.length, 25);
+  assert.deepEqual(Object.keys(chart.categories), CATEGORY_IDS);
+  assert.equal(new Set(Object.values(chart.categories)).size, 25);
+  const body = response();
+  body.summary = { meal_count: 25, category_meal_count: 25 };
+  body.top_categories = CATEGORY_IDS.map((category_id) => ({ category_id, meal_count: 1 }));
+  body.food_by_slot[2] = { meal_slot: 'dinner', category_meal_count: 25, leaders: body.top_categories };
+  const cards = mapInsights(body, [], CATEGORIES, chart.categories).cards;
+  assert.deepEqual(cards.top.groups[0].bars.map((b) => b.color),
+    cards.food.groups[2].bars.map((b) => b.color));
+  for (const bar of cards.top.groups[0].bars) assert.equal(bar.color, chart.categories[bar.id]);
+});
+
+test('canonical neighbors stay separated by deltaE00 25 and every common-category pair reaches 20', () => {
+  for (let i = 1; i < CATEGORY_IDS.length; i++) {
+    assert.ok(deltaE00(lab(chart.categories[CATEGORY_IDS[i - 1]]), lab(chart.categories[CATEGORY_IDS[i]])) >= 25);
+  }
+  const common = ['chinese', 'mexican', 'chicken_wings', 'burgers', 'sandwiches'];
+  for (let i = 0; i < common.length; i++) {
+    for (const other of common.slice(i + 1)) {
+      const difference = deltaE00(lab(chart.categories[common[i]]), lab(chart.categories[other]));
+      assert.ok(difference >= 20, `${common[i]} vs ${other}: ${difference}`);
+    }
+  }
+});
+
+test('all chart marks meet 3:1 contrast and price levels deepen from light to dark', () => {
+  const glass = colors.glass.match(/[\d.]+/g).map(Number);
+  const white = glass.slice(0, 3).map((v) => v / 255);
+  const backgrounds = [...colors.gradient.map((c) => blend(white, channels(c), glass[3])), white];
+  for (const bg of backgrounds) {
+    for (const c of [...Object.values(chart.categories), ...chart.price, chart.accent, chart.neutral]) {
+      assert.ok(contrast(channels(c), bg) >= 3, `${c} contrast below 3`);
+    }
+    assert.ok(contrast(channels(chart.accent), blend(channels(chart.accent), bg, chart.areaOpacity)) >= 3);
+  }
+  for (let i = 1; i < chart.price.length; i++) {
+    assert.ok(luminance(channels(chart.price[i - 1])) > luminance(channels(chart.price[i])));
+  }
 });

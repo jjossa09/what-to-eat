@@ -13,6 +13,7 @@ export const INSIGHTS_TIMEOUT_MS = 5_000;
 
 export type InsightCategory = { category_id: string; meal_count: number };
 export type InsightSlot = 'breakfast' | 'lunch' | 'dinner' | 'late';
+export type DistancePoint = { eaten_on: string; distance_m: number };
 export type InsightCompanion = {
   companion_id: string;
   meal_count: number;
@@ -47,6 +48,7 @@ export type InsightsResponse = {
     meal_slot: InsightSlot;
     measured_meal_count: number;
     median_m: number | null;
+    points: DistancePoint[];
   }[];
   top_categories: InsightCategory[];
   coverage: {

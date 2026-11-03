@@ -1,5 +1,6 @@
-import { useFocusEffect } from '@react-navigation/native';
-import { type ReactNode, useCallback, useRef, useState } from 'react';
+import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Chip, GlassCard, GlassScreen, PrimaryButton, SecondaryButton, useTabBarSpace } from '../components/ui';
@@ -15,7 +16,7 @@ import {
   loadTastePrior,
   type TastePrior,
 } from '../lib/profile';
-import { colors, emojiFor, spacing, type } from '../theme';
+import { chart, colors, emojiFor, spacing, type } from '../theme';
 import InsightsScreen from './InsightsScreen';
 
 // Read-only profile (P1-22). Editing is a later ticket.
@@ -49,12 +50,14 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
   const [insights, setInsights] = useState<InsightsState>({ status: 'loading' });
   const [showInsights, setShowInsights] = useState(false);
   const insightRequest = useRef(0);
+  const navigation = useNavigation<BottomTabNavigationProp<{ Profile: undefined }>>();
+  useEffect(() => navigation.addListener('tabPress', () => setShowInsights(false)), [navigation]);
 
   const refreshInsights = useCallback(async (categories: Category[]) => {
     const requestId = ++insightRequest.current;
     setInsights({ status: 'loading' });
     const state = await loadInsights(localInsightsDate(), getInsights,
-      () => loadCompanionChoices(userId), categories);
+      () => loadCompanionChoices(userId), categories, chart.categories);
     if (requestId === insightRequest.current) setInsights(state);
   }, [userId]);
 

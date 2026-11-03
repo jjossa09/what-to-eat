@@ -1,11 +1,11 @@
 import { Animated, StyleSheet, Text, View } from 'react-native';
 
 import type { InsightGroup } from '../../lib/insights';
-import { colors, radii, spacing, type } from '../../theme';
+import { chart, colors, radii, spacing, type } from '../../theme';
 import { ChartCard, type ChartProps } from './BarChart';
 import { useOpeningProgress } from './OpeningMotion';
 
-const LEVEL_COLORS = [colors.text, colors.textSecondary, colors.accentDark, colors.accentLight];
+const LEVEL_COLORS = chart.price;
 
 function SlotBar({ group }: { group: InsightGroup }) {
   const progress = useOpeningProgress(`price:${group.id}`);
@@ -24,13 +24,14 @@ function SlotBar({ group }: { group: InsightGroup }) {
     <View style={styles.track} accessibilityElementsHidden>
       <Animated.View style={[styles.stack, { transform: [{ scaleX: progress }] }]}>
         {segments.filter((s) => s.fraction > 0).map((s) => (
-          <View key={s.level} style={[styles.segment, { width: `${100 * s.fraction}%` }]}>
-            <View style={{ width: `${100 * s.paidFraction}%`, backgroundColor: LEVEL_COLORS[s.level - 1] }} />
-            <View style={{ width: `${100 * s.budgetFraction}%`, backgroundColor: LEVEL_COLORS[s.level - 1], opacity: 0.35 }} />
-          </View>
+          <View key={s.level} style={[styles.segment,
+            { width: `${100 * s.fraction}%`, backgroundColor: LEVEL_COLORS[s.level - 1] }]} />
         ))}
       </Animated.View>
     </View>
+    <Text style={styles.muted}>{segments.filter((s) => s.fraction > 0)
+      .map((s) => `${s.label} ${s.paidCount + s.budgetCount}`).join(' · ')}</Text>
+    {group.budgetNote && <Text style={styles.muted}>{group.budgetNote}</Text>}
   </View>;
 }
 
@@ -53,7 +54,7 @@ const styles = StyleSheet.create({
   muted: { color: colors.textSecondary, fontSize: type.caption },
   track: { height: spacing.md, borderRadius: radii.pill, overflow: 'hidden', backgroundColor: colors.hairline },
   stack: { width: '100%', height: '100%', flexDirection: 'row', transformOrigin: 'left center' },
-  segment: { height: '100%', flexDirection: 'row' },
+  segment: { height: '100%', borderEndWidth: 2, borderColor: chart.separator },
   legend: { flexDirection: 'row', justifyContent: 'space-between', gap: spacing.sm },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   swatch: { width: spacing.sm, height: spacing.sm, borderRadius: spacing.xs },

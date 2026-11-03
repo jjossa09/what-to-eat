@@ -2,7 +2,7 @@ import { Animated, StyleSheet, Text, View } from 'react-native';
 import Svg, { Circle } from 'react-native-svg';
 
 import type { CompanyRing } from '../../lib/insights';
-import { colors, spacing, type } from '../../theme';
+import { chart, colors, spacing, type } from '../../theme';
 import { useOpeningProgress } from './OpeningMotion';
 
 const AnimatedCircle = Animated.createAnimatedComponent(Circle);
@@ -19,7 +19,7 @@ export default function CompanyShareRing({ data }: { data: CompanyRing }) {
     <Svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`} accessibilityElementsHidden>
       <Circle cx={SIZE / 2} cy={SIZE / 2} r={RADIUS} stroke={colors.hairline}
         strokeWidth={STROKE} fill={colors.transparent} />
-      <AnimatedCircle cx={SIZE / 2} cy={SIZE / 2} r={RADIUS} stroke={colors.textSecondary}
+      <AnimatedCircle cx={SIZE / 2} cy={SIZE / 2} r={RADIUS} stroke={chart.accent}
         strokeWidth={STROKE} fill={colors.transparent}
         strokeDasharray={[CIRCUMFERENCE, CIRCUMFERENCE]} strokeDashoffset={offset}
         transform={`rotate(-90 ${SIZE / 2} ${SIZE / 2})`} />

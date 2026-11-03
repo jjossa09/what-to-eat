@@ -1,7 +1,8 @@
-import { createContext, type ReactNode, useContext, useEffect, useState } from 'react';
+import { createContext, type ReactNode, useContext, useEffect, useMemo, useState } from 'react';
 import { AccessibilityInfo, Animated, Easing } from 'react-native';
 
 import { createOpeningMotion, type InsightCards, openingRows } from '../../lib/insights';
+import type { InsightSlot } from '../../lib/api';
 
 function createMotion() {
   return createOpeningMotion({
@@ -19,10 +20,14 @@ function createMotion() {
   });
 }
 
-const Context = createContext<ReturnType<typeof createMotion> | null>(null);
+const Context = createContext<{
+  motion: ReturnType<typeof createMotion>; reduceMotion: boolean | null;
+} | null>(null);
 
 /** Mount once per opening, outside loading/refresh branches. No scroll-triggered work. */
-export function OpeningMotion({ cards, children }: { cards?: InsightCards; children: ReactNode }) {
+export function OpeningMotion({ cards, selectedSlot, children }: {
+  cards?: InsightCards; selectedSlot?: InsightSlot; children: ReactNode;
+}) {
   const [motion] = useState(createMotion);
   const [reduceMotion, setReduceMotion] = useState<boolean | null>(null);
   useEffect(() => {
@@ -39,15 +44,25 @@ export function OpeningMotion({ cards, children }: { cards?: InsightCards; child
   }, []);
   useEffect(() => {
     if (reduceMotion === true) motion.finish();
-    if (cards && reduceMotion !== null) motion.begin(openingRows(cards), reduceMotion);
-  }, [cards, motion, reduceMotion]);
+    if (cards && reduceMotion !== null) motion.begin(openingRows(cards, selectedSlot), reduceMotion);
+  }, [cards, motion, reduceMotion, selectedSlot]);
   useEffect(() => () => motion.finish(), [motion]);
-  return <Context.Provider value={motion}>{children}</Context.Provider>;
+  const context = useMemo(() => ({ motion, reduceMotion }), [motion, reduceMotion]);
+  return <Context.Provider value={context}>{children}</Context.Provider>;
 }
 
 /** Reusable charts render final values when used without an opening provider, e.g. chat. */
 export function useOpeningProgress(id: string): Animated.Value {
-  const motion = useContext(Context);
+  const context = useContext(Context);
   const [final] = useState(() => new Animated.Value(1));
-  return motion ? motion.value(id) : final;
+  return context ? context.motion.value(id) : final;
+}
+
+export function useTimelineSwitch() {
+  const context = useContext(Context);
+  return (pointCount: number) => {
+    if (context && context.reduceMotion !== null) {
+      context.motion.switchTimeline(pointCount, context.reduceMotion);
+    }
+  };
 }

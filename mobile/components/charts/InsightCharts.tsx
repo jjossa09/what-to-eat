@@ -1,6 +1,8 @@
 import BarChart, { type ChartProps } from './BarChart';
 import CompanyShareRing from './CompanyShareRing';
 import PriceDistributionChart from './PriceDistributionChart';
+import DistanceTimelineChart from './DistanceTimelineChart';
+import type { InsightSlot } from '../../lib/api';
 
 export function TopCategoriesChart(props: ChartProps) {
   return <BarChart title="Top categories" chartId="top" {...props} />;
@@ -14,8 +16,10 @@ export function PriceBySlotChart(props: ChartProps) {
   return <PriceDistributionChart {...props} />;
 }
 
-export function MealDistanceChart(props: ChartProps) {
-  return <BarChart title="Meal distance" chartId="distance" {...props} />;
+export function MealDistanceChart(props: ChartProps & {
+  selectedSlot: InsightSlot; onSlotChange: (slot: InsightSlot) => void;
+}) {
+  return <DistanceTimelineChart {...props} />;
 }
 
 export function CompanionMealsChart(props: ChartProps) {

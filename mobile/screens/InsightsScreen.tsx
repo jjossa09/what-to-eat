@@ -1,6 +1,6 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useFocusEffect } from '@react-navigation/native';
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, BackHandler, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
 import {
@@ -9,13 +9,20 @@ import {
 import { OpeningMotion } from '../components/charts/OpeningMotion';
 import ScrollWithBar from '../components/ScrollWithBar';
 import { GlassScreen, PrimaryButton, ScreenTitle, TextLink, useTabBarSpace } from '../components/ui';
-import type { InsightsState } from '../lib/insights';
+import { defaultDistanceSlot, type InsightsState } from '../lib/insights';
+import type { InsightSlot } from '../lib/api';
 import { colors, spacing, type } from '../theme';
 
 export default function InsightsScreen({ state, onClose, onRefresh }: {
   state: InsightsState; onClose: () => void; onRefresh: () => void;
 }) {
   const space = useTabBarSpace();
+  const [selectedSlot, setSelectedSlot] = useState<InsightSlot | null>(null);
+  const activeSlot = selectedSlot ?? (state.status === 'ready'
+    ? defaultDistanceSlot(state.cards.distance.timeline ?? []) : 'breakfast');
+  useEffect(() => {
+    if (state.status === 'ready' && selectedSlot === null) setSelectedSlot(activeSlot);
+  }, [activeSlot, selectedSlot, state]);
   useFocusEffect(useCallback(() => {
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
       onClose();
@@ -24,7 +31,7 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
     return () => subscription.remove();
   }, [onClose]));
   return (
-    <OpeningMotion cards={state.status === 'ready' ? state.cards : undefined}>
+    <OpeningMotion cards={state.status === 'ready' ? state.cards : undefined} selectedSlot={activeSlot}>
     <GlassScreen tabBar>
       <View style={styles.header}>
         <Pressable accessibilityRole="button" accessibilityLabel="Back to Profile"
@@ -47,7 +54,8 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
         <TopCategoriesChart data={state.cards.top} />
         <FoodBySlotChart data={state.cards.food} />
         <PriceBySlotChart data={state.cards.price} />
-        <MealDistanceChart data={state.cards.distance} />
+        <MealDistanceChart data={state.cards.distance} selectedSlot={activeSlot}
+          onSlotChange={setSelectedSlot} />
         <CompanionMealsChart data={state.cards.companions} />
         {state.cards.companions.unavailable && <TextLink label="Retry names" onPress={onRefresh} />}
       </ScrollWithBar>}

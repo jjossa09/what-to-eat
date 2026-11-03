@@ -31,6 +31,9 @@ def aggregate(meals: Iterable[Meal], as_of: date) -> dict:
         maximum = max(slot_food.values(), default=0)
         measured = [m.distance_m for m in slot_meals
                     if m.source == "live" and m.distance_m is not None]
+        points = [{"eaten_on": m.eaten_on.isoformat(), "distance_m": m.distance_m}
+                  for m in sorted(slot_meals, key=lambda m: (m.eaten_on, m.id))
+                  if m.source == "live" and m.distance_m is not None]
         prices.append({"meal_slot": slot, "levels": [
             {"level": level, "paid_count": paid[level], "budget_count": budgets[level]}
             for level in LEVELS],
@@ -41,7 +44,7 @@ def aggregate(meals: Iterable[Meal], as_of: date) -> dict:
                                   for cat in CATEGORY_IDS
                                   if slot_food[cat] == maximum and maximum]})
         distances.append({"meal_slot": slot, "measured_meal_count": len(measured),
-                          "median_m": median(measured) if measured else None})
+                          "median_m": median(measured) if measured else None, "points": points})
     return {
         "summary": {"meal_count": len(visits), "category_meal_count": len(food)},
         "price_by_slot": prices,
