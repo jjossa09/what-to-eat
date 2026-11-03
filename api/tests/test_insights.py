@@ -269,7 +269,7 @@ def test_t11_response_and_queries_exclude_names_dishes_and_messages():
     body = response.json()
     assert set(body) == {"complete", "cutoff_date", "companions", "summary", "price_by_slot",
                          "food_by_slot", "distance_by_slot", "top_categories", "coverage"}
-    assert set(body["companions"]) == {"companions", "coverage"}
+    assert set(body["companions"]) == {"companions", "coverage", "with_company_meal_count"}
     assert set(companion(body)) == {
         "companion_id", "meal_count", "category_meal_count", "source_counts", "weekdays",
         "categories", "leading_day_ids", "leading_category_ids", "pattern_status",

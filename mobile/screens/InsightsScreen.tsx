@@ -1,29 +1,45 @@
-import { ActivityIndicator, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { useFocusEffect } from '@react-navigation/native';
+import { useCallback } from 'react';
+import { ActivityIndicator, BackHandler, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
 import {
   CompanionMealsChart, FoodBySlotChart, MealDistanceChart, PriceBySlotChart, TopCategoriesChart,
 } from '../components/charts/InsightCharts';
+import { OpeningMotion } from '../components/charts/OpeningMotion';
 import ScrollWithBar from '../components/ScrollWithBar';
-import { GlassScreen, PrimaryButton, ScreenTitle, TextLink } from '../components/ui';
+import { GlassScreen, PrimaryButton, ScreenTitle, TextLink, useTabBarSpace } from '../components/ui';
 import type { InsightsState } from '../lib/insights';
 import { colors, spacing, type } from '../theme';
 
 export default function InsightsScreen({ state, onClose, onRefresh }: {
   state: InsightsState; onClose: () => void; onRefresh: () => void;
 }) {
+  const space = useTabBarSpace();
+  useFocusEffect(useCallback(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      onClose();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [onClose]));
   return (
-    <GlassScreen>
+    <OpeningMotion cards={state.status === 'ready' ? state.cards : undefined}>
+    <GlassScreen tabBar>
       <View style={styles.header}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Back to Profile"
+          hitSlop={spacing.sm} onPress={onClose} style={styles.back}>
+          <Ionicons name="chevron-back" size={spacing.xxl} color={colors.text} />
+        </Pressable>
         <ScreenTitle>Insights</ScreenTitle>
-        <TextLink label="Close" onPress={onClose} />
       </View>
-      {state.status === 'loading' ? <View style={styles.center}>
+      {state.status === 'loading' ? <View style={[styles.center, { paddingBottom: space }]}>
         <ActivityIndicator color={colors.textSecondary} accessibilityLabel="Loading insights" />
-      </View> : state.status === 'unavailable' ? <View style={styles.center}>
+      </View> : state.status === 'unavailable' ? <View style={[styles.center, { paddingBottom: space }]}>
         <Text style={styles.note}>Insights unavailable</Text>
         <PrimaryButton label="Retry" onPress={onRefresh} />
       </View> : <ScrollWithBar
-        contentContainerStyle={styles.scroll}
+        contentContainerStyle={[styles.scroll, { paddingBottom: space }]}
         refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} tintColor={colors.textSecondary} />}
       >
         {state.note && <Text accessibilityLiveRegion="polite" style={styles.note}>{state.note}</Text>}
@@ -36,11 +52,13 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
         {state.cards.companions.unavailable && <TextLink label="Retry names" onPress={onRefresh} />}
       </ScrollWithBar>}
     </GlassScreen>
+    </OpeningMotion>
   );
 }
 
 const styles = StyleSheet.create({
-  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: spacing.lg },
+  header: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.lg },
+  back: { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
   center: { flex: 1, justifyContent: 'center', gap: spacing.lg },
   scroll: { gap: spacing.lg, paddingBottom: spacing.lg },
   note: { color: colors.textSecondary, fontSize: type.small },

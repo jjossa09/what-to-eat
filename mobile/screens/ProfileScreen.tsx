@@ -1,6 +1,6 @@
 import { useFocusEffect } from '@react-navigation/native';
 import { type ReactNode, useCallback, useRef, useState } from 'react';
-import { ActivityIndicator, Modal, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { Chip, GlassCard, GlassScreen, PrimaryButton, SecondaryButton, useTabBarSpace } from '../components/ui';
 import { getInsights } from '../lib/api';
@@ -109,6 +109,11 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
     );
   }
 
+  if (showInsights) {
+    return <InsightsScreen state={insights} onClose={() => setShowInsights(false)}
+      onRefresh={() => { void refreshInsights(data.categories); }} />;
+  }
+
   const names = new Map(data.categories.map((c) => [c.id, c.name]));
   const budget = BUDGETS.find((b) => b.level === data.prior.budget);
   const usually =
@@ -163,11 +168,6 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
         <SecondaryButton label="Insights" onPress={() => setShowInsights(true)} />
         <PrimaryButton label="Sign out" onPress={onSignOut} />
       </ScrollView>
-      <Modal visible={showInsights} animationType="slide" presentationStyle="fullScreen"
-        onRequestClose={() => setShowInsights(false)}>
-        <InsightsScreen state={insights} onClose={() => setShowInsights(false)}
-          onRefresh={() => { void refreshInsights(data.categories); }} />
-      </Modal>
     </GlassScreen>
   );
 }

@@ -152,3 +152,29 @@ def test_cutoff_inclusive_and_empty_sections():
     assert empty["summary"] == {"meal_count": 0, "category_meal_count": 0}
     assert empty["top_categories"] == []
     assert all(s["median_m"] is None for s in empty["distance_by_slot"])
+
+
+def test_company_share_counts_visits_once_excludes_contradictions_and_uses_cutoff():
+    rows = [row(i, meal_companions=[]) for i in range(1, 27)]
+    for i, companions in enumerate(((A, B), (A, B), (A,), (B,))):
+        rows[i]["meal_companions"] = [{"companion_id": cid} for cid in companions]
+    rows[4] = row(5, source="live")
+    rows[5] = row(6, solo=True)  # Contradictory visit stays in the visit total, not company.
+    rows[6] = row(7, solo=True, meal_companions=[])
+    rows[7] = row(8, source="live", eaten_on="2026-11-04", meal_companions=[])
+    rows += [row(30, source="live", went=None), row(31, source="live", went=False),
+             row(32, eaten_on="2026-11-05")]
+    body = get(Upstream(rows, companions=(A, B))).json()
+    assert body["summary"]["meal_count"] == 26
+    assert body["companions"]["with_company_meal_count"] == 5
+    people = {c["companion_id"]: c["meal_count"] for c in body["companions"]["companions"]}
+    assert people == {A: 4, B: 3}  # Summing participation would incorrectly give seven.
+    assert body["companions"]["coverage"] == {
+        "unlinked_meals": 20, "contradictory_company_meals": 1}
+    assert get(Upstream()).json()["companions"]["with_company_meal_count"] == 0
+
+
+def test_company_share_uses_surviving_saved_companions():
+    body = get(Upstream([row(1)], companions=(B,))).json()
+    assert body["companions"]["with_company_meal_count"] == 0
+    assert body["companions"]["coverage"]["unlinked_meals"] == 1

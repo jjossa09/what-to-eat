@@ -30,6 +30,7 @@ export type InsightsResponse = {
   summary: { meal_count: number; category_meal_count: number };
   companions: {
     companions: InsightCompanion[];
+    with_company_meal_count: number;
     coverage: { unlinked_meals: number; contradictory_company_meals: number };
   };
   price_by_slot: {
