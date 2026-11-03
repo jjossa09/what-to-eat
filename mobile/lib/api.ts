@@ -1,5 +1,8 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
 import { supabase } from './supabase';
 import { withInsightsDeadline } from './insights';
+import { loadTakeaway, requestTakeaway, type TakeawayResult } from './takeaway';
 
 // Our own API (EXPO_PUBLIC_API_URL). Every call carries the user's Supabase JWT.
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
@@ -10,6 +13,32 @@ const TIMEOUT_MS = 20_000;
 // order (P2-05). History only, so it is fast when the API is warm.
 export const PLAN_TIMEOUT_MS = 5_000;
 export const INSIGHTS_TIMEOUT_MS = 5_000;
+export const TAKEAWAY_TIMEOUT_MS = 12_000;
+
+export type TakeawayResponse = {
+  source: 'muse' | 'template' | 'none'; line: string | null;
+  companion_refs: { placeholder: string; companion_id: string }[];
+};
+
+/** Independent of chart loading. Only the cutoff date is uploaded. */
+export async function getInsightsTakeaway(
+  stats: InsightsResponse, saved: readonly { id: string; name: string }[],
+): Promise<TakeawayResult> {
+  try {
+    return await withInsightsDeadline(async (signal) => {
+      const { data } = await supabase.auth.getSession();
+      const session = data.session;
+      if (!session || !API_URL || signal.aborted) throw new ApiError('auth');
+      return await loadTakeaway({ user: session.user.id, date: stats.cutoff_date, stats, saved,
+        storage: AsyncStorage, request: () => requestTakeaway(
+          `${API_URL.replace(/\/$/, '')}/insights/takeaway`, session.access_token,
+          stats.cutoff_date, signal,
+        ) });
+    }, TAKEAWAY_TIMEOUT_MS);
+  } catch {
+    return { source: 'none', line: null, cached: false };
+  }
+}
 
 export type InsightCategory = { category_id: string; meal_count: number };
 export type InsightSlot = 'breakfast' | 'lunch' | 'dinner' | 'late';

@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from time import perf_counter
+from uuid import uuid4
 
 import httpx2
 
@@ -136,22 +138,26 @@ class DailyCap:
         self.count = 0
 
     def take(self, limit: int, today: date) -> bool:
-        if today != self.day:
-            self.day, self.count = today, 0
-        if self.count >= limit:
+        if not self.available(limit, today):
             return False
         self.count += 1
         return True
 
+    def available(self, limit: int, today: date) -> bool:
+        if today != self.day:
+            self.day, self.count = today, 0
+        return self.count < limit
+
 
 daily_cap = DailyCap()
+takeaway_cap = DailyCap()
 
 
 @dataclass(frozen=True)
 class Usage:
     prompt_tokens: int
     completion_tokens: int
-    reasoning_tokens: int
+    reasoning_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -316,11 +322,21 @@ def parse_usage(body: dict) -> Usage | None:
     usage = body.get("usage")
     if not isinstance(usage, dict):
         return None
-    details = usage.get("completion_tokens_details") or {}
+    def count(value):
+        return type(value) is int and value >= 0
+
+    if not all(count(usage.get(k)) for k in ("prompt_tokens", "completion_tokens")):
+        return None
+    details = usage.get("completion_tokens_details")
+    if details is not None and not isinstance(details, dict):
+        return None
+    reasoning = details.get("reasoning_tokens") if details is not None else None
+    if reasoning is not None and not count(reasoning):
+        return None
     return Usage(
-        prompt_tokens=int(usage.get("prompt_tokens") or 0),
-        completion_tokens=int(usage.get("completion_tokens") or 0),
-        reasoning_tokens=int(details.get("reasoning_tokens") or 0),
+        prompt_tokens=usage["prompt_tokens"],
+        completion_tokens=usage["completion_tokens"],
+        reasoning_tokens=reasoning,
     )
 
 
@@ -336,56 +352,129 @@ def usage_note(usage: Usage | None) -> str:
 # Call ------------------------------------------------------------------------
 
 
+@dataclass
+class CallTelemetry:
+    """Only operational metadata; one row including the caller's validation result."""
+
+    call_type: str
+    effective_timeout_s: float
+    token_cap: int
+    correlation_id: str = field(default_factory=lambda: str(uuid4()))
+    started: float = field(default_factory=perf_counter)
+    status: int | None = None
+    failure_class: str | None = None
+    finish_reason: str | None = None
+    usage: Usage | None = None
+    emitted: bool = False
+
+    def emit(self, validation_outcome: str) -> None:
+        if self.emitted:
+            return
+        self.emitted = True
+        row = {
+            "call_type": self.call_type, "correlation_id": self.correlation_id,
+            "model": MODEL, "effort": REASONING_EFFORT, "token_cap": self.token_cap,
+            "effective_timeout_s": self.effective_timeout_s,
+            "elapsed_ms": round((perf_counter() - self.started) * 1000, 1),
+            "status": self.status, "failure_class": self.failure_class,
+            "finish_reason": self.finish_reason, "validation_outcome": validation_outcome,
+            "prompt_tokens": self.usage.prompt_tokens if self.usage else None,
+            "completion_tokens": self.usage.completion_tokens if self.usage else None,
+            "reasoning_tokens": self.usage.reasoning_tokens if self.usage else None,
+        }
+        try:
+            logger.info("Muse call: %s", json.dumps(row, separators=(",", ":")))
+        except Exception:
+            pass  # Secondary telemetry must never fail the request.
+
+
 @dataclass(frozen=True)
 class Reply:
     content: object  # the message content; checked by the caller
     finish_reason: str | None
     usage: Usage | None
+    telemetry: CallTelemetry | None = None
 
 
-async def call(body: dict, *, client: httpx2.AsyncClient) -> Reply | None:
+def validation_done(reply: Reply, outcome: str) -> None:
+    if reply.telemetry is not None:
+        reply.telemetry.emit(outcome)
+
+
+async def call(
+    body: dict, *, client: httpx2.AsyncClient, call_type: str = "reasons",
+    timeout_s: float | None = None,
+) -> Reply | None:
     """One chat completion, shared by reasons and answer parsing (app/answers.py).
 
     None on any failure (not configured, daily cap, timeout, HTTP error, unreadable body),
     with a short warning. Never logs the key, the request, or the response text.
     """
     settings = get_settings()
+    cap = {"reasons": min(5.0, settings.MUSE_TIMEOUT_S),
+           "parse": min(5.0, settings.MUSE_PARSE_TIMEOUT_S),
+           "takeaway": min(8.0, settings.MUSE_TAKEAWAY_TIMEOUT_S)}[call_type]
+    timeout = max(0.0, min(cap, timeout_s)) if timeout_s is not None else max(0.0, cap)
+    trace = CallTelemetry(call_type, timeout, body["max_completion_tokens"])
+
+    def failed(code: str):
+        trace.failure_class = code
+        trace.emit("not_run")
+        return None
+
+    if timeout <= 0:
+        return failed("RoundDeadline")
     try:
         api_key = settings.require("META_API_KEY")
     except MissingSettingError:
         logger.warning("Muse is not configured")
-        return None
-    if not daily_cap.take(settings.MUSE_DAILY_CAP, datetime.now(UTC).date()):
+        return failed("NotConfigured")
+    today = datetime.now(UTC).date()
+    if call_type == "takeaway" and not takeaway_cap.available(
+        min(10, settings.MUSE_TAKEAWAY_DAILY_CAP), today
+    ):
+        return failed("TakeawayCap")
+    if not daily_cap.take(settings.MUSE_DAILY_CAP, today):
         logger.warning("Muse daily cap reached")
-        return None
+        return failed("DailyCap")
+    if call_type == "takeaway":
+        takeaway_cap.take(min(10, settings.MUSE_TAKEAWAY_DAILY_CAP), today)
 
     # Exceptions are dropped without their message: it can echo request details.
     try:
-        async with asyncio.timeout(settings.MUSE_TIMEOUT_S):  # total, not per phase
+        async with asyncio.timeout(timeout):  # total, not per phase; includes the body read
             response = await client.post(
                 MUSE_URL,
                 json=body,
                 headers={"Authorization": f"Bearer {api_key}"},
-                timeout=settings.MUSE_TIMEOUT_S,
+                timeout=timeout,
             )
-    except (TimeoutError, httpx2.TimeoutException):
+    except (TimeoutError, httpx2.TimeoutException) as error:
         logger.warning("Muse timed out")
-        return None
+        return failed(type(error).__name__)
     except httpx2.HTTPError:
         logger.warning("Muse request failed")
-        return None
+        return failed("HTTPError")
+    except asyncio.CancelledError:
+        failed("Cancelled")
+        raise
+    trace.status = response.status_code
     if response.status_code != 200:
         logger.warning("Muse returned status %s", response.status_code)
-        return None
+        return failed("HTTPStatus")
     try:
         data = response.json()
+        trace.usage = parse_usage(data) if isinstance(data, dict) else None
         choice = data["choices"][0]
         content = choice["message"]["content"]
         finish_reason = choice.get("finish_reason")
     except (ValueError, KeyError, IndexError, TypeError):
         logger.warning("Muse returned an unreadable body")
-        return None
-    return Reply(content, finish_reason, parse_usage(data) if isinstance(data, dict) else None)
+        return failed("UnreadableBody")
+    trace.finish_reason = finish_reason if finish_reason in (
+        "stop", "length", "content_filter", "tool_calls", "function_call", None
+    ) else "other"
+    return Reply(content, finish_reason, trace.usage, trace)
 
 
 def rejection_note(content, finish_reason: str | None, usage: Usage | None) -> str:
@@ -397,7 +486,9 @@ def rejection_note(content, finish_reason: str | None, usage: Usage | None) -> s
     )
 
 
-async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) -> Reasons:
+async def write_reasons(
+    picks: tuple[Pick, ...], *, client: httpx2.AsyncClient, timeout_s: float | None = None,
+) -> Reasons:
     """One Muse call for all picks. Any failure gives the template reasons, never an error."""
     templates = tuple(template_reason(p) for p in picks)
 
@@ -406,7 +497,7 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
 
     if not picks:
         return fallback()
-    reply = await call(request_body(picks), client=client)
+    reply = await call(request_body(picks), client=client, timeout_s=timeout_s)
     if reply is None:
         return fallback()
     content, finish_reason, usage = reply.content, reply.finish_reason, reply.usage
@@ -419,7 +510,9 @@ async def write_reasons(picks: tuple[Pick, ...], *, client: httpx2.AsyncClient) 
         logger.warning(
             "Muse output rejected: %s (%s)", e, rejection_note(content, finish_reason, usage)
         )
+        validation_done(reply, f"rejected:{e}")
         return fallback(usage)
     logger.info("Muse usage: %s", usage_note(usage))
+    validation_done(reply, "accepted")
     # Our order, always (R2).
     return Reasons(tuple(lines[i] for i in ids), MUSE, usage)
