@@ -25,6 +25,43 @@ export const colors = {
   scrollThumb: 'rgba(31,26,23,0.32)',
 };
 
+// P2-08 chart colors. Category IDs keep the same color in every chart.
+export const chart = {
+  accent: '#CC421F',
+  neutral: colors.textSecondary,
+  track: colors.hairline,
+  separator: '#FFF7EE',
+  areaOpacity: 0.12,
+  price: ['#9C5F33', '#8C482B', '#71351F', '#4C2516'] as const,
+  categories: {
+    burgers: '#C94627',
+    pizza: '#285828',
+    mexican: '#A57700',
+    latin: '#704040',
+    chinese: '#326F64',
+    japanese_sushi: '#703410',
+    korean: '#DC4058',
+    thai: '#408864',
+    vietnamese: '#A01C10',
+    indian: '#7C6494',
+    mediterranean: '#70884C',
+    italian: '#AC1C88',
+    french: '#A05810',
+    american_diner: '#4C8888',
+    bbq: '#AC1C40',
+    chicken_wings: '#584070',
+    sandwiches: '#DC4094',
+    seafood: '#704C10',
+    salads_bowls: '#AC7070',
+    breakfast_brunch: '#7C704C',
+    coffee_bakery: '#945870',
+    smoothies_juice: '#4C4C10',
+    dessert: '#945840',
+    pubs_bars: '#6B2350',
+    other: '#77635B',
+  } as Record<string, string>,
+};
+
 export const blur = {
   intensity: 40,
   tint: 'light' as const,

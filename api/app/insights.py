@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 import httpx2
@@ -11,12 +13,14 @@ from fastapi import HTTPException, status
 from app.categories import CATEGORY_IDS
 from app.companion_metrics import Meal, aggregate
 from app.config import MissingSettingError, get_settings
+from app.insight_metrics import SLOTS
+from app.insight_metrics import aggregate as charts
 
 MEALS_LIMIT = 1000
 COMPANION_PAGE_SIZE = 1000
 MEALS_SELECT = (
     "id,user_id,source,eaten_on,day_of_week,category_id,ate_at,went,solo,"
-    "meal_companions(companion_id)"
+    "meal_companions(companion_id),meal_slot,price_amount,price_level,price_tap,budget_level,distance_m"
 )
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,48 @@ def _meal(row: dict, user_id: str) -> Meal:
         raise ValueError
     ids = frozenset(_uuid(link["companion_id"]) for link in links)
     return Meal(mid, source, eaten_on, day, category, ate_at is not None, went, solo, ids)
+
+
+def _level(value: object) -> int | None:
+    if value is not None and (type(value) is not int or value not in (1, 2, 3, 4)):
+        raise ValueError
+    return value
+
+
+def _measurements(meal: Meal, row: dict) -> tuple[Meal, bool]:
+    """A bad added measurement never discards the meal's other evidence."""
+    complete = True
+    slot = row.get("meal_slot")
+    if slot is not None and slot not in SLOTS:
+        slot, complete = None, False
+    paid = budget = distance = None
+    try:
+        if meal.source == "backfill":
+            amount = row.get("price_amount")
+            level = _level(row.get("price_level"))
+            if amount is not None:
+                if isinstance(amount, bool) or not isinstance(amount, (int, float, str)):
+                    raise ValueError
+                amount = Decimal(str(amount))
+                if not amount.is_finite() or amount < 0 or level is None:
+                    raise ValueError
+                # Postgres generates this level from the amount, using the existing boundaries.
+                paid = level
+        else:
+            paid = _level(row.get("price_tap"))
+            if paid is None:
+                budget = _level(row.get("budget_level"))
+    except (ValueError, InvalidOperation):
+        paid = budget = None
+        complete = False
+    try:
+        distance = row.get("distance_m")
+        if distance is not None and (type(distance) is not int or distance < 0):
+            raise ValueError
+    except ValueError:
+        distance, complete = None, False
+    return replace(meal, meal_slot=slot, paid_level=paid, budget_level=budget,
+                   distance_m=distance), complete
 
 
 async def _companions(client, base, user_id, headers, timeout) -> tuple[frozenset[str], bool]:
@@ -130,8 +176,11 @@ async def response(user_id: str, token: str, as_of: date, *, client: httpx2.Asyn
             meal = _meal(row, user_id)
             if meal.id in meals:
                 raise ValueError
+            meal, measurements_complete = _measurements(meal, row)
+            complete = complete and measurements_complete
             meals[meal.id] = meal
         except (ValueError, KeyError, TypeError):
             complete = False
     return {"complete": complete, "cutoff_date": as_of.isoformat(),
-            "companions": aggregate(companions, meals.values(), as_of)}
+            "companions": aggregate(companions, meals.values(), as_of),
+            **charts(meals.values(), as_of)}

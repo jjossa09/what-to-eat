@@ -19,6 +19,10 @@ class Meal:
     went: bool | None
     solo: bool | None
     companion_ids: frozenset[str]
+    meal_slot: str | None = None
+    paid_level: int | None = None
+    budget_level: int | None = None
+    distance_m: int | None = None
 
 
 def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) -> dict:
@@ -27,7 +31,7 @@ def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) 
     days = {cid: Counter() for cid in saved}
     categories = {cid: Counter() for cid in saved}
     sources = {cid: Counter() for cid in saved}
-    unlinked = contradictory = 0
+    unlinked = contradictory = with_company = 0
     for meal in meals:
         if meal.eaten_on > as_of or (meal.source == "live" and meal.went is not True):
             continue
@@ -38,6 +42,7 @@ def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) 
         if not linked:
             unlinked += 1
             continue
+        with_company += 1
         for cid in linked:
             days[cid][meal.day_of_week] += 1
             sources[cid][meal.source] += 1
@@ -66,6 +71,6 @@ def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) 
             if enough and food_n else None,
             "pattern_status": "available" if enough else "insufficient_data",
         })
-    return {"companions": companions, "coverage": {
+    return {"companions": companions, "with_company_meal_count": with_company, "coverage": {
         "unlinked_meals": unlinked, "contradictory_company_meals": contradictory,
     }}
