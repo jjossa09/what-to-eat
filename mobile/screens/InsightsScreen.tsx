@@ -10,7 +10,7 @@ import { OpeningMotion } from '../components/charts/OpeningMotion';
 import ScrollWithBar from '../components/ScrollWithBar';
 import { GlassScreen, PrimaryButton, ScreenTitle, TextLink, useTabBarSpace } from '../components/ui';
 import { defaultDistanceSlot, type InsightsState } from '../lib/insights';
-import type { InsightSlot } from '../lib/api';
+import { getInsightsTakeaway, type InsightSlot, type InsightsResponse } from '../lib/api';
 import { colors, spacing, type } from '../theme';
 
 export default function InsightsScreen({ state, onClose, onRefresh }: {
@@ -18,6 +18,16 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
 }) {
   const space = useTabBarSpace();
   const [selectedSlot, setSelectedSlot] = useState<InsightSlot | null>(null);
+  const [takeaway, setTakeaway] = useState<{ stats: InsightsResponse; line: string | null } | null>(null);
+  useEffect(() => {
+    if (state.status !== 'ready') return;
+    let live = true;
+    const saved = state.cards.companions.groups.flatMap((g) => g.bars.map((b) => ({ id: b.id, name: b.label })));
+    getInsightsTakeaway(state.response, saved).then((result) => {
+      if (live) setTakeaway({ stats: state.response, line: result.line });
+    });
+    return () => { live = false; };
+  }, [state]);
   const activeSlot = selectedSlot ?? (state.status === 'ready'
     ? defaultDistanceSlot(state.cards.distance.timeline ?? []) : 'breakfast');
   useEffect(() => {
@@ -49,6 +59,8 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
         contentContainerStyle={[styles.scroll, { paddingBottom: space }]}
         refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} tintColor={colors.textSecondary} />}
       >
+        {takeaway?.stats === state.response && takeaway.line &&
+          <Text style={styles.takeaway} numberOfLines={1}>{takeaway.line}</Text>}
         {state.note && <Text accessibilityLiveRegion="polite" style={styles.note}>{state.note}</Text>}
         {state.emptyText && <Text style={styles.note}>{state.emptyText}</Text>}
         <TopCategoriesChart data={state.cards.top} />
@@ -70,4 +82,5 @@ const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', gap: spacing.lg },
   scroll: { gap: spacing.lg, paddingBottom: spacing.lg },
   note: { color: colors.textSecondary, fontSize: type.small },
+  takeaway: { color: colors.text, fontSize: type.small },
 });

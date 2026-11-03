@@ -12,7 +12,7 @@ import httpx2
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
-from app import funnel, gate, history, insights, muse, places, refine, widening
+from app import funnel, gate, history, insights, muse, places, refine, takeaway, widening
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_RADIUS_M = widening.MAX_RADIUS_M
 # ML10: after 3 rounds without a pick, round 4 is the best options so far.
 CAP_ROUND = 4
+ROUND_BUDGET_S = 7.5
 
 
 async def get_places_client() -> AsyncIterator[httpx2.AsyncClient]:
@@ -69,6 +70,19 @@ async def get_insights(
     client: httpx2.AsyncClient = Depends(get_http_client),
 ) -> dict:
     return await insights.response(*auth, as_of, client=client)
+
+
+class TakeawayRequest(BaseModel):
+    as_of: date
+
+
+@app.post("/insights/takeaway")
+async def insights_takeaway(
+    body: TakeawayRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client),
+) -> dict:
+    return await takeaway.response(*auth, body.as_of, client=client)
 
 
 @app.get("/places/search")
@@ -180,10 +194,14 @@ def offset_zone(local: datetime) -> str:
     return f"UTC{sign}{hours:02d}:{mins:02d}"
 
 
-async def quietly(coro, what: str):
+async def quietly(coro, what: str, *, deadline: float | None = None):
     """Runs a logging write. On any failure: logs the error type only and returns None."""
     try:
-        result = await coro
+        if deadline is None:
+            result = await coro
+        else:
+            async with asyncio.timeout(max(0.0, deadline - time.perf_counter())):
+                result = await coro
     except Exception as e:
         logger.warning("Funnel %s failed: %s", what, type(e).__name__)
         return None
@@ -214,6 +232,7 @@ async def recommendations(
     and log the previous round's cards as rejected. Round 4 without a pick is the best so far.
     """
     started = time.perf_counter()
+    deadline = started + ROUND_BUDGET_S
     user_id, token = auth
     default_radius = get_settings().PLACES_RADIUS_M
     current = refine.Answers(body.craving, body.budget_level, refine.chip_radius(body.radius_m),
@@ -239,7 +258,8 @@ async def recommendations(
     )
     session_id = str(body.session_id) if body.session_id else None
     opening = quietly(
-        funnel.open_round(user_id, token, session_id, new_session, client=client), "session"
+        funnel.open_round(user_id, token, session_id, new_session, client=client), "session",
+        deadline=deadline,
     )
     try:
         if session_id is None:
@@ -295,22 +315,25 @@ async def recommendations(
     # The shown places are cached while Muse writes; the events need their rows.
     # The transcript and a later round's follow-up writes go alongside them.
     reasons, cached, saved, followed, gated, _ = await asyncio.gather(
-        muse.write_reasons(ranking.top3, client=client),
-        quietly(funnel.upsert_places(shown, client=client), "places")
+        muse.write_reasons(ranking.top3, client=client,
+                           timeout_s=max(0.0, deadline - time.perf_counter())),
+        quietly(funnel.upsert_places(shown, client=client), "places", deadline=deadline)
         if ref
         else asyncio.sleep(0),
-        log_transcript(user_id, token, ref, body, client) if ref else asyncio.sleep(0),
-        log_follow_up(user_id, token, ref, new_session, reject_tags(body, applied), client)
+        log_transcript(user_id, token, ref, body, client, deadline=deadline)
+        if ref else asyncio.sleep(0),
+        log_follow_up(user_id, token, ref, new_session, reject_tags(body, applied), client,
+                      deadline=deadline)
         if ref
         else asyncio.sleep(0),
         # sessions.gate: never part of `logged`, so a failure loses only the gate entry.
         log_gate(token, ref, chosen.as_log(),
                  round_one_plan(body, user_history, slot, is_weekend, local_date)
-                 if ref.round == 1 else None, client)
+                 if ref.round == 1 else None, client, deadline=deadline)
         if ref
         else asyncio.sleep(0),
         quietly(funnel.update_search_radius(user_id, token, ref.session_id, result.radius_m,
-                                           client=client), "search radius")
+                                           client=client), "search radius", deadline=deadline)
         if ref and ref.round == 1 and result.radius_m != radius
         else asyncio.sleep(0),
     )
@@ -324,6 +347,7 @@ async def recommendations(
                 user_id, token, ref, ranking.top3, reasons.lines, reasons.source, client=client
             ),
             "shown",
+            deadline=deadline,
         )
     )
 
@@ -375,11 +399,12 @@ def answers_out(answers: refine.Answers) -> dict:
 
 async def log_transcript(
     user_id: str, token: str, ref: funnel.RoundRef, body: RecommendationsRequest,
-    client: httpx2.AsyncClient,
+    client: httpx2.AsyncClient, *, deadline: float | None = None,
 ):
     transcript = [m.model_dump() for m in body.transcript]
     return await quietly(
-        funnel.log_messages(user_id, token, ref, transcript, client=client), "messages"
+        funnel.log_messages(user_id, token, ref, transcript, client=client), "messages",
+        deadline=deadline,
     )
 
 
@@ -400,13 +425,14 @@ def round_one_plan(
 
 async def log_gate(
     token: str, ref: funnel.RoundRef, entry: dict, plan_log: dict | None,
-    client: httpx2.AsyncClient,
+    client: httpx2.AsyncClient, *, deadline: float | None = None,
 ):
     """This round's gate entry; round 1 adds the plan log. True when written, None on any
     failure (logged, not raised)."""
     return await quietly(
         funnel.append_gate(token, ref.session_id, ref.round, entry, plan_log, client=client),
         "gate",
+        deadline=deadline,
     )
 
 
@@ -418,7 +444,7 @@ def reject_tags(body: RecommendationsRequest, applied: refine.Applied) -> tuple[
 
 async def log_follow_up(
     user_id: str, token: str, ref: funnel.RoundRef, new: funnel.NewSession,
-    tags: tuple[str, ...], client: httpx2.AsyncClient,
+    tags: tuple[str, ...], client: httpx2.AsyncClient, *, deadline: float | None = None,
 ) -> bool:
     """Later rounds: the session's current answers, and the previous round's cards as
     rejected with what changed (never the user's text). True when both were written."""
@@ -427,11 +453,11 @@ async def log_follow_up(
     previous = ref.round - 1
     results = await asyncio.gather(
         quietly(funnel.update_answers(user_id, token, ref.session_id, new, client=client),
-                "answers"),
+                "answers", deadline=deadline),
         quietly(funnel.log_rejected(user_id, token, ref.session_id, previous,
                                     ref.shown_in(previous), refine.reject_reason(tags),
                                     client=client),
-                "rejected"),
+                "rejected", deadline=deadline),
     )
     return all(results)
 
@@ -446,6 +472,7 @@ async def best_so_far_round(
     No places search and no Muse call: the cards and their reasons were shown before (R2).
     Fewer than 3 can fit; none means the app goes straight to the open question.
     """
+    deadline = started + ROUND_BUDGET_S
     answers = applied.answers
     user_history = loaded or History()
     known = {
@@ -467,15 +494,16 @@ async def best_so_far_round(
         for rank_, (card, meters) in enumerate(best, start=1)
     ]
     saved, followed, gated = await asyncio.gather(
-        log_transcript(user_id, token, ref, body, client),
-        log_follow_up(user_id, token, ref, new, reject_tags(body, applied), client),
-        log_gate(token, ref, gate.CAP_ENTRY, None, client),
+        log_transcript(user_id, token, ref, body, client, deadline=deadline),
+        log_follow_up(user_id, token, ref, new, reject_tags(body, applied), client,
+                      deadline=deadline),
+        log_gate(token, ref, gate.CAP_ENTRY, None, client, deadline=deadline),
     )
     logged = bool(
         saved
         and followed
         and await quietly(funnel.log_shown_rows(user_id, token, ref, cards, client=client),
-                          "shown")
+                          "shown", deadline=deadline)
     )
     logger.info(
         "Best-so-far round in %d ms (%d cards)", (time.perf_counter() - started) * 1000, len(best)

@@ -250,7 +250,7 @@ def check_parse(content, question_key: str, finish_reason: str | None = None) ->
 
 async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> Parsed:
     """One Muse call. Any failure or unclear answer is not sure, never an error."""
-    reply = await muse.call(request_body(question_key, text), client=client)
+    reply = await muse.call(request_body(question_key, text), client=client, call_type="parse")
     if reply is None:
         return Parsed(NOT_SURE, None, NONE)
     try:
@@ -262,6 +262,7 @@ async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> 
             question_key,
             muse.rejection_note(reply.content, reply.finish_reason, reply.usage),
         )
+        muse.validation_done(reply, f"rejected:{e}")
         return Parsed(NOT_SURE, None, NONE)
     except NotSure as e:
         logger.info(
@@ -270,6 +271,7 @@ async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> 
             question_key,
             muse.usage_note(reply.usage),
         )
+        muse.validation_done(reply, "not_sure")
         return Parsed(NOT_SURE, e.partial, muse.MUSE)
     except ChatReply as e:
         fallback = e.reply == FALLBACK_REPLY[question_key]
@@ -280,6 +282,8 @@ async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> 
             fallback,
             muse.usage_note(reply.usage),
         )
+        muse.validation_done(reply, "chat")
         return Parsed(CHAT, None, muse.MUSE, e.reply)
     logger.info("Muse parse usage: %s (question=%s)", muse.usage_note(reply.usage), question_key)
+    muse.validation_done(reply, "accepted")
     return Parsed(OK, change, muse.MUSE)
