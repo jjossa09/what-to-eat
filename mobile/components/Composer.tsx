@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native';
 
+import { haptic } from '../lib/haptics';
 import { colors, radii, spacing, type } from '../theme';
 import PressScale from './PressScale';
 
@@ -18,11 +19,14 @@ type Props = {
 
 export default function Composer({ placeholder, onSend, busy = false, disabled = false }: Props) {
   const [text, setText] = useState('');
+  const submitted = useRef(false);
   const ready = text.trim().length > 0 && !busy && !disabled;
 
   function send() {
-    if (!ready) return;
+    if (!ready || submitted.current) return;
+    submitted.current = true;
     onSend(text.trim());
+    haptic('light');
     setText('');
   }
 
@@ -33,7 +37,7 @@ export default function Composer({ placeholder, onSend, busy = false, disabled =
         placeholder={placeholder}
         placeholderTextColor={colors.textSecondary}
         value={text}
-        onChangeText={setText}
+        onChangeText={(value) => { submitted.current = false; setText(value); }}
         onSubmitEditing={send}
         submitBehavior="submit"
         returnKeyType="send"

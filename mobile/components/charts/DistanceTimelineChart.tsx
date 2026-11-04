@@ -1,10 +1,11 @@
 import { useId } from 'react';
-import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Animated, StyleSheet, Text, View } from 'react-native';
 import Svg, { Circle, ClipPath, Defs, Line, LinearGradient, Path, Rect, Stop, Text as SvgText } from 'react-native-svg';
 
 import type { InsightSlot } from '../../lib/api';
 import { type DistanceSlot, formatMiles, mealCount, timelineGeometry } from '../../lib/insights';
 import { chart, colors, radii, spacing, type } from '../../theme';
+import PressScale from '../PressScale';
 import { ChartCard, type ChartProps } from './BarChart';
 import { useOpeningProgress, useTimelineSwitch } from './OpeningMotion';
 
@@ -99,7 +100,8 @@ export default function DistanceTimelineChart({ selectedSlot, onSlotChange, ...p
   const selected = slots.find((s) => s.id === selectedSlot);
   return <ChartCard title="Meal distance" {...props}>
     <View style={styles.segments}>
-      {slots.map((slot) => <Pressable key={slot.id} accessibilityRole="button"
+      {slots.map((slot) => <PressScale key={slot.id} accessibilityRole="button"
+        feedback={slot.id === selectedSlot ? false : 'selection'}
         accessibilityState={{ selected: slot.id === selectedSlot }}
         onPress={() => {
           if (slot.id === selectedSlot) return;
@@ -107,7 +109,7 @@ export default function DistanceTimelineChart({ selectedSlot, onSlotChange, ...p
           switchTimeline(slot.points.length);
         }} style={[styles.segment, slot.id === selectedSlot && styles.selected]}>
         <Text style={styles.segmentLabel}>{slot.label}</Text>
-      </Pressable>)}
+      </PressScale>)}
     </View>
     {selected && <Timeline slot={selected} />}
   </ChartCard>;

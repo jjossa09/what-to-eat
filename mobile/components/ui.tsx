@@ -4,7 +4,8 @@ import type { ReactNode } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { blur, colors, dock, radii, spacing, type } from '../theme';
+import type { HapticKind } from '../lib/haptics';
+import { blur, colors, dock, layout, radii, spacing, type } from '../theme';
 import PressScale from './PressScale';
 
 // Shared glass pieces (R1, P1-22). Colors come only from theme.ts.
@@ -61,14 +62,19 @@ type ChipProps = {
   onRemove?: () => void;
   wide?: boolean;
   detail?: string;
+  feedback?: HapticKind | false;
+  disabled?: boolean;
 };
 
-export function Chip({ label, selected = false, onPress, onRemove, wide = false, detail }: ChipProps) {
+export function Chip({ label, selected = false, onPress, onRemove, wide = false, detail,
+  feedback = 'light', disabled = false }: ChipProps) {
   return (
     <PressScale
       onPress={onPress ?? onRemove}
-      accessibilityRole="button"
-      accessibilityState={{ selected }}
+      disabled={disabled}
+      feedback={feedback === 'selection' && selected && !onRemove ? false : feedback}
+      accessibilityRole={onPress || onRemove ? 'button' : 'text'}
+      accessibilityState={{ selected, disabled }}
       style={[styles.chip, wide && styles.chipWide, selected && styles.chipSelected]}
     >
       <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{label}</Text>
@@ -78,12 +84,13 @@ export function Chip({ label, selected = false, onPress, onRemove, wide = false,
   );
 }
 
-type ButtonProps = { label: string; onPress: () => void; disabled?: boolean; busy?: boolean };
+type ButtonProps = { label: string; onPress: () => void; disabled?: boolean; busy?: boolean; feedback?: HapticKind | false };
 
-export function PrimaryButton({ label, onPress, disabled = false, busy = false }: ButtonProps) {
+export function PrimaryButton({ label, onPress, disabled = false, busy = false, feedback = 'light' }: ButtonProps) {
   return (
     <PressScale
       onPress={onPress}
+      feedback={feedback}
       disabled={disabled || busy}
       accessibilityRole="button"
       accessibilityState={{ disabled: disabled || busy }}
@@ -99,10 +106,11 @@ export function PrimaryButton({ label, onPress, disabled = false, busy = false }
 }
 
 /** The quieter partner of PrimaryButton: same height and shape, glass fill (P1-24). */
-export function SecondaryButton({ label, onPress, disabled = false }: Omit<ButtonProps, 'busy'>) {
+export function SecondaryButton({ label, onPress, disabled = false, feedback = 'light' }: Omit<ButtonProps, 'busy'>) {
   return (
     <PressScale
       onPress={onPress}
+      feedback={feedback}
       disabled={disabled}
       accessibilityRole="button"
       accessibilityState={{ disabled }}
@@ -113,9 +121,9 @@ export function SecondaryButton({ label, onPress, disabled = false }: Omit<Butto
   );
 }
 
-export function TextLink({ label, onPress }: { label: string; onPress: () => void }) {
+export function TextLink({ label, onPress, feedback = 'light' }: Pick<ButtonProps, 'label' | 'onPress' | 'feedback'>) {
   return (
-    <PressScale onPress={onPress} accessibilityRole="button" style={styles.link} hitSlop={12}>
+    <PressScale onPress={onPress} feedback={feedback} accessibilityRole="button" style={styles.link} hitSlop={12}>
       <Text style={styles.linkText}>{label}</Text>
     </PressScale>
   );
@@ -134,7 +142,7 @@ export function Dots({ step, total }: { step: number; total: number }) {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    paddingHorizontal: spacing.xl,
+    paddingHorizontal: layout.gutter,
   },
   card: {
     borderRadius: radii.card,

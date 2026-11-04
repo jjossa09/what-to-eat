@@ -1,8 +1,7 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { type BottomTabBarButtonProps, createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { DefaultTheme, NavigationContainer } from '@react-navigation/native';
 import type { Session } from '@supabase/supabase-js';
-import * as Haptics from 'expo-haptics';
 import { StatusBar } from 'expo-status-bar';
 import { type ComponentProps, useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
@@ -17,6 +16,7 @@ import NameStep from './components/NameStep';
 import Quiz from './components/Quiz';
 import { GlassScreen, PrimaryButton, useDockBottom, useTabBarSpace } from './components/ui';
 import { clearReminder } from './lib/notify';
+import { haptic } from './lib/haptics';
 import { hasTasteProfile, loadDisplayName } from './lib/profile';
 import { supabase } from './lib/supabase';
 import MapScreen from './screens/MapScreen';
@@ -53,19 +53,27 @@ function EatTab({ userId }: { userId: string }) {
   return <Chat userId={userId} onSignOut={signOut} bottom={space} />;
 }
 
+// Keep the same PressScale element through tab and Profile/Insights transitions.
+function renderTabButton({ ref: _ref, ...props }: BottomTabBarButtonProps) {
+  return <PressScale {...props} />;
+}
+
 function HomeTabs({ userId }: { userId: string }) {
   const dockBottom = useDockBottom();
+  const [showInsights, setShowInsights] = useState(false);
   return (
     <NavigationContainer theme={navTheme}>
       <Tab.Navigator
         // The capsule floats above the safe area itself, so the bar adds no inset padding.
         safeAreaInsets={{ bottom: 0, left: 0, right: 0 }}
-        // A light tap when switching tabs (not when re-tapping the current one).
-        screenListeners={({ navigation }) => ({
+        // Returning from Insights is a navigation action even while Profile is focused.
+        screenListeners={({ navigation, route }) => ({
           tabPress: () => {
-            if (!navigation.isFocused()) {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+            const returning = route.name === 'Profile' && showInsights;
+            if (!navigation.isFocused() || returning) {
+              haptic('light');
             }
+            if (returning) setShowInsights(false);
           },
         })}
         screenOptions={({ route }) => ({
@@ -76,7 +84,7 @@ function HomeTabs({ userId }: { userId: string }) {
           tabBarItemStyle: styles.dockItem,
           tabBarLabelStyle: styles.dockLabel,
           tabBarBackground: () => <DockBackground />,
-          tabBarButton: ({ ref: _ref, ...props }) => <PressScale {...props} />,
+          tabBarButton: renderTabButton,
           tabBarIcon: ({ color, focused }) => (
             <Ionicons
               name={(focused ? TAB_ICONS[route.name] : `${TAB_ICONS[route.name]}-outline`) as IconName}
@@ -90,7 +98,8 @@ function HomeTabs({ userId }: { userId: string }) {
         <Tab.Screen name="Map" component={MapScreen} />
         <Tab.Screen name="Meals">{() => <MealsScreen userId={userId} />}</Tab.Screen>
         <Tab.Screen name="Profile">
-          {() => <ProfileScreen userId={userId} onSignOut={signOut} />}
+          {() => <ProfileScreen userId={userId} onSignOut={signOut}
+            showInsights={showInsights} onInsightsChange={setShowInsights} />}
         </Tab.Screen>
       </Tab.Navigator>
       {/* Went? + stars on app open (P1-17) */}

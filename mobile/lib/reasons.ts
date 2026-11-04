@@ -2,6 +2,14 @@
 export type ReasonsEnvelope = { payload: string; signature: string };
 export type ReasonsResponse = { source: 'muse' | 'template'; reasons: { id: string; line: string }[] };
 
+/** Presentation observer, scoped to one operation and round. Never starts a request. */
+export type ReasonsObserver = {
+  current: () => boolean;
+  accepted: () => void;
+  fallback: () => void;
+  displayed: (id: string) => void;
+};
+
 export class ReasonsCache {
   private entries = new Map<string, Promise<ReasonsResponse | null>>();
   private generation = 0;
@@ -12,11 +20,15 @@ export class ReasonsCache {
   clear() { this.invalidate(); this.entries.clear(); }
 
   watch(key: string, ids: readonly string[], generation: number,
-    request: () => Promise<ReasonsResponse>, apply: (result: ReasonsResponse) => void) {
+    request: () => Promise<ReasonsResponse>, apply: (result: ReasonsResponse) => void,
+    fallback?: () => void) {
     let live = true;
     if (this.isCurrent(generation)) {
       this.load(key, ids, request).then((result) => {
-        if (live && this.isCurrent(generation) && result) apply(result);
+        if (live && this.isCurrent(generation)) {
+          if (result) apply(result);
+          else fallback?.();
+        }
       });
     }
     return () => { live = false; };
@@ -44,16 +56,20 @@ export type Fade = (opacity: number, duration: number, done: () => void) => () =
 /** Both the response and animation callback must still belong to the active round. */
 export function swapReason(
   reduceMotion: boolean, current: () => boolean, apply: () => void, fade: Fade,
+  displayed?: () => void,
 ): () => void {
   let cancelled = false;
   let stop = () => {};
   const live = () => !cancelled && current();
   if (live()) {
-    if (reduceMotion) apply();
-    else stop = fade(0, 90, () => {
+    if (reduceMotion) {
+      apply();
+      if (live()) displayed?.();
+    } else stop = fade(0, 90, () => {
+      if (cancelled) return;
       if (!live()) { stop = fade(1, 0, () => {}); return; }
       apply();
-      stop = fade(1, 90, () => {});
+      stop = fade(1, 90, () => { if (live()) displayed?.(); });
     });
   }
   return () => { cancelled = true; stop(); };

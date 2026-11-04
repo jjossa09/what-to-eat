@@ -150,11 +150,13 @@ class FailedMealLinks(FunnelFake):
 def test_failed_meal_companions_still_returns_a_successful_pick(caplog):
     up = FailedMealLinks(session_companions=[A])
     response = funnel_t.send(up, "picked", {"round": 1, "place_id": funnel_t.PLACE_ID})
-    assert response.status_code == 200 and response.json() == {"logged": True}
-    assert len(up.calls("PATCH", "sessions")) == 1
-    assert len(up.calls("POST", "meals")) == 1
+    assert response.status_code == 200
+    assert response.json() == {"logged": True, "meal_id": up.meal_id}
+    assert len(up.calls("POST", "rpc/save_recommendation_pick")) == 1
+    assert up.outcome == "picked" and len(up.meals) == 1
+    assert up.calls("PATCH", "sessions") == up.calls("POST", "meals") == []
     assert len(up.calls("POST", "meal_companions")) == 1
-    assert up.calls("POST", "recommendation_events")
+    assert len(up.picked_events) == 1 and up.picked_events[0]["event"] == "picked"
     assert "Funnel meal_companions failed: FunnelUpstreamError" in caplog.text
     assert "private failure detail" not in caplog.text
 
@@ -170,6 +172,7 @@ def test_malformed_pick_embed_is_an_upstream_error_before_writes(embed):
     assert response.status_code == 502
     assert up.calls("PATCH", "sessions") == []
     assert up.calls("POST", "meals") == []
+    assert up.calls("POST", "rpc/save_recommendation_pick") == []
 
 
 def test_solo_with_companions_is_422_before_upstream_calls():
@@ -275,20 +278,21 @@ def test_failed_companions_read_preserves_other_history(monkeypatch):
 
 
 @pytest.mark.parametrize("rows", [[], [{}]])
-def test_missing_meal_id_skips_companion_copy(rows, caplog):
+def test_missing_rpc_meal_id_never_confirms_or_copies_companions(rows, caplog):
     class MissingId(FunnelFake):
         def __call__(self, request):
-            if request.method == "POST" and request.url.path.endswith("/meals"):
+            if request.method == "POST" and request.url.path.endswith("/save_recommendation_pick"):
                 self.requests.append(request)
-                return httpx2.Response(201, json=rows)
+                return httpx2.Response(200, json=rows)
             return super().__call__(request)
 
     up = MissingId(session_companions=[A])
     response = funnel_t.send(up, "picked", {"round": 1, "place_id": funnel_t.PLACE_ID})
-    assert response.status_code == 200
-    assert len(up.calls("POST", "meals")) == 1
+    assert response.status_code == 502
+    assert len(up.calls("POST", "rpc/save_recommendation_pick")) == 1
+    assert up.calls("POST", "meals") == []
     assert up.calls("POST", "meal_companions") == []
-    assert "meal insert returned no id" in caplog.text
+    assert "Funnel event failed: FunnelUpstreamError" in caplog.text
 
 
 def test_six_older_company_meals_confidently_skip_company(company_pool, monkeypatch):

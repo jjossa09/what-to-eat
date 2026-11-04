@@ -2,6 +2,7 @@ import { useRef } from 'react';
 import { Linking, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 
+import { haptic } from '../lib/haptics';
 import type { Position } from '../lib/location';
 import { colors, emojiFor, map, spacing, type } from '../theme';
 
@@ -29,11 +30,11 @@ export function EmojiPin({ category, selected = false }: { category: string; sel
 export function Attribution({ style, quiet = false }: { style?: object; quiet?: boolean }) {
   return (
     <Text style={[styles.attribution, quiet && styles.quiet, style]}>
-      <Text style={styles.link} onPress={() => Linking.openURL(GEOAPIFY)}>
+      <Text style={styles.link} onPress={() => { haptic('light'); Linking.openURL(GEOAPIFY); }}>
         Powered by Geoapify
       </Text>
       {' · '}
-      <Text style={styles.link} onPress={() => Linking.openURL(OSM_COPYRIGHT)}>
+      <Text style={styles.link} onPress={() => { haptic('light'); Linking.openURL(OSM_COPYRIGHT); }}>
         © OpenStreetMap contributors
       </Text>
     </Text>

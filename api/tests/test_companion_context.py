@@ -642,6 +642,7 @@ class FunnelFake(funnel_t.Supabase):
     def __init__(self, session_companions=(), **kw):
         super().__init__(**kw)
         self.session_companions = [{"companion_id": c} for c in session_companions]
+        self.meal_id = MEAL_ID
 
     def __call__(self, request):
         table = request.url.path.rsplit("/", 1)[-1]
@@ -655,9 +656,6 @@ class FunnelFake(funnel_t.Supabase):
         if key == "GET session_companions":
             self.requests.append(request)
             return httpx2.Response(200, json=self.session_companions)
-        if key == "POST meals":
-            self.requests.append(request)
-            return httpx2.Response(201, json=[{"id": MEAL_ID}])
         if key == "POST meal_companions":
             self.requests.append(request)
             return httpx2.Response(201)

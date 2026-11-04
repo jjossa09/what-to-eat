@@ -1,6 +1,7 @@
 import { type ReactNode, type Ref, useEffect, useState } from 'react';
 import {
   Animated,
+  type FlatListProps,
   type LayoutChangeEvent,
   type ScrollViewInstance,
   type ScrollViewProps,
@@ -9,28 +10,42 @@ import {
   type ViewStyle,
 } from 'react-native';
 
-import { colors, scrollBar } from '../theme';
+import { colors, layout, scrollBar } from '../theme';
 
-// Chat scroll view with its own indicator (P1-19). The iOS indicator's width can't be set, so
+// Shared scroll view with its own indicator (P1-19). The iOS indicator's width can't be set, so
 // the native one is hidden and an Animated thumb follows the scroll position on the native
-// driver. It sits at the right edge of this view (the chat places it at the screen edge),
-// shows while scrolling, and fades out after a short hold. Values in theme.ts (scrollBar).
+// driver. The viewport extends through GlassScreen's gutters to the screen edge, while
+// content keeps the shared inset. The optional list uses the same indicator and preserves
+// FlatList virtualization, with no second scrolling surface. The thumb shows while scrolling
+// and fades out after a short hold. Values in theme.ts (scrollBar).
 
-type Props = Omit<ScrollViewProps, 'onScroll' | 'style'> & {
+// Only the scroll event is animated; row data keeps FlatList's ordinary generic item type.
+const AnimatedFlatList = Animated.FlatList as <Item>(props: FlatListProps<Item>) => ReactNode;
+
+type Props<Item> = Omit<ScrollViewProps, 'onScroll' | 'style'> & {
   scrollRef?: Ref<ScrollViewInstance>;
   /** The outer view (the thumb's track runs its full height). */
   style?: ViewStyle;
   children?: ReactNode;
+  list?: Pick<FlatListProps<Item>, 'data' | 'keyExtractor' | 'renderItem'>;
 };
 
-export default function ScrollWithBar({
+export function scrollGeometry(view: number, content: number) {
+  const scrollable = view > 0 && content > view + 1;
+  const thumb = scrollable ? Math.min(view, Math.max(scrollBar.minThumb, (view * view) / content)) : 0;
+  return { scrollable, thumb, range: Math.max(1, content - view), travel: Math.max(0, view - thumb) };
+}
+
+export default function ScrollWithBar<Item>({
   scrollRef,
   style,
   children,
+  list,
+  contentContainerStyle,
   onLayout,
   onContentSizeChange,
   ...rest
-}: Props) {
+}: Props<Item>) {
   // Created once: the scroll value, the thumb's opacity, and the scroll handler that wakes it.
   const [bar] = useState(() => {
     const y = new Animated.Value(0);
@@ -54,39 +69,45 @@ export default function ScrollWithBar({
       useNativeDriver: true,
       listener: wake,
     });
-    return { y, opacity, onScroll, stop: () => clearTimeout(timer) };
+    return { y, opacity, onScroll, stop: () => {
+      clearTimeout(timer);
+      opacity.stopAnimation();
+    } };
   });
   useEffect(() => bar.stop, [bar]);
 
   const [view, setView] = useState(0);
   const [content, setContent] = useState(0);
-  const scrollable = view > 0 && content > view + 1;
-  const thumb = scrollable ? Math.max(scrollBar.minThumb, (view * view) / content) : 0;
+  const { scrollable, thumb, range, travel } = scrollGeometry(view, content);
   const translateY = bar.y.interpolate({
-    inputRange: [0, Math.max(1, content - view)],
-    outputRange: [0, Math.max(0, view - thumb)],
+    inputRange: [0, range],
+    outputRange: [0, travel],
     extrapolate: 'clamp',
   });
 
+  const scrollProps = {
+    ...rest,
+    contentContainerStyle: [styles.content, contentContainerStyle],
+    showsVerticalScrollIndicator: false,
+    scrollEventThrottle: 16,
+    onScroll: bar.onScroll,
+    onLayout: (e: LayoutChangeEvent) => {
+      setView(e.nativeEvent.layout.height);
+      onLayout?.(e);
+    },
+    onContentSizeChange: (w: number, h: number) => {
+      setContent(h);
+      onContentSizeChange?.(w, h);
+    },
+  };
+
   return (
     <View style={[styles.wrap, style]}>
-      <Animated.ScrollView
-        {...rest}
-        ref={scrollRef}
-        showsVerticalScrollIndicator={false}
-        scrollEventThrottle={16}
-        onScroll={bar.onScroll}
-        onLayout={(e: LayoutChangeEvent) => {
-          setView(e.nativeEvent.layout.height);
-          onLayout?.(e);
-        }}
-        onContentSizeChange={(w: number, h: number) => {
-          setContent(h);
-          onContentSizeChange?.(w, h);
-        }}
-      >
-        {children}
-      </Animated.ScrollView>
+      {list ? <AnimatedFlatList {...list} {...scrollProps} /> : (
+        <Animated.ScrollView {...scrollProps} ref={scrollRef}>
+          {children}
+        </Animated.ScrollView>
+      )}
       {scrollable && (
         <Animated.View
           pointerEvents="none"
@@ -102,6 +123,10 @@ export default function ScrollWithBar({
 const styles = StyleSheet.create({
   wrap: {
     flex: 1,
+    marginHorizontal: -layout.gutter,
+  },
+  content: {
+    paddingHorizontal: layout.gutter,
   },
   thumb: {
     position: 'absolute',

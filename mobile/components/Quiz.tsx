@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import {
@@ -9,6 +9,7 @@ import {
   type QuizAnswers,
   saveTasteQuiz,
 } from '../lib/profile';
+import { haptic } from '../lib/haptics';
 import { colors, radii, type } from '../theme';
 import PressScale from './PressScale';
 import { Chip, Dots, GlassCard, GlassScreen, PrimaryButton, TextLink } from './ui';
@@ -32,6 +33,12 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveFailed, setSaveFailed] = useState(false);
+  const life = useRef({ mounted: true, busy: false, added: false });
+  useEffect(() => {
+    const current = life.current;
+    current.mounted = true;
+    return () => { current.mounted = false; };
+  }, []);
 
   const fetchCategories = useCallback(
     (isLive: () => boolean = () => true) =>
@@ -56,8 +63,10 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
 
   function toggleFavorite(id: string) {
     if (favorites.includes(id)) {
+      haptic('selection');
       setFavorites(favorites.filter((f) => f !== id));
     } else if (favorites.length < MAX_FAVORITES) {
+      haptic('selection');
       setFavorites([...favorites, id]);
       setHardNos(hardNos.filter((h) => h !== id));
     }
@@ -65,26 +74,35 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
   }
 
   function toggleHardNo(id: string) {
+    haptic('selection');
     setHardNos(hardNos.includes(id) ? hardNos.filter((h) => h !== id) : [...hardNos, id]);
   }
 
   function addCompanion() {
+    if (life.current.added) return;
+    life.current.added = true;
     const trimmed = name.trim();
     const taken = companions.some((c) => c.toLowerCase() === trimmed.toLowerCase());
     if (trimmed && !taken && companions.length < MAX_COMPANIONS) {
       setCompanions([...companions, trimmed]);
+      haptic('light');
     }
     setName('');
   }
 
   async function save(solo: boolean) {
-    if (budget === null || saving) return;
+    if (budget === null || life.current.busy) return;
+    life.current.busy = true;
     setSaving(true);
     setSaveFailed(false);
     try {
       await saveTasteQuiz({ favorites, hardNos, budget, mostlySolo: solo, companions });
+      if (!life.current.mounted) return;
+      haptic('success');
       onDone();
     } catch {
+      life.current.busy = false;
+      if (!life.current.mounted) return;
       setSaveFailed(true);
       setSaving(false);
     }
@@ -96,6 +114,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
     if (solo) {
       save(true);
     } else {
+      if (mostlySolo !== false) haptic('selection');
       setStep(4);
     }
   }
@@ -138,6 +157,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
             key={c.id}
             label={c.name}
             selected={favorites.includes(c.id)}
+            feedback={false}
             onPress={() => toggleFavorite(c.id)}
           />
         ))}
@@ -155,6 +175,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
               key={c.id}
               label={c.name}
               selected={hardNos.includes(c.id)}
+              feedback={false}
               onPress={() => toggleHardNo(c.id)}
             />
           ))}
@@ -172,6 +193,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
             label={b.label}
             detail={b.detail}
             selected={budget === b.level}
+            feedback="selection"
             onPress={() => {
               setBudget(b.level);
               setStep(3);
@@ -184,8 +206,8 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
     title = 'Solo or with people?';
     body = (
       <View style={styles.stack}>
-        <Chip wide label="Solo" selected={mostlySolo === true} onPress={() => chooseSolo(true)} />
-        <Chip wide label="With people" selected={mostlySolo === false} onPress={() => chooseSolo(false)} />
+        <Chip wide label="Solo" feedback={false} disabled={saving} selected={mostlySolo === true} onPress={() => chooseSolo(true)} />
+        <Chip wide label="With people" feedback={false} disabled={saving} selected={mostlySolo === false} onPress={() => chooseSolo(false)} />
         {saving && <ActivityIndicator style={styles.spinner} />}
       </View>
     );
@@ -199,7 +221,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
             placeholder="Name"
             placeholderTextColor={colors.textSecondary}
             value={name}
-            onChangeText={setName}
+            onChangeText={(value) => { life.current.added = false; setName(value); }}
             onSubmitEditing={addCompanion}
             submitBehavior="submit"
             returnKeyType="done"
@@ -220,7 +242,7 @@ export default function Quiz({ onDone }: { onDone: () => void }) {
       </View>
     );
     footer = (
-      <PrimaryButton label={companions.length ? 'Done' : 'Skip'} busy={saving} onPress={() => save(false)} />
+      <PrimaryButton label={companions.length ? 'Done' : 'Skip'} feedback={false} busy={saving} onPress={() => save(false)} />
     );
   }
 

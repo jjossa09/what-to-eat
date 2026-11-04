@@ -9,6 +9,7 @@ import { Attribution, EmojiPin } from '../components/PlaceMap';
 import PressScale from '../components/PressScale';
 import { Chip, GlassCard, GlassScreen, PrimaryButton, useTabBarSpace } from '../components/ui';
 import { useReduceMotion } from '../lib/accessibility';
+import { haptic } from '../lib/haptics';
 import type { Place } from '../lib/api';
 import { getPosition, type Position } from '../lib/location';
 import {
@@ -23,7 +24,7 @@ import {
   searchArea,
 } from '../lib/places';
 import { loadCategories } from '../lib/profile';
-import { colors, emojiFor, frame, map, motion, radii, spacing, type } from '../theme';
+import { colors, emojiFor, frame, layout, map, motion, radii, spacing, type } from '../theme';
 
 // Map tab (P1-13): Apple Map centered on the user with nearby places as emoji pins. One search
 // when the tab opens, reused until the user moves about 500 m. "Search this area" (P1-23): after
@@ -59,6 +60,12 @@ export default function MapScreen() {
   const searched = useRef<Region | null>(null);
   const visible = useRef<Region | null>(null);
   const selectedId = useRef<string | null>(null); // read by merges; never dropped by the cap
+  const interaction = useRef({ mounted: true, searching: false });
+  useEffect(() => {
+    const current = interaction.current;
+    current.mounted = true;
+    return () => { current.mounted = false; };
+  }, []);
   const reduceMotion = useReduceMotion();
   const [bounce] = useState(() => new Animated.Value(1));
   const ready = user !== null; // the button exists once the map does
@@ -157,13 +164,19 @@ export default function MapScreen() {
 
   async function searchThisArea() {
     const region = visible.current;
-    if (!region || area === 'searching') return;
+    if (!region || interaction.current.searching) return;
+    interaction.current.searching = true;
     setArea('searching');
     try {
-      merge(await searchArea(regionSearch(region)), region);
+      const found = await searchArea(regionSearch(region));
+      if (!interaction.current.mounted) return;
+      merge(found, region);
       setArea('hidden');
+      if (navigation.isFocused()) haptic('success');
     } catch {
-      setArea('failed');
+      if (interaction.current.mounted) setArea('failed');
+    } finally {
+      interaction.current.searching = false;
     }
   }
 
@@ -201,7 +214,7 @@ export default function MapScreen() {
         onRegionChangeComplete={onRegionChangeComplete}
         onPress={(e) => {
           // A pin tap also reaches the map on iOS; only a tap on the map itself closes the card.
-          if (e.nativeEvent.action !== 'marker-press') setSelected(null);
+          if (e.nativeEvent.action !== 'marker-press') { selectedId.current = null; setSelected(null); }
         }}
       >
         {places.map((p) => (
@@ -209,7 +222,11 @@ export default function MapScreen() {
             key={`${p.id}-${p.id === selected?.id}`}
             coordinate={{ latitude: p.lat, longitude: p.lon }}
             tracksViewChanges={false}
-            onPress={() => setSelected(p)}
+            onPress={() => {
+              if (selectedId.current !== p.id) haptic('selection');
+              selectedId.current = p.id;
+              setSelected(p);
+            }}
           >
             <EmojiPin category={p.category} selected={p.id === selected?.id} />
           </Marker>
@@ -240,7 +257,7 @@ export default function MapScreen() {
         {area === 'failed' && (
           <View style={styles.pill}>
             <Text style={styles.problemText}>Couldn&apos;t load places.</Text>
-            <Chip label="Try again" onPress={searchThisArea} />
+            <Chip label="Try again" feedback={false} onPress={searchThisArea} />
           </View>
         )}
       </View>
@@ -270,6 +287,7 @@ export default function MapScreen() {
         )}
         <Animated.View style={[styles.fab, { transform: [{ scale: bounce }] }]}>
           <PressScale
+            feedback="light"
             onPress={() => navigation.navigate('Eat')}
             accessibilityRole="button"
             accessibilityLabel="What to eat?!"
@@ -298,8 +316,8 @@ const styles = StyleSheet.create({
   },
   top: {
     position: 'absolute',
-    left: spacing.lg,
-    right: spacing.lg,
+    left: layout.gutter,
+    right: layout.gutter,
     alignItems: 'center',
     gap: spacing.sm,
   },
@@ -325,8 +343,8 @@ const styles = StyleSheet.create({
   },
   bottom: {
     position: 'absolute',
-    left: spacing.lg,
-    right: spacing.lg,
+    left: layout.gutter,
+    right: layout.gutter,
     gap: spacing.md,
   },
   cardTop: {

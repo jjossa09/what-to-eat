@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { setDisplayName } from '../lib/profile';
+import { haptic } from '../lib/haptics';
 import { colors, radii, spacing, type } from '../theme';
 import { GlassCard, GlassScreen, PrimaryButton } from './ui';
 
@@ -13,16 +14,27 @@ export default function NameStep({ onDone }: { onDone: () => void }) {
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState(false);
+  const life = useRef({ mounted: true, busy: false });
+  useEffect(() => {
+    const current = life.current;
+    current.mounted = true;
+    return () => { current.mounted = false; };
+  }, []);
   const clean = name.trim();
 
   async function save() {
-    if (!clean || saving) return;
+    if (!clean || life.current.busy) return;
+    life.current.busy = true;
     setSaving(true);
     setFailed(false);
     try {
       await setDisplayName(clean);
+      if (!life.current.mounted) return;
+      haptic('success');
       onDone();
     } catch {
+      life.current.busy = false;
+      if (!life.current.mounted) return;
       setFailed(true);
       setSaving(false);
     }
@@ -48,7 +60,7 @@ export default function NameStep({ onDone }: { onDone: () => void }) {
           />
         </GlassCard>
         {failed && <Text style={styles.error}>Couldn&apos;t save. Try again.</Text>}
-        <PrimaryButton label="Continue" disabled={!clean} busy={saving} onPress={save} />
+        <PrimaryButton label="Continue" feedback={false} disabled={!clean} busy={saving} onPress={save} />
       </View>
     </GlassScreen>
   );

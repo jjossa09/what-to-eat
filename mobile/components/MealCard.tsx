@@ -16,9 +16,10 @@ import {
 
 import { useReduceMotion, useReduceTransparency } from '../lib/accessibility';
 import { MAX_DISH } from '../lib/feedback';
+import { haptic } from '../lib/haptics';
 import { canEdit, editMeal, type Meal, type MealEdit, mealWhen, slotLabel } from '../lib/meals';
 import { BUDGETS } from '../lib/profile';
-import { colors, emojiFor, mealCard, radii, spacing, type } from '../theme';
+import { colors, emojiFor, layout, mealCard, radii, spacing, type } from '../theme';
 import GlassFrame from './GlassFrame';
 import PressScale from './PressScale';
 import { Chip, PrimaryButton, SecondaryButton } from './ui';
@@ -61,7 +62,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   const window = useWindowDimensions();
   const reduceMotion = useReduceMotion();
   const reduceTransparency = useReduceTransparency();
-  const size = Math.min(mealCard.maxSize, window.width - 2 * spacing.xl);
+  const size = Math.min(mealCard.maxSize, window.width - 2 * layout.gutter);
   const left = (window.width - size) / 2;
   const top = (window.height - size) / 2;
 
@@ -72,6 +73,25 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   const [solo, setSolo] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState(false);
+  const [interaction] = useState(() => {
+    let mounted = true, busy = false, closed = false;
+    return {
+      mount: () => { mounted = true; }, unmount: () => { mounted = false; },
+      current: () => mounted && !closed,
+      beginSave: () => { if (busy || closed) return false; busy = true; return true; },
+      endSave: () => { busy = false; },
+      dismiss: () => { if (closed) return false; closed = true; return true; },
+    };
+  });
+  useEffect(() => {
+    interaction.mount();
+    return () => interaction.unmount();
+  }, [interaction]);
+  // Event-only position tracking, like ScrollWithBar's timer: no per-frame React updates.
+  const [detailScroll] = useState(() => {
+    let offset = 0;
+    return { atTop: () => offset <= 0, move: (y: number) => { offset = y; } };
+  });
 
   // p: 0 = in the row, 1 = open. drag: the swipe down. lift: clears the keyboard while editing.
   const [anim] = useState(() => ({
@@ -91,7 +111,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   }, [anim, reduceMotion]);
 
   function dismiss() {
-    if (closing) return;
+    if (closing || !interaction.dismiss()) return;
     setClosing(true);
     Keyboard.dismiss();
     const duration = reduceMotion ? mealCard.fadeMs : mealCard.closeMs;
@@ -107,7 +127,8 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   const springBack = () =>
     Animated.spring(anim.drag, { toValue: 0, ...mealCard.openSpring, useNativeDriver: true }).start();
   const pan = PanResponder.create({
-    onMoveShouldSetPanResponder: (_, g) => !editing && g.dy > 8 && Math.abs(g.dy) > Math.abs(g.dx),
+    onMoveShouldSetPanResponder: (_, g) => !editing && detailScroll.atTop()
+      && g.dy > 8 && Math.abs(g.dy) > Math.abs(g.dx),
     onPanResponderMove: (_, g) => anim.drag.setValue(Math.max(0, g.dy)),
     onPanResponderRelease: (_, g) => {
       if (g.dy > mealCard.swipeCloseDy || g.vy > mealCard.swipeCloseVy) dismiss();
@@ -158,6 +179,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   const scrimOpacity = anim.p.interpolate({ inputRange: [0, 1], outputRange: [0, 1], extrapolate: 'clamp' });
 
   function startEdit() {
+    detailScroll.move(0);
     setDish(meal.dish ?? '');
     setStars(meal.stars);
     setPrice(meal.priceTap);
@@ -167,7 +189,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
   }
 
   async function save() {
-    if (saving) return;
+    if (!interaction.beginSave()) return;
     const edit: MealEdit = {};
     const clean = dish.trim();
     if (clean !== (meal.dish ?? '')) edit.dish = clean;
@@ -175,6 +197,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     if (price !== null && price !== meal.priceTap) edit.priceTap = price;
     if (solo !== null && solo !== meal.solo) edit.solo = solo;
     if (Object.keys(edit).length === 0) {
+      interaction.endSave();
       setEditing(false);
       return;
     }
@@ -184,16 +207,32 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     try {
       await editMeal(meal.id, edit);
       await onSaved();
+      if (!interaction.current()) return;
+      haptic('success');
       setEditing(false);
     } catch {
-      setFailed(true);
+      if (interaction.current()) setFailed(true);
     } finally {
-      setSaving(false);
+      interaction.endSave();
+      if (interaction.current()) setSaving(false);
     }
   }
 
   const had = meal.dish ?? (meal.ateAnswered ? categoryName(meal.category) : null) ?? 'Not answered yet';
   const slot = slotLabel(meal.mealSlot);
+  const header = (
+    <View style={styles.header}>
+      <Text style={styles.emoji}>{emojiFor(meal.category)}</Text>
+      <Text style={styles.place} numberOfLines={editing ? 2 : undefined}>
+        {meal.placeName}
+      </Text>
+      {canEdit(meal) && !editing && (
+        <PressScale feedback="light" onPress={startEdit} accessibilityRole="button" hitSlop={12} style={styles.editButton}>
+          <Text style={styles.editText}>Edit</Text>
+        </PressScale>
+      )}
+    </View>
+  );
 
   return (
     <Modal transparent visible animationType="none" onRequestClose={dismiss}>
@@ -209,22 +248,11 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
         style={[styles.card, { left, top, width: size, height: size, transform }]}
         {...pan.panHandlers}
       >
-        <GlassFrame shape="rounded" radius={radii.card} style={{ width: size, height: size }}>
+        <GlassFrame shape="rounded" variant="frosted" radius={radii.card} style={{ width: size, height: size }}>
           <Animated.View style={[styles.body, { opacity: contentOpacity }]}>
-            <View style={styles.header}>
-              <Text style={styles.emoji}>{emojiFor(meal.category)}</Text>
-              <Text style={styles.place} numberOfLines={2}>
-                {meal.placeName}
-              </Text>
-              {canEdit(meal) && !editing && (
-                <PressScale onPress={startEdit} accessibilityRole="button" hitSlop={12} style={styles.editButton}>
-                  <Text style={styles.editText}>Edit</Text>
-                </PressScale>
-              )}
-            </View>
-
             {editing ? (
               <>
+                {header}
                 <ScrollView style={styles.fill} contentContainerStyle={styles.form} keyboardShouldPersistTaps="handled">
                   <TextInput
                     style={styles.input}
@@ -240,7 +268,8 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
                     {STARS.map((n) => (
                       <PressScale
                         key={n}
-                        onPress={() => setStars(n)}
+                        disabled={saving}
+                        onPress={() => { if (stars !== n) { setStars(n); haptic('selection'); } }}
                         accessibilityRole="button"
                         accessibilityLabel={`${n} star${n > 1 ? 's' : ''}`}
                         accessibilityState={{ selected: stars !== null && n <= stars }}
@@ -254,12 +283,12 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
                   </View>
                   <View style={styles.chips}>
                     {BUDGETS.map((b) => (
-                      <Chip key={b.level} label={b.label} selected={price === b.level} onPress={() => setPrice(b.level)} />
+                      <Chip key={b.level} label={b.label} feedback="selection" disabled={saving} selected={price === b.level} onPress={() => setPrice(b.level)} />
                     ))}
                   </View>
                   <View style={styles.chips}>
-                    <Chip label="Solo" selected={solo === true} onPress={() => setSolo(true)} />
-                    <Chip label="With people" selected={solo === false} onPress={() => setSolo(false)} />
+                    <Chip label="Solo" feedback="selection" disabled={saving} selected={solo === true} onPress={() => setSolo(true)} />
+                    <Chip label="With people" feedback="selection" disabled={saving} selected={solo === false} onPress={() => setSolo(false)} />
                   </View>
                   {failed && <Text style={styles.error}>Couldn&apos;t save.</Text>}
                 </ScrollView>
@@ -269,12 +298,14 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
                     <SecondaryButton label="Cancel" onPress={() => setEditing(false)} disabled={saving} />
                   </View>
                   <View style={styles.action}>
-                    <PrimaryButton label="Save" onPress={save} busy={saving} />
+                    <PrimaryButton label="Save" feedback={false} onPress={save} busy={saving} />
                   </View>
                 </View>
               </>
             ) : (
-              <View style={styles.details}>
+              <ScrollView style={styles.fill} contentContainerStyle={styles.details}
+                onScroll={(e) => detailScroll.move(e.nativeEvent.contentOffset.y)} scrollEventThrottle={16}>
+                {header}
                 <Line label="When" value={mealWhen(meal)} />
                 {slot && <Line label="Time" value={slot} />}
                 <Line label="Had" value={had} />
@@ -294,7 +325,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
                   )}
                 </View>
                 <Line label="Price" value={priceText(meal)} muted={meal.priceLevel === null} />
-              </View>
+              </ScrollView>
             )}
           </Animated.View>
         </GlassFrame>
@@ -307,7 +338,7 @@ function Line({ label, value, muted = false }: { label: string; value: string; m
   return (
     <View style={styles.line}>
       <Text style={styles.label}>{label}</Text>
-      <Text style={muted ? styles.valueMuted : styles.value} numberOfLines={1}>
+      <Text style={muted ? styles.valueMuted : styles.value}>
         {value}
       </Text>
     </View>
@@ -361,9 +392,11 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   label: {
-    width: 56,
+    minWidth: 56,
+    flexShrink: 0,
     fontSize: type.small,
-    color: colors.textSecondary,
+    fontWeight: '600',
+    color: colors.text,
   },
   value: {
     flex: 1,

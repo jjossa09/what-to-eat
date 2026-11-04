@@ -1,8 +1,8 @@
-import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { type ReactNode, useCallback, useRef, useState } from 'react';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
+import ScrollWithBar from '../components/ScrollWithBar';
 import { Chip, GlassCard, GlassScreen, PrimaryButton, SecondaryButton, useTabBarSpace } from '../components/ui';
 import { getInsights } from '../lib/api';
 import { type InsightsState, loadInsights, localInsightsDate } from '../lib/insights';
@@ -43,15 +43,14 @@ function Section({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-export default function ProfileScreen({ userId, onSignOut }: { userId: string; onSignOut: () => void }) {
+export default function ProfileScreen({ userId, onSignOut, showInsights, onInsightsChange }: {
+  userId: string; onSignOut: () => void; showInsights: boolean; onInsightsChange: (show: boolean) => void;
+}) {
   const space = useTabBarSpace();
   const [data, setData] = useState<Data | null>(null);
   const [failed, setFailed] = useState(false);
   const [insights, setInsights] = useState<InsightsState>({ status: 'loading' });
-  const [showInsights, setShowInsights] = useState(false);
   const insightRequest = useRef(0);
-  const navigation = useNavigation<BottomTabNavigationProp<{ Profile: undefined }>>();
-  useEffect(() => navigation.addListener('tabPress', () => setShowInsights(false)), [navigation]);
 
   const refreshInsights = useCallback(async (categories: Category[]) => {
     const requestId = ++insightRequest.current;
@@ -113,7 +112,7 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
   }
 
   if (showInsights) {
-    return <InsightsScreen state={insights} onClose={() => setShowInsights(false)}
+    return <InsightsScreen state={insights} onClose={() => onInsightsChange(false)}
       onRefresh={() => { void refreshInsights(data.categories); }} />;
   }
 
@@ -124,9 +123,8 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
 
   return (
     <GlassScreen tabBar>
-      <ScrollView
+      <ScrollWithBar
         contentContainerStyle={[styles.scroll, { paddingBottom: space }]}
-        showsVerticalScrollIndicator={false}
       >
         <View style={styles.top}>
           <View style={styles.avatar}>
@@ -168,9 +166,9 @@ export default function ProfileScreen({ userId, onSignOut }: { userId: string; o
           </Section>
         </GlassCard>
 
-        <SecondaryButton label="Insights" onPress={() => setShowInsights(true)} />
+        <SecondaryButton label="Insights" onPress={() => onInsightsChange(true)} />
         <PrimaryButton label="Sign out" onPress={onSignOut} />
-      </ScrollView>
+      </ScrollWithBar>
     </GlassScreen>
   );
 }

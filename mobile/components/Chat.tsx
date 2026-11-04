@@ -1,6 +1,8 @@
-import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { Fragment, type ReactNode, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Keyboard,
   KeyboardAvoidingView,
   Linking,
@@ -32,7 +34,9 @@ import {
   type TranscriptMessage,
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
+import { haptic } from '../lib/haptics';
 import { remindAfterPick } from '../lib/notify';
+import { OtisController } from '../lib/otis';
 import {
   budgetPick as pickBudget, companySelection, matchCompany, planPrefill,
   type Prefill, skippedAnswers, traceOf,
@@ -46,9 +50,10 @@ import {
   loadTastePrior,
   type TastePrior,
 } from '../lib/profile';
-import { ReasonsCache, type ReasonsEnvelope } from '../lib/reasons';
-import { colors, radii, spacing, type } from '../theme';
+import { ReasonsCache, type ReasonsEnvelope, type ReasonsObserver } from '../lib/reasons';
+import { colors, otis as otisTheme, radii, spacing, type } from '../theme';
 import Composer from './Composer';
+import Otis from './Otis';
 import ResultCards from './ResultCards';
 import ScrollWithBar from './ScrollWithBar';
 import TypingBubble from './TypingBubble';
@@ -86,6 +91,7 @@ type Round = {
   round: number | null;
   envelope?: ReasonsEnvelope | null;
   generation: number;
+  lifecycle: ReasonsObserver;
   final: boolean; // the cap round: None of these ends the session
 };
 type Answers = { craving: string | null; budget: number; radius: Radius; exclude: string[] };
@@ -194,7 +200,20 @@ type ChatProps = {
 
 export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [reasonsCache] = useState(() => new ReasonsCache());
-  useEffect(() => () => reasonsCache.clear(), [reasonsCache, userId]);
+  const [otis] = useState(() => new OtisController(otisTheme.happyMs));
+  const otisStatus = useSyncExternalStore(otis.subscribe, otis.getSnapshot);
+  const navigation = useNavigation();
+  useFocusEffect(useCallback(() => {
+    otis.setActive(AppState.currentState === 'active');
+    return () => otis.setActive(false);
+  }, [otis]));
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      otis.setActive(state === 'active' && navigation.isFocused());
+    });
+    return () => sub.remove();
+  }, [navigation, otis]);
+  useEffect(() => () => { reasonsCache.clear(); otis.cancel(); }, [reasonsCache, otis, userId]);
   const [categories, setCategories] = useState<Category[] | null>(null);
   const [prior, setPrior] = useState<TastePrior | null>(null);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
@@ -385,6 +404,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseCompany(value: Exclude<CompanyAnswer, null>, text?: string) {
     if (busy.current) return;
+    if (text === undefined) {
+      if (value !== 'solo') haptic('light'); // Continue confirms the selected companions.
+      else if (companyPick !== 'solo') haptic('selection');
+    }
     companyTrace.current.shown = companyPick;
     companyAnswer.current = value;
     const label = value === 'solo' ? 'Solo' : value.length > 2 ? `${value.length} companions`
@@ -397,6 +420,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseCraving(id: string | null, label: string) {
     if (busy.current) return;
+    if (id === null || cravingPick !== id) haptic('selection');
     noteShown('craving');
     answers.current.craving = id;
     record('craving', label, { craving: id }, id !== null && cravingPick === id ? 'prefill' : 'chip');
@@ -405,6 +429,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseBudget(level: number, label: string) {
     if (busy.current) return;
+    if (budgetPick !== level) haptic('selection');
     noteShown('budget');
     answers.current.budget = level;
     record('budget', label, { budget_level: level }, budgetPick === level ? 'prefill' : 'chip');
@@ -413,6 +438,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseDistance(radius: Radius, label: string) {
     if (busy.current) return;
+    if (radiusPick !== radius) haptic('selection');
     noteShown('distance');
     answers.current.radius = radius;
     record('distance', label, { radius_m: radius }, radiusPick === radius ? 'prefill' : 'chip');
@@ -463,6 +489,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   function rejectRound(): boolean {
     if (busy.current) return false;
     reasonsCache.invalidate();
+    otis.cancel();
     noneOfThese.current = true;
     record('refine', 'None of these', { none_of_these: true }, 'chip');
     if (nextQuestion) askLine(REFINE_QUESTIONS[nextQuestion.key], nextQuestion.key);
@@ -488,6 +515,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   function chooseFollowUp(change: Partial<Change>, label: string, asked?: RefinementKey) {
     if (busy.current) return;
+    haptic('light');
     setUnsent(null);
     followUp(change, label, 'chip', label, asked);
   }
@@ -495,6 +523,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   /** After a pick or None of these: a new session that starts at the craving. */
   function startNewSearch(plan: PlanResponse | null) {
     reasonsCache.invalidate();
+    otis.cancel();
     sessionId.current = null;
     shownIds.current = [];
     transcript.current = [];
@@ -538,6 +567,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     const key = first ?? (nextIsOpen.current ? 'open' : 'refine');
     busy.current = true;
     setParsing(true);
+    const operation = otis.begin();
     if (!first || fresh) reasonsCache.invalidate();
     let result: ParseResponse | null = null;
     let freshPlan: PlanResponse | null = null;
@@ -555,6 +585,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       setParsing(false);
     }
     if (failed) {
+      otis.finish(operation);
       // The bubble stays; the error line goes under it, and Try again resends the text.
       say('assistant', PROBLEM_TEXT[failed], true);
       setUnsent({ text, problem: failed });
@@ -562,6 +593,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     }
     // Small talk: one line back, the question and its chips stay. Not an answer, not logged.
     if (result?.status === 'chat' && result.reply) {
+      otis.finish(operation);
       say('assistant', withName(result.reply, name));
       return;
     }
@@ -582,6 +614,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       return;
     }
     if (!parsed) {
+      otis.finish(operation);
       // Not sure, but it may have answered later questions (FR4 prefill).
       const partial = result?.status === 'not_sure' ? result.answer : null;
       if (partial && first) prefill(first, partial);
@@ -590,6 +623,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     }
     if (first) typedFirst(first, parsed, text);
     else followUp(parsed, text, 'text');
+    // A third answer may already have begun the next operation; this token then does nothing.
+    otis.finish(operation);
   }
 
   // Rounds ---------------------------------------------------------------------
@@ -602,6 +637,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   async function fetchRound(change?: Partial<Change>) {
     reasonsCache.invalidate();
+    const operation = otis.begin();
     pendingChange.current = change;
     busy.current = true;
     setProblem(null);
@@ -610,7 +646,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     if (!where.ok) {
       location.current = null; // the next try asks again
       busy.current = false;
-      fail(where.reason === 'denied' ? 'denied' : 'nofix');
+      fail(where.reason === 'denied' ? 'denied' : 'nofix', operation);
       return;
     }
     try {
@@ -660,12 +696,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       const id = line ? say('assistant', line) : null;
       if (id !== null && result.picks.length) {
         const round = result.session_id ? result.round : null;
+        const generation = reasonsCache.current();
+        const lifecycle = otis.observeReasons(operation, { userId, sessionId: result.session_id, round, generation },
+          result.picks.map((p) => p.id));
         setRounds((prev) => [
           ...prev,
           { bubbleId: id, picks: result.picks, sessionId: result.session_id, round, final: result.best_so_far,
-            envelope: result.reasons_envelope, generation: reasonsCache.current() },
+            envelope: result.reasons_envelope, generation, lifecycle },
         ]);
-      }
+      } else otis.finish(operation);
       if (result.best_so_far) {
         ask('open');
         nextIsOpen.current = true;
@@ -680,14 +719,16 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       setStep('results');
     } catch (e) {
       const kind = e instanceof ApiError ? e.kind : 'network';
-      fail(kind === 'conflict' || kind === 'notfound' ? 'server' : kind);
+      fail(kind === 'conflict' || kind === 'notfound' ? 'server' : kind, operation);
     } finally {
       busy.current = false;
     }
   }
 
   /** A failed step: the error line in the thread, the fix as chips below. */
-  function fail(kind: Problem) {
+  function fail(kind: Problem, operation?: number) {
+    if (operation === undefined) otis.cancel();
+    else otis.finish(operation);
     say('assistant', PROBLEM_TEXT[kind], true);
     setProblem(kind);
     setStep('error');
@@ -728,10 +769,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
             key={id}
             label={cravingLabel(id)}
             selected={cravingPick === id}
+            feedback={false}
             onPress={() => chooseCraving(id, cravingLabel(id))}
           />
         ))}
-        <Chip label="Anything" onPress={() => chooseCraving(null, 'Anything')} />
+        <Chip label="Anything" feedback={false} onPress={() => chooseCraving(null, 'Anything')} />
         {!showAll && <Chip label="More" onPress={() => setShowAll(true)} />}
       </>
     );
@@ -744,15 +786,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
             key={c.id}
             label={c.name}
             selected={selected.includes(c.id)}
+            feedback={false}
             onPress={() => {
               if (busy.current) return;
+              haptic('selection');
               setCompanyPick(selected.includes(c.id)
                 ? selected.filter((id) => id !== c.id) : [...selected, c.id].sort());
             }}
           />
         ))}
-        <Chip label="Solo" selected={companyPick === 'solo'} onPress={() => chooseCompany('solo')} />
-        {selected.length > 0 && <Chip label="Continue" onPress={() => chooseCompany(selected)} />}
+        <Chip label="Solo" feedback={false} selected={companyPick === 'solo'} onPress={() => chooseCompany('solo')} />
+        {selected.length > 0 && <Chip label="Continue" feedback={false} onPress={() => chooseCompany(selected)} />}
       </>
     );
   } else if (step === 'budget') {
@@ -761,6 +805,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         key={b.level}
         label={b.label}
         selected={budgetPick === b.level}
+        feedback={false}
         onPress={() => chooseBudget(b.level, b.label)}
       />
     ));
@@ -770,16 +815,17 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         key={d.radius}
         label={d.label}
         selected={radiusPick === d.radius}
+        feedback={false}
         onPress={() => chooseDistance(d.radius, d.label)}
       />
     ));
   } else if (step === 'results' && !decided && refining && nextQuestion) {
     chips = questionChips(nextQuestion).map((f) => (
-      <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label, nextQuestion.key)} />
+      <Chip key={f.label} label={f.label} feedback={false} onPress={() => chooseFollowUp(f.change, f.label, nextQuestion.key)} />
     ));
   } else if (step === 'results' && !decided && refining) {
     chips = followUps(lastRound.radius, lastRound.empty).map((f) => (
-      <Chip key={f.label} label={f.label} onPress={() => chooseFollowUp(f.change, f.label)} />
+      <Chip key={f.label} label={f.label} feedback={false} onPress={() => chooseFollowUp(f.change, f.label)} />
     ));
   } else if (step === 'error' && problem) {
     chips = (
@@ -822,14 +868,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const composerOff = step === 'loading' || step === 'error' || !categories;
 
   const latest = rounds.length ? rounds[rounds.length - 1].bubbleId : null;
+  const decisionGeneration = reasonsCache.current();
+  const conversationId = nextId.current;
 
   return (
     <GlassScreen tabBar>
       <KeyboardAvoidingView behavior="padding" style={styles.fill}>
+        <Otis state={otisStatus.state} active={otisStatus.active} keyboard={keyboard} />
         <ScrollWithBar
           scrollRef={scroll}
-          // Full screen width, so the scroll bar sits at the screen's right edge.
-          style={styles.edgeToEdge}
           contentContainerStyle={styles.thread}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
@@ -854,8 +901,19 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                     envelope={r.envelope}
                     reasonsCache={reasonsCache}
                     generation={r.generation}
+                    lifecycle={r.lifecycle}
+                    active={otisStatus.active}
                     userId={userId}
-                    onDecisionStart={() => reasonsCache.invalidate()}
+                    onDecisionStart={() => {
+                      // Reject events from before a parse, new round or search reset,
+                      // including the interval before the old cards rerender read-only.
+                      if (busy.current || b.id !== latest || sessionId.current !== r.sessionId
+                        || nextId.current !== conversationId || !reasonsCache.isCurrent(decisionGeneration)) return false;
+                      reasonsCache.invalidate();
+                      otis.cancel();
+                      const generation = reasonsCache.current();
+                      return () => reasonsCache.isCurrent(generation);
+                    }}
                     user={user}
                     sessionId={r.sessionId}
                     round={r.round}
@@ -870,10 +928,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               </Fragment>
             );
           })}
-          {parsing && <TypingBubble />}
-          {step === 'loading' && (
+          {parsing && otisStatus.active && <TypingBubble />}
+          {otisStatus.state === 'thinking' && !parsing && (
             <View style={[styles.bubble, styles.theirs]}>
-              <Text style={styles.bubbleText}>Finding spots…</Text>
+              <Text accessibilityLiveRegion="polite" style={styles.bubbleText}>
+                {step === 'loading' ? 'Finding spots…' : 'Finishing reasons…'}
+              </Text>
             </View>
           )}
         </ScrollWithBar>
@@ -900,12 +960,8 @@ const styles = StyleSheet.create({
   fill: {
     flex: 1,
   },
-  edgeToEdge: {
-    marginHorizontal: -spacing.xl, // undoes GlassScreen's side padding
-  },
   thread: {
     gap: 10,
-    paddingHorizontal: spacing.xl,
     paddingBottom: spacing.lg,
   },
   spinner: {

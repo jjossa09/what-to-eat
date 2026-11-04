@@ -376,7 +376,8 @@ async def recommendations(
         and followed
         and await quietly(
             funnel.log_shown(
-                user_id, token, ref, ranking.top3, template_lines, muse.TEMPLATE, client=client
+                user_id, token, ref, ranking.top3, template_lines, muse.TEMPLATE,
+                budget_level=answers.budget_level, client=client
             ),
             "shown",
             deadline=deadline,
@@ -536,7 +537,8 @@ async def best_so_far_round(
     logged = bool(
         saved
         and followed
-        and await quietly(funnel.log_shown_rows(user_id, token, ref, cards, client=client),
+        and await quietly(funnel.log_shown_rows(user_id, token, ref, cards,
+                                               budget_level=answers.budget_level, client=client),
                           "shown", deadline=deadline)
     )
     logger.info(
@@ -731,11 +733,12 @@ async def picked(
     """Final choice (FR9): the picked event, the live meal, and outcome = 'picked'."""
     user_id, token = auth
     try:
-        await funnel.log_pick(user_id, token, str(session_id), body.round, body.place_id,
-                              client=client)
+        meal_id = await funnel.log_pick(user_id, token, str(session_id), body.round, body.place_id,
+                                        client=client)
     except funnel.FunnelError as e:
         raise funnel_error(e) from None
-    return {"logged": True}
+    # Additive identity lets callers verify that an exact retry refers to the same meal.
+    return {"logged": True, "meal_id": meal_id}
 
 
 @app.post("/sessions/{session_id}/none")

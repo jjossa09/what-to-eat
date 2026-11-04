@@ -1,9 +1,10 @@
 import { useFocusEffect } from '@react-navigation/native';
 import { type ComponentRef, useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import MealCard, { type Rect } from '../components/MealCard';
 import PressScale from '../components/PressScale';
+import ScrollWithBar from '../components/ScrollWithBar';
 import { GlassCard, GlassScreen, PrimaryButton, ScreenTitle, useTabBarSpace } from '../components/ui';
 import { loadMeals, type Meal, mealLine } from '../lib/meals';
 import { loadCategories } from '../lib/profile';
@@ -29,6 +30,7 @@ function MealRow({ meal, onOpen }: { meal: Meal; onOpen: (meal: Meal, from: Rect
   return (
     <View ref={ref} collapsable={false}>
       <PressScale
+        feedback="light"
         onPress={() =>
           ref.current?.measureInWindow((x, y, width, height) => onOpen(meal, { x, y, width, height }))
         }
@@ -103,12 +105,13 @@ export default function MealsScreen({ userId }: { userId: string }) {
     content = <Text style={styles.empty}>No meals yet.</Text>;
   } else {
     content = (
-      <FlatList
-        data={meals}
-        keyExtractor={(m) => m.id}
+      <ScrollWithBar
+        list={{
+          data: meals,
+          keyExtractor: (m) => m.id,
+          renderItem: ({ item }) => <MealRow meal={item} onOpen={(m, from) => setOpen({ id: m.id, from })} />,
+        }}
         contentContainerStyle={[styles.list, { paddingBottom: space }]}
-        showsVerticalScrollIndicator={false}
-        renderItem={({ item }) => <MealRow meal={item} onOpen={(m, from) => setOpen({ id: m.id, from })} />}
       />
     );
   }
