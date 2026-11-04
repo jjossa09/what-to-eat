@@ -85,6 +85,7 @@ class NewSession:
     search_radius_m: int
     solo: bool | None = None
     companion_ids: frozenset[str] = frozenset()
+    company_confirmed: bool = False
 
 
 # REST plumbing ---------------------------------------------------------------
@@ -200,6 +201,7 @@ async def open_round(
             "radius_m": new.radius_m,
             "search_radius_m": new.search_radius_m,
             "solo": new.solo,
+            "company_confirmed": new.company_confirmed,
         }
         rows = await _send(client, "POST", "sessions", headers, params={"select": "id"},
                            json=row, prefer="return=representation")
@@ -374,6 +376,7 @@ async def log_shown(
     *,
     budget_level: int | None,
     client: httpx2.AsyncClient,
+    company: dict | None = None,
 ) -> None:
     """One 'shown' row per card, in one insert."""
     rows = [
@@ -387,18 +390,21 @@ async def log_shown(
         }
         for pick, reason in zip(picks, reasons, strict=True)
     ]
-    await log_shown_rows(user_id, token, ref, rows, budget_level=budget_level, client=client)
+    await log_shown_rows(user_id, token, ref, rows, budget_level=budget_level,
+                         company=company, client=client)
 
 
 async def log_shown_rows(
     user_id: str, token: str, ref: RoundRef, cards: list[dict], *,
     budget_level: int | None, client: httpx2.AsyncClient,
+    company: dict | None = None,
 ) -> None:
     """Shown rows from card fields (place_id, rank, slot, score, pick_reason, reasons_source)."""
     if not cards:
         return
     rows = [{"user_id": user_id, "session_id": ref.session_id, "round": ref.round,
-             "event": "shown", **card, "decision_budget_level": budget_level} for card in cards]
+             "event": "shown", **card, "decision_budget_level": budget_level,
+             "decision_company": company} for card in cards]
     await _send(client, "POST", "recommendation_events", _user_headers(token), json=rows)
 
 
@@ -428,8 +434,8 @@ async def log_messages(
 # Decisions -------------------------------------------------------------------
 
 SHOWN_SELECT = (
-    "place_id,places(category_id,lat,lon),"
-    "sessions(lat,lon,local_date,meal_slot,solo,outcome,session_companions(companion_id))"
+    "place_id,decision_company,places(category_id,lat,lon),"
+    "sessions(lat,lon,local_date,meal_slot,solo,outcome,company_confirmed,session_companions(companion_id))"
 )
 
 
@@ -490,12 +496,12 @@ async def log_pick(
     user_id: str, token: str, session_id: str, round_: int, place_id: str,
     *, client: httpx2.AsyncClient,
 ) -> str:
-    """Atomically save or verify this exact pick, then copy companions best-effort."""
+    """Atomically save or verify this pick, including its confirmed company snapshot."""
     shown = await find_shown(user_id, token, session_id, round_, place_id, client=client)
     session, place = shown["sessions"], shown["places"]
-    # Validate the existing embed before any primary write, as before. A transport
-    # failure copying these links AFTER commit must never invalidate the saved pick.
-    companions = _session_companions(session.get("session_companions"))
+    # Preserve validation of the existing embed. SQL owns companion copying under
+    # the same meal lock as edits; there is no delayed secondary write to race Solo.
+    _session_companions(session.get("session_companions"))  # validate the legacy embed, not labels
     headers = _user_headers(token)
     rows = await _send(client, "POST", "rpc/save_recommendation_pick", headers, json={
         "p_session_id": session_id, "p_round": round_, "p_place_id": place_id,
@@ -515,10 +521,6 @@ async def log_pick(
         meal_id = str(UUID(result["meal_id"]))
     except (KeyError, TypeError, ValueError, AttributeError):
         raise FunnelUpstreamError from None
-    if status == "saved" and companions:
-        await _write_companions(client, "meal_companions", headers,
-                                [{"meal_id": meal_id, "companion_id": cid,
-                                  "user_id": user_id} for cid in companions])
     return meal_id
 
 

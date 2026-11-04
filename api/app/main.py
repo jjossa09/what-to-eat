@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Literal
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
@@ -15,7 +15,20 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
-from app import funnel, gate, history, insights, muse, places, reasons, refine, takeaway, widening
+from app import companion_actions as actions
+from app import (
+    conversation,
+    funnel,
+    gate,
+    history,
+    insights,
+    muse,
+    places,
+    reasons,
+    refine,
+    takeaway,
+    widening,
+)
 from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
@@ -40,13 +53,16 @@ class LanguageRoute(APIRoute):
 
         async def bounded(request):
             path = request.url.path
-            if path not in ("/reasons", "/answers/parse"):
+            if path not in ("/reasons", "/answers/parse", "/conversation/parse"):
                 return await handler(request)
             seconds = REASONS_DEADLINE_S if path == "/reasons" else PARSE_DEADLINE_S
             try:
                 async with asyncio.timeout(seconds):
                     return await handler(request)
             except TimeoutError:
+                if path == "/conversation/parse":
+                    return JSONResponse({"intents": [{"type": "unknown"}],
+                                         "patch": {}, "understood": False})
                 return JSONResponse(reasons.EMPTY if path == "/reasons" else NOT_SURE)
             except RequestValidationError:
                 if path == "/reasons":
@@ -101,8 +117,13 @@ async def get_insights(
     as_of: date,
     auth: tuple[str, str] = Depends(current_auth),
     client: httpx2.AsyncClient = Depends(get_http_client),
+    from_date: date | None = None,
+    meal_slot: conversation.Slot | None = None,
 ) -> dict:
-    return await insights.response(*auth, as_of, client=client)
+    if from_date and from_date > as_of:
+        raise HTTPException(422, "Invalid date range")
+    return await insights.response(*auth, as_of, client=client,
+                                   from_date=from_date, meal_slot=meal_slot)
 
 
 class TakeawayRequest(BaseModel):
@@ -121,21 +142,44 @@ async def insights_takeaway(
 @app.get("/places/search")
 async def places_search(
     lat: float = Query(ge=-90, le=90),
-    lon: float = Query(ge=-180, le=180),
+    lon: float | None = Query(default=None, ge=-180, le=180),
+    lng: float | None = Query(default=None, ge=-180, le=180),
+    name: str | None = Query(default=None, min_length=1, max_length=80),
     radius_m: int | None = Query(default=None, ge=1, le=MAX_RADIUS_M),
     user_id: str = Depends(current_user),
     client: httpx2.AsyncClient = Depends(get_places_client),
 ) -> dict:
     """Catering places within radius_m (default PLACES_RADIUS_M). Empty list is a 200."""
+    longitude = lng if lng is not None else lon
+    if longitude is None or (lng is not None and lon is not None and lng != lon):
+        raise HTTPException(422, "Supply one longitude")
+    widened = False
     try:
-        result = await places.search(lat, lon, radius_m, client=client)
+        if name is None:
+            result = await places.search(lat, longitude, radius_m, client=client)
+        else:
+            async with asyncio.timeout(widening.PLACES_BUDGET_S):
+                result = await places.search(lat, longitude, radius_m, client=client,
+                                             name=name, bias=True)
+                matches = places.named_matches(result.places, name)
+                if not matches and result.radius_m < MAX_RADIUS_M:
+                    widened = True
+                    result = await places.search(lat, longitude, MAX_RADIUS_M, client=client,
+                                                 name=name, bias=True)
+                    matches = places.named_matches(result.places, name)
+                result = replace(result, places=matches)
+                await quietly(funnel.upsert_places(matches, client=client), "named places")
     except places.PlacesError as e:
         raise places_error(e) from None
+    except TimeoutError:
+        raise HTTPException(504, "Place lookup timed out") from None
     return {
         "radius_m": result.radius_m,
         "count": len(result.places),
         "truncated": result.truncated,
-        "places": [asdict(p) for p in result.places],
+        "places": [{k: v for k, v in asdict(p).items() if k != "brand" or v is not None}
+                   for p in result.places],
+        **({"widened": widened, "presentation": "nearby"} if name is not None else {}),
     }
 
 
@@ -174,7 +218,8 @@ class RecommendationsRequest(BaseModel):
     timezone: str | None = Field(default=None, max_length=64)  # device IANA zone
     solo: bool | None = None
     companion_ids: list[UUID] = Field(default_factory=list)
-    transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=8)
+    transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=40)
+    survey: conversation.Survey | None = None
     # Round 1 (P2-05): the question order the phone used and where it came from ("plan" or
     # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
     asked_order: list[JsonValue] | None = Field(default=None, max_length=10)
@@ -267,6 +312,14 @@ async def recommendations(
     started = time.perf_counter()
     deadline = started + ROUND_BUDGET_S
     user_id, token = auth
+    if body.survey is not None:
+        s = body.survey
+        body.craving, body.budget_level, body.radius_m = (
+            s.craving.value, s.budget.value, s.distance.value)
+        body.exclude_categories = s.exclusions
+        body.solo = True if s.company.value == "solo" else False if s.company.value else None
+        body.companion_ids = ([UUID(x) for x in s.company.value]
+                              if isinstance(s.company.value, list) else [])
     default_radius = get_settings().PLACES_RADIUS_M
     current = refine.Answers(body.craving, body.budget_level, refine.chip_radius(body.radius_m),
                              tuple(body.exclude_categories))
@@ -288,6 +341,8 @@ async def recommendations(
         search_radius_m=radius,
         solo=body.solo,
         companion_ids=frozenset(str(c) for c in body.companion_ids),
+        company_confirmed=bool(body.survey and body.survey.company.status == "confirmed"
+                               and body.survey.company.source in ("chip", "typed")),
     )
     session_id = str(body.session_id) if body.session_id else None
     opening = quietly(
@@ -377,7 +432,7 @@ async def recommendations(
         and await quietly(
             funnel.log_shown(
                 user_id, token, ref, ranking.top3, template_lines, muse.TEMPLATE,
-                budget_level=answers.budget_level, client=client
+                budget_level=answers.budget_level, company=company_snapshot(body), client=client
             ),
             "shown",
             deadline=deadline,
@@ -432,6 +487,13 @@ def answers_out(answers: refine.Answers) -> dict:
     }
 
 
+def company_snapshot(body: RecommendationsRequest) -> dict:
+    confirmed = bool(body.survey and body.survey.company.status == "confirmed"
+                     and body.survey.company.source in ("chip", "typed"))
+    return {"confirmed": confirmed, "solo": body.solo if confirmed else None,
+            "companion_ids": [str(cid) for cid in body.companion_ids] if confirmed else []}
+
+
 async def log_transcript(
     user_id: str, token: str, ref: funnel.RoundRef, body: RecommendationsRequest,
     client: httpx2.AsyncClient, *, deadline: float | None = None,
@@ -449,6 +511,9 @@ def round_one_plan(
 ) -> dict:
     """Round 1's plan log: the plan recomputed from the same history and context as
     /questions/plan, and next to it what the phone actually asked (gate.asked_log)."""
+    if body.survey is not None:
+        return {"protocol": 2, "survey": body.survey.model_dump(),
+                "question_count": len(body.survey.asked)}
     recomputed = gate.plan(user_history, slot, is_weekend, local_date,
                            new_search=body.plan_source == "new_search")
     asked = gate.asked_log(body.asked_order, body.plan_source, recomputed)
@@ -538,7 +603,8 @@ async def best_so_far_round(
         saved
         and followed
         and await quietly(funnel.log_shown_rows(user_id, token, ref, cards,
-                                               budget_level=answers.budget_level, client=client),
+                                               budget_level=answers.budget_level,
+                                               company=company_snapshot(body), client=client),
                           "shown", deadline=deadline)
     )
     logger.info(
@@ -618,6 +684,180 @@ async def question_plan(
 
 
 # Answer parsing (P1-21 FR5, P1-14) --------------------------------------------
+
+
+class CompanionParseRequest(conversation.Strict):
+    text: str = Field(min_length=1, max_length=200)
+    asked: conversation.Key | None = None
+    companion_refs: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("companion_refs")
+    @classmethod
+    def placeholders(cls, values):
+        if values != [f"companion_{i+1}" for i in range(len(values))]:
+            raise ValueError("Only anonymous companion references are allowed")
+        return values
+
+
+@app.post("/conversation/parse")
+async def companion_parse(body: CompanionParseRequest,
+    user_id: str = Depends(current_user), client: httpx2.AsyncClient = Depends(get_http_client)):
+    return await conversation.parse(body.text, body.asked, body.companion_refs, client=client)
+
+
+class CompanionPlanRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    local_time: datetime
+    state: conversation.Survey = Field(default_factory=conversation.Survey)
+    patch: conversation.Patch | None = None
+    source: Literal["chip", "typed"] = "typed"
+    companion_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    conversation_id: UUID | None = None
+    recommend_now: bool = False
+
+
+@app.post("/conversation/plan")
+async def companion_plan(body: CompanionPlanRequest,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    user_id, token = auth
+    loaded = await load_history(user_id, token, client)
+    h = loaded or History()
+    ids = [str(cid) for cid in body.companion_ids]
+    if ids and (loaded is None or not set(ids) <= h.companions):
+        raise HTTPException(422, "Companions unavailable; choose Solo or retry")
+    if body.patch and body.patch.unmatched:
+        logger.info("Unmatched request categories: %s", sorted(set(body.patch.unmatched)))
+    state = body.state
+    try:
+        if body.patch is not None:
+            state = conversation.apply_patch(state, body.patch, body.source, ids)
+        if isinstance(state.company.value, list) and not set(state.company.value) <= h.companions:
+            raise ValueError("unknown companion")
+    except ValueError:
+        raise HTTPException(422, "Couldn't apply that answer") from None
+    state.recommend_now = state.recommend_now or body.recommend_now
+    slot, day, weekend = meal_context(body.local_time)
+    result = conversation.decide(state, h, slot, weekend, day)
+    return {**result, "conversation_id": str(body.conversation_id or uuid4()),
+            "history_used": loaded is not None}
+
+
+@app.get("/conversation/meals")
+async def companion_meals(reference: Literal["last", "food", "date"] = "last",
+    category: str | None = None, eaten_on: date | None = None,
+    slot: conversation.Slot | None = None, auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    return await actions.meals(*auth, client, reference=reference, category=category,
+                              eaten_on=eaten_on.isoformat() if eaten_on else None, slot=slot)
+
+
+@app.get("/conversation/profile")
+async def companion_profile(auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    return await actions.profile(*auth, client)
+
+
+@app.get("/conversation/context")
+async def companion_context(user_id: str = Depends(current_user)):
+    return {"conversation_id": str(uuid4())}
+
+
+class HistoryQuery(BaseModel):
+    range: conversation.Range
+    chart_id: conversation.Chart
+    slot: conversation.Slot | None = None
+    timezone: str = Field(max_length=64)
+
+
+@app.post("/conversation/history")
+async def companion_history(body: HistoryQuery, auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    try:
+        today = datetime.now(ZoneInfo(body.timezone)).date()
+    except (ValueError, ZoneInfoNotFoundError):
+        raise HTTPException(422, "Unknown timezone") from None
+    start, end = conversation.date_range(body.range, today)
+    stats = await insights.response(*auth, end, client=client, from_date=start, meal_slot=body.slot)
+    facts, _ = takeaway.build_facts(stats)
+    fact_type = {"top": "category_count", "food": "category_count", "price": "price_level_count",
+                 "distance": "distance_median", "companions": "companion_count"}[body.chart_id]
+    fact = next((f for f in facts if f["type"] == fact_type), None)
+    # Factual fallback is sufficient: no extra Muse call to acknowledge a read or chip.
+    line = (takeaway.template(fact) if fact and fact_type != "companion_count" else
+            f"{stats['summary']['meal_count']} recorded meals.")
+    return {"stats": stats, "chart_id": body.chart_id, "from_date": start.isoformat(),
+            "to_date": end.isoformat(), "line": line,
+            "note": None if stats["complete"] else "Loaded history only; some data is missing."}
+
+
+class ManualCorrection(BaseModel):
+    revision: int = Field(ge=0)
+    changes: actions.MealChanges
+    confirmed: Literal[True]
+
+
+async def manual_action(kind, arguments, key, auth, client):
+    context = str(uuid5(NAMESPACE_URL, auth[0] + ":manual:" + kind))
+    prepared = await actions.rpc("prepare_companion_action", {"p_conversation_id": context,
+        "p_client_key": key, "p_kind": kind, "p_arguments": arguments}, auth[1], client)
+    if prepared["arguments"] != arguments:
+        raise HTTPException(409, "This record changed; reload")
+    return await actions.rpc("confirm_companion_action", {"p_id": prepared["id"],
+        "p_conversation_id": context, "p_arguments": arguments}, auth[1], client)
+
+
+@app.post("/meals/{meal_id}/correct")
+async def correct_meal(meal_id: UUID, body: ManualCorrection,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    arguments = {"meal_id": str(meal_id), "revision": body.revision,
+                 "changes": body.changes.model_dump(exclude_unset=True)}
+    return await manual_action("edit_meal", arguments, f"{meal_id}:{body.revision}", auth, client)
+
+
+@app.post("/profile/preferences")
+async def save_preferences(body: actions.ProfileDraft,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    if body.source != "profile":
+        raise HTTPException(422, "Use the chat confirmation card")
+    return await manual_action("preference_change", body.model_dump(), body.expected_updated_at,
+                               auth, client)
+
+
+@app.post("/conversation/actions/prepare")
+async def companion_prepare(body: actions.Prepare, auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    try:
+        arguments = body.checked()
+    except ValueError:
+        raise HTTPException(422, "Check the highlighted action fields") from None
+    return await actions.rpc("prepare_companion_action", {
+        "p_conversation_id": body.conversation_id, "p_client_key": body.client_key,
+        "p_kind": body.kind, "p_arguments": arguments}, auth[1], client)
+
+
+@app.post("/conversation/actions/confirm")
+async def companion_confirm(body: actions.Confirmation,
+    auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    return await actions.rpc("confirm_companion_action", {"p_id": body.action_id,
+        "p_conversation_id": body.conversation_id, "p_arguments": body.arguments}, auth[1], client)
+
+
+class CancelAction(BaseModel):
+    action_id: UUID | None = None
+    conversation_id: UUID
+
+
+@app.post("/conversation/actions/cancel")
+async def companion_cancel(body: CancelAction, auth: tuple[str, str] = Depends(current_auth),
+    client: httpx2.AsyncClient = Depends(get_http_client)):
+    await actions.rpc("cancel_companion_action", {
+        "p_id": str(body.action_id) if body.action_id else None,
+        "p_conversation_id": str(body.conversation_id)}, auth[1], client)
+    return {"cancelled": True}
 
 
 class ParseRequest(BaseModel):

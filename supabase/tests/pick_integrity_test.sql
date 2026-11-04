@@ -37,6 +37,10 @@ values
 update public.recommendation_events set decision_budget_level = null
 where session_id = '11111111-0080-0000-0000-000000000002';
 
+-- #75: this fixture's solo answer is explicitly confirmed for each displayed round.
+update public.recommendation_events set decision_company='{"confirmed":true,"solo":true,"companion_ids":[]}'
+where event='shown' and user_id='aaaaaaaa-0000-0000-0000-000000000080';
+
 create function public.test_pick_assert(ok boolean, label text) returns void
 language plpgsql as $$ begin
   if ok is distinct from true then raise exception 'assertion failed: %', label; end if;

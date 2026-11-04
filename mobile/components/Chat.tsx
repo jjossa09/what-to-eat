@@ -15,19 +15,16 @@ import {
 
 import {
   ApiError,
+  companionCall,
   type Change,
   type CompanyAnswer,
   type RefinementKey,
   deviceTimezone,
   type FirstKey,
-  getQuestionPlan,
   getRecommendations,
   localTimeIso,
   type NextQuestion,
-  parseAnswer,
-  type ParseResponse,
   type Pick,
-  type PlanResponse,
   type QuestionKey,
   type RoundRequest,
   type RoundResponse,
@@ -35,52 +32,38 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { haptic } from '../lib/haptics';
+import { changedLine, dispatch, emptySurvey, privateMessage, resolveDate, validInterpretation,
+  type Intent, type Patch, type Survey, type SurveyKey } from '../lib/companion';
+import { changePreference, draftMeal, nearby, persistPending, type HistoryResult,
+  type MealRecord, type Output, type Pending, type Profile } from '../lib/companionActions';
+import { withInsightsDeadline } from '../lib/insights';
 import { remindAfterPick } from '../lib/notify';
 import { OtisController } from '../lib/otis';
-import {
-  budgetPick as pickBudget, companySelection, matchCompany, planPrefill,
-  type Prefill, skippedAnswers, traceOf,
-} from '../lib/questionPlan';
+import type { Prefill } from '../lib/questionPlan';
 import {
   type Category,
   type Companion,
   loadCompanionChoices,
   loadCategories,
-  loadDisplayName,
   loadTastePrior,
   type TastePrior,
 } from '../lib/profile';
 import { ReasonsCache, type ReasonsEnvelope, type ReasonsObserver } from '../lib/reasons';
 import { colors, otis as otisTheme, radii, spacing, type } from '../theme';
 import Composer from './Composer';
+import { HistoryCard, MealReferenceCard, NearbyCard, PendingCard } from './CompanionCards';
 import Otis from './Otis';
 import ResultCards from './ResultCards';
 import ScrollWithBar from './ScrollWithBar';
 import TypingBubble from './TypingBubble';
 import { Chip, GlassScreen } from './ui';
 
-// Chat (P1-09) with the 3 questions (P1-10): craving, budget, distance. P2-05: their order and
-// pre-selected chips come from the confidence gate (POST /questions/plan): weak predictions
-// first, confident ones last with their chip pre-selected (editable). The quiz budget is
-// pre-selected even when budget is weak (it is the user's own answer). If the plan call fails,
-// the order is craving, budget, distance as before. After a round only the picks and None of
-// these show. None of these keeps the session open and asks the refinement question:
-// next_question (highest information gain, ML10) with its chips, or "What would make it
-// better?" with the fixed chips when it is null. Typed text after a round runs the next round
-// right away. The cap round (best so far) keeps its open question; None of these there ends
-// the session as none.
-// Company is asked only when included by the gate; typed names are matched locally.
-// Typed answers are parsed by Muse into the same answers as the chips (P1-21). After a round,
-// the chat stays open: Cheaper / Closer / Something else or a typed follow-up runs a new round
-// that skips every place already shown (P1-14). Round 4 without a pick is the best so far.
-// P1-19: the composer is always there. After a pick or None of these, typed text is the craving
-// of a new search (budget and distance asked again, preselected). Small talk gets one short
-// line back from the same parse call; {name} in it is filled in here, never sent to Muse.
-// Round 2: the user's bubble shows at once, with "…" until a typed reply comes back ("Finding
-// spots…" for rounds). Errors are a line in the thread under the user's bubble. Distance is
-// two chips: Close to me (15 km) and I don't mind (35 km).
+// Companion protocol v2: the server validates patches and owns dynamic question decisions.
+// Chip actions are deterministic. Each typed message is redacted and parsed once. Pending
+// actions freeze the survey; only explicit confirmation can reach the mutation RPCs.
+// Recommendation cards, signed progressive reasons and pick lifecycle stay in ResultCards.
 
-type Step = 'craving' | 'budget' | 'distance' | 'company' | 'loading' | 'results' | 'error';
+type Step = 'welcome' | 'craving' | 'budget' | 'distance' | 'company' | 'loading' | 'results' | 'error';
 type Problem = 'denied' | 'nofix' | 'network' | 'server' | 'auth' | 'load';
 type Bubble = { id: number; role: 'assistant' | 'user'; text: string; error?: boolean };
 type Radius = RoundRequest['radius_m'];
@@ -94,43 +77,15 @@ type Round = {
   lifecycle: ReasonsObserver;
   final: boolean; // the cap round: None of these ends the session
 };
-type Answers = { craving: string | null; budget: number; radius: Radius; exclude: string[] };
+type Answers = { craving: string | null; budget: number | null; radius: Radius | null; exclude: string[] };
 
-// The order when there is no plan (plan call failed): the Phase 1 order.
-const DEFAULT_ORDER: FirstKey[] = ['craving', 'budget', 'distance'];
-
-/** The plan's order if it is exactly the 3 questions, else the default order (a fallback). */
-function planOrder(plan: PlanResponse | null): { keys: FirstKey[]; source: 'plan' | 'fallback' } {
-  const keys = plan?.questions.map((q) => q.key) ?? [];
-  const pool = [...DEFAULT_ORDER, 'company'];
-  const valid = keys.length === 3 && new Set(keys).size === 3 && keys.every((k) => pool.includes(k))
-    && (!keys.includes('company') || !!plan?.skipped)
-    && (!plan?.skipped || (pool.includes(plan.skipped.key) && !keys.includes(plan.skipped.key)));
-  return valid ? { keys, source: 'plan' } : { keys: DEFAULT_ORDER, source: 'fallback' };
-}
-
-/** The prior, categories, name, and the gate's plan, together. A failed plan is null (the
- * default order), never a load error. */
+/** Independent start reads; a failed companion read leaves deterministic chips usable. */
 function loadStart(userId: string) {
-  const quiz = loadTastePrior(userId);
-  const people = loadCompanionChoices(userId);
-  return Promise.all([
-    loadCategories(),
-    quiz,
-    loadDisplayName(userId).catch(() => null),
-    getQuestionPlan(localTimeIso()).catch(() => null),
-    people,
-  ]);
+  return Promise.all([loadCategories(), loadTastePrior(userId),
+    loadCompanionChoices(userId, true).catch(() => null)]);
 }
 
 // Refinement lines (P2-05): fixed, separate from the round-1 wording. No Muse call.
-const REFINE_QUESTIONS: Record<RefinementKey, string> = {
-  craving: 'What sounds better?',
-  budget: 'What price works better?',
-  distance: 'How far would you go?',
-};
-const REFINE_OPEN = 'What would make it better?'; // no gate question: the fixed chips
-
 const QUESTIONS = {
   craving: 'What are you craving?',
   budget: 'Budget this time?',
@@ -159,19 +114,10 @@ const FARTHER: FollowUp = { label: "I don't mind the distance", change: { distan
 const SOMETHING_ELSE: FollowUp = { label: 'Something else', change: { something_else: true } };
 
 /** Follow-up chips: an empty round only offers going farther (or something else at 35 km). */
-function followUps(radius: Radius, empty: boolean): FollowUp[] {
-  const close = radius === CLOSE;
+function followUps(radius: Radius | null, empty: boolean): FollowUp[] {
+  const close = radius !== 35000;
   if (empty) return [close ? FARTHER : SOMETHING_ELSE];
   return [CHEAPER, close ? FARTHER : CLOSER, SOMETHING_ELSE];
-}
-
-const NOT_SURE = "Didn't catch that. Tap one below.";
-
-/** Fills Muse's {name} placeholder with the user's name, or drops it cleanly when unset. */
-function withName(line: string, name: string | null): string {
-  if (name) return line.split('{name}').join(name);
-  const out = line.replace(/,?\s*\{name\}/g, '').replace(/^[\s,!.]+/, '').trim();
-  return out.charAt(0).toUpperCase() + out.slice(1);
 }
 
 const PROBLEM_TEXT: Record<Problem, string> = {
@@ -228,19 +174,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [lastRound, setLastRound] = useState<{ radius: Radius; empty: boolean }>({ radius: CLOSE, empty: false });
   // A typed message that couldn't reach the server: "Try again" resends it (bubble stays).
   const [unsent, setUnsent] = useState<{ text: string; problem: Problem } | null>(null);
-  const [name, setName] = useState<string | null>(null);
   const [keyboard, setKeyboard] = useState(false);
   const [otisUnavailable, setOtisUnavailable] = useState(false);
   // Pre-selected chips: from the plan (confident predictions, P2-05) or a typed answer that
   // covered a later question (FR4).
   const [preset, setPreset] = useState<Prefill>({});
   const [companions, setCompanions] = useState<Companion[]>([]);
+  const privacyReady = useRef(false);
   const [companyPick, setCompanyPick] = useState<CompanyAnswer>(null);
   const companyAnswer = useRef<CompanyAnswer>(null);
-  const companyTrace = useRef<{ received: CompanyAnswer; shown: CompanyAnswer }>({
-    received: null, shown: null,
-  });
-  const companyInPool = useRef(false);
   // After a round: the information-gain question (ML10), or null for the fixed chips. Asked
   // only once refining (after None of these).
   const [nextQuestion, setNextQuestion] = useState<NextQuestion | null>(null);
@@ -249,24 +191,287 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   // Unsent chat lines: sent with the next round, then cleared (R3).
   const transcript = useRef<TranscriptMessage[]>([]);
-  const answers = useRef<Answers>({ craving: null, budget: 2, radius: CLOSE, exclude: [] });
-  const order = useRef<FirstKey[]>(DEFAULT_ORDER); // the 3 questions in asking order
-  // Sent with round 1 (P2-05): where this search's question order came from.
-  const planSource = useRef<'plan' | 'fallback' | 'new_search'>('fallback');
+  const answers = useRef<Answers>({ craving: null, budget: null, radius: null, exclude: [] });
   const sessionId = useRef<string | null>(null);
   const shownIds = useRef<string[]>([]);
   const pendingChange = useRef<Partial<Change> | undefined>(undefined);
+  const pendingEnhancement = useRef(false);
   const firstOfSearch = useRef(true); // the next round is this search's first ("3 spots")
   const nextIsOpen = useRef(false); // the next follow-up answers "What would make it right?"
   const noneOfThese = useRef(false); // sent with the next round: its rejected reason
-  // Trace (P2-05), sent with round 1: the plan's pre-fills as received, and the chip that was
-  // highlighted when each question was answered (read from that render).
-  const prefillReceived = useRef<Prefill>({});
-  const prefillShown = useRef<Prefill>({});
   const busy = useRef(false); // one answer at a time (a chip tap during a parse is ignored)
   const location = useRef<Promise<LocationResult> | null>(null);
   const nextId = useRef(0);
   const scroll = useRef<ScrollViewInstance>(null);
+  const survey = useRef<Survey>(emptySurvey());
+  const conversation = useRef<string | null>(null);
+  const actionTurn = useRef(0);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [duplicate, setDuplicate] = useState(false);
+  const [outputs, setOutputs] = useState<{ id: number; output: Output }[]>([]);
+  const [choices, setChoices] = useState<MealRecord[]>([]);
+  const [reference, setReference] = useState<Extract<Intent, { type: 'rate_meal' }> | null>(null);
+  const ratingStars = useRef<number | null>(null);
+  const secondAction = useRef<Intent | undefined>(undefined);
+  const [offered, setOffered] = useState<Intent | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const focusedOnce = useRef(false);
+  useFocusEffect(useCallback(() => {
+    if (!focusedOnce.current) { focusedOnce.current = true; return; }
+    let live = true;
+    privacyReady.current = false;
+    void loadCompanionChoices(userId, true).then((people) => {
+      if (live) { setCompanions(people); privacyReady.current = true; }
+    }).catch(() => undefined);
+    void withInsightsDeadline(() => loadTastePrior(userId), 5000)
+      .then((value) => { if (live) setPrior(value); }).catch(() => undefined);
+    return () => { live = false; };
+  }, [userId]));
+
+  type SurveyPlan = { state: Survey; next_key: SurveyKey | null; ready: boolean; conversation_id: string };
+
+  function syncSurvey(state: Survey) {
+    survey.current = state;
+    answers.current = {
+      craving: typeof state.craving.value === 'string' ? state.craving.value : null,
+      budget: typeof state.budget.value === 'number' ? state.budget.value : null,
+      radius: isRadius(typeof state.distance.value === 'number' ? state.distance.value : null)
+        ? state.distance.value as Radius : null,
+      exclude: state.exclusions,
+    };
+    companyAnswer.current = state.company.value === 'solo' ? 'solo'
+      : Array.isArray(state.company.value) ? state.company.value : null;
+    setCompanyPick(companyAnswer.current);
+    setPreset({ ...(answers.current.craving ? { craving: answers.current.craving } : {}),
+      ...(answers.current.budget ? { budget: answers.current.budget } : {}),
+      ...(answers.current.radius ? { radius: answers.current.radius } : {}) });
+  }
+
+  async function ensureConversation() {
+    if (!conversation.current) {
+      const context = await companionCall<{ conversation_id: string }>('/conversation/context');
+      conversation.current = context.conversation_id;
+    }
+    return conversation.current;
+  }
+
+  async function planSurvey(patch?: Patch, source: 'chip' | 'typed' = 'typed', recommend = false) {
+    const result = await companionCall<SurveyPlan>('/conversation/plan', {
+      local_time: localTimeIso(), state: survey.current, patch: patch ?? null, source,
+      companion_ids: companions.map((p) => p.id), conversation_id: conversation.current,
+      recommend_now: recommend,
+    });
+    if (!mounted.current) throw new Error('Conversation closed');
+    conversation.current = result.conversation_id;
+    syncSurvey(result.state);
+    return result;
+  }
+
+  async function continueSurvey(result?: SurveyPlan, enhance = false) {
+    if (!result && step === 'results') return;
+    if (!result && isFirst(step) && !survey.current.recommend_now
+      && !['confirmed', 'uncertain'].includes(survey.current[step].status)) return;
+    const plan = result ?? await planSurvey();
+    if (plan.ready) { await fetchRound(undefined, enhance); return; }
+    const key = plan.next_key!;
+    // This records only actual survey questions, never action or clarification messages.
+    survey.current = { ...plan.state, asked: [...plan.state.asked, key] };
+    ask(key); setStep(key);
+  }
+
+  async function answerField(key: SurveyKey, value: string | number | string[] | null, label: string) {
+    if (busy.current || pending || choices.length || reference) return;
+    busy.current = true; setParsing(true);
+    const operation = otis.begin();
+    try {
+      record(key, label, { [key]: value }, 'chip');
+      const plan = await planSurvey({ [key]: { status: 'confirmed', value } }, 'chip');
+      await continueSurvey(plan);
+    } catch { say('assistant', "Couldn't update that. Try again."); }
+    finally { busy.current = false; setParsing(false); otis.finish(operation); }
+  }
+
+  async function cancelPending(acknowledge = true) {
+    if ((pending || choices.length || reference) && conversation.current) {
+      await companionCall('/conversation/actions/cancel', {
+        action_id: pending?.savedId ?? null, conversation_id: conversation.current });
+    }
+    setPending(null); setChoices([]); setReference(null); setActionError(null); setDuplicate(false);
+    secondAction.current = undefined;
+    if (acknowledge) say('assistant', 'Cancelled that action.');
+  }
+
+  function selectFeedback(meal: MealRecord) {
+    setChoices([]);
+    setPending({ key: `turn:${actionTurn.current}`, kind: 'rate_meal',
+      placeName: `${meal.eaten_on} · ${meal.meal_slot ?? 'Time not set'}`,
+      arguments: { meal_id: meal.id, revision: meal.revision, changes: { stars: ratingStars.current } } });
+    if (meal.stars !== null) say('assistant', 'This will update your existing rating.');
+  }
+
+  async function findNamed(name_: string) {
+    const here = await withInsightsDeadline(() => getPosition(), 5000);
+    if (!here.ok) throw new Error('Location unavailable');
+    location.current = Promise.resolve(here);
+    return nearby(name_, here.position, answers.current.radius);
+  }
+
+  async function handleAction(intent: Intent) {
+    actionTurn.current++;
+    setActionError(null); setDuplicate(false);
+    if (intent.type === 'log_meal') {
+      setPending({ key: `turn:${actionTurn.current}`, kind: 'log_meal',
+        arguments: draftMeal(intent, companions),
+        ...(intent.date?.kind === 'weekday' ? { dateHint: `Which ${intent.date.value}? Enter the date.` } : {}) });
+      if (intent.place_name) {
+        const data = await findNamed(intent.place_name);
+        setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+      }
+    } else if (intent.type === 'rate_meal') {
+      const eaten = resolveDate(intent.date);
+      if ((intent.date && !eaten) || (intent.reference === 'date' && !eaten)
+        || (intent.reference === 'food' && !intent.category)) {
+        setReference(intent); return;
+      }
+      setReference(null);
+      const query = new URLSearchParams({ reference: intent.reference });
+      if (intent.category) query.set('category', intent.category);
+      if (eaten) query.set('eaten_on', eaten);
+      if (intent.slot) query.set('slot', intent.slot);
+      const found = await companionCall<{ meals: MealRecord[]; ambiguous: boolean; more: boolean; complete: boolean }>(
+        `/conversation/meals?${query.toString()}`);
+      ratingStars.current = intent.stars;
+      if (!found.meals.length) say('assistant', 'No matching meal found.');
+      else if (found.ambiguous) {
+        say('assistant', found.more ? 'Which meal? Use a date to narrow more matches.' : 'Which meal did you mean?');
+        setChoices(found.meals);
+      } else selectFeedback(found.meals[0]);
+    } else if (intent.type === 'preference_change') {
+      const profile = await companionCall<Profile>('/conversation/profile');
+      setPending({ key: `turn:${actionTurn.current}`, kind: 'preference_change', arguments: changePreference(profile, intent) });
+    } else if (intent.type === 'find_place') {
+      const data = await findNamed(intent.name);
+      setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+    } else if (intent.type === 'history_query') {
+      const data = await companionCall<HistoryResult>('/conversation/history', { range: intent.range,
+        chart_id: intent.chart_id, slot: intent.slot, timezone: deviceTimezone() });
+      setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'history', data } }]);
+    }
+  }
+
+  async function confirmPending(another = false) {
+    if (!pending || busy.current) return;
+    busy.current = true; setActionBusy(true); setActionError(null);
+    const current = pending.kind === 'log_meal' && another
+      ? { ...pending, arguments: { ...pending.arguments, allow_duplicate: true } } as Pending : pending;
+    try {
+      const context = await ensureConversation();
+      const request = await persistPending(current, context);
+      if (!mounted.current) return;
+      setPending({ ...current, savedId: request.prepared.id });
+      const result = await request.save();
+      if (!mounted.current) return;
+      if (result.status === 'duplicate') { setDuplicate(true); return; }
+      setPending(null); setDuplicate(false);
+      if (current.kind === 'preference_change') {
+        void withInsightsDeadline(() => loadTastePrior(userId), 5000)
+          .then(setPrior).catch(() => undefined);
+      }
+      haptic('success'); say('assistant', current.kind === 'log_meal' ? 'Meal saved.'
+        : current.kind === 'rate_meal' ? 'Rating saved.' : 'Taste profile updated.');
+      if (secondAction.current) {
+        setOffered(secondAction.current); secondAction.current = undefined;
+        say('assistant', 'Would you like to handle the other action now?');
+      } else await continueSurvey();
+    } catch (e) {
+      if (mounted.current) setActionError(e instanceof ApiError && e.kind === 'conflict'
+        ? 'This record changed; cancel and reopen it.' : "Couldn't save. Check the fields and retry.");
+    } finally { busy.current = false; setActionBusy(false); }
+  }
+
+  async function parseText(text: string) {
+    if (busy.current) return;
+    busy.current = true; setParsing(true); setOffered(null);
+    // A new message takes ownership immediately, including while parsing fails or waits.
+    // An older pick may finish legitimately, but must not decide this newer conversation.
+    reasonsCache.invalidate();
+    const operation = otis.begin();
+    let interpreted = false;
+    setUnsent(null);
+    try {
+      if (!privacyReady.current) {
+        const people = await loadCompanionChoices(userId, true);
+        if (!mounted.current) return;
+        setCompanions(people); privacyReady.current = true;
+        say('assistant', 'Ready. Please send that again.');
+        return;
+      }
+      const response: unknown = await companionCall('/conversation/parse', {
+        ...privateMessage(text, companions), asked: isFirst(step) ? step : null });
+      if (!mounted.current) return;
+      if (!validInterpretation(response, new Set((categories ?? []).map((c) => c.id))) || !response.understood) {
+        say('assistant', "Didn't catch that. Could you rephrase?"); return;
+      }
+      interpreted = true;
+      const selected = dispatch(response.intents);
+      const p = response.patch;
+      const supported = !!(p.craving || p.budget || p.distance || p.company || p.exclude?.length
+        || p.allow?.length || p.budget_step || p.distance_step || p.something_else || selected.recommend);
+      const hasPatch = supported || !!p.unmatched?.length;
+      const confirmsPending = !!(pending || choices.length || reference) && selected.confirmation?.type === 'confirm';
+      if (pending || choices.length || reference) {
+        if (!confirmsPending) await cancelPending();
+      } else if (selected.confirmation) say('assistant', 'There is no action waiting for confirmation.');
+      if (step === 'results' && decided && hasPatch && !selected.effect && !selected.reads.length) startNewSearch();
+      let plan: SurveyPlan | undefined;
+      if (hasPatch) {
+        const before = survey.current;
+        plan = await planSurvey(response.patch, 'typed', selected.recommend);
+        const acknowledgement = changedLine(before, plan.state, names);
+        if (acknowledgement) say('assistant', acknowledgement);
+        if (p.unmatched?.length) say('assistant', "I can't verify that from place data.");
+      }
+      if (confirmsPending) {
+        say('assistant', 'Check the card, then tap Confirm.'); return;
+      }
+      if (!hasPatch && !selected.effect && !selected.reads.length) {
+        if (selected.confirmation?.type === 'cancel') await continueSurvey();
+        else if (!selected.confirmation) say('assistant', 'Could you give me a little more detail?');
+        return;
+      }
+      if (selected.effect) {
+        secondAction.current = response.intents.filter((i) => ['log_meal', 'rate_meal', 'preference_change'].includes(i.type))[1];
+        if (secondAction.current) say('assistant', "Let's handle one action at a time.");
+        await handleAction(selected.effect);
+      }
+      for (const read of selected.reads) await handleAction(read);
+      if (selected.effect || selected.reads.length) return;
+      if (!supported && step === 'results') return;
+      if (step === 'results' && !decided) {
+        const p = response.patch;
+        const change: Partial<Change> = {
+          ...(p.craving?.status === 'confirmed' ? { craving: p.craving.value === null ? 'anything' : String(p.craving.value) } : {}),
+          ...(p.budget?.status === 'confirmed' ? { budget: Number(p.budget.value) as 1 | 2 | 3 | 4 } : {}),
+          ...(p.distance?.status === 'confirmed' ? { distance: Number(p.distance.value) as Radius } : {}),
+          ...(p.budget_step ? { budget: p.budget_step } : {}), ...(p.distance_step ? { distance: p.distance_step } : {}),
+          exclude_categories: p.exclude ?? [], something_else: p.something_else ?? false,
+        };
+        // Relative changes are already applied by /conversation/plan. Send the resulting
+        // state once; never step the budget twice on /recommendations.
+        record(nextIsOpen.current ? 'open' : 'refine', 'Updated answers', change, 'text', '[structured typed answer]');
+        nextIsOpen.current = false;
+        await fetchRound(undefined, true);
+      } else await continueSurvey(plan, true);
+    } catch (e) {
+      // Only retry the language request before any validated patch was applied.
+      // Replaying a partially completed relative correction could otherwise step it twice.
+      if (!interpreted) setUnsent({ text, problem: e instanceof ApiError && e.kind === 'auth' ? 'auth' : 'network' });
+      say('assistant', e instanceof ApiError && e.kind === 'auth' ? 'Please sign in again.' : "Couldn't finish that. Please try again.");
+    } finally { busy.current = false; setParsing(false); otis.finish(operation); }
+  }
 
   function say(role: Bubble['role'], text: string, error = false): number {
     nextId.current += 1;
@@ -297,63 +502,16 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     transcript.current.push({ role: 'user', body, question_key: key, answer: value, input_mode: mode });
   }
 
-  /** Applies the plan (or the default order) and returns the first question. */
-  function applyPlan(rows: Category[], quiz: TastePrior, plan: PlanResponse | null, people: Companion[]): FirstKey {
-    const candidate = planOrder(plan);
-    const ids = new Set(people.map((p) => p.id));
-    // Never show a company question without usable chips.
-    const chosen = candidate.keys.includes('company') && !people.length
-      ? { keys: DEFAULT_ORDER, source: 'fallback' as const } : candidate;
-    const usable = chosen.source === 'plan' ? plan : null;
-    companyInPool.current = !!usable && (usable.questions.some((q) => q.key === 'company')
-      || usable.skipped?.key === 'company');
-    const received = companySelection(usable?.questions.find((q) => q.key === 'company')?.prefill, ids);
-    companyTrace.current = { received, shown: null };
-    companyAnswer.current = null;
-    setCompanyPick(received);
-    order.current = chosen.keys;
-    planSource.current = chosen.source;
-    const pre = planPrefill(usable?.questions, new Set(rows.map((c) => c.id)));
-    prefillReceived.current = pre;
-    prefillShown.current = {};
-    setPreset(pre); // a weak budget falls back to the quiz budget (budgetPick below)
-    if (quiz.budget) answers.current.budget = quiz.budget;
-    const inferred = skippedAnswers(usable?.skipped, new Set(rows.map((c) => c.id)), ids);
-    companyAnswer.current = inferred.company ?? null;
-    if (inferred.craving) answers.current.craving = inferred.craving;
-    if (inferred.budget) answers.current.budget = inferred.budget;
-    if (inferred.radius) answers.current.radius = inferred.radius;
-    return order.current[0];
-  }
-
-  // Start: the prior, categories, and plan for the chips, and location in the background so it
-  // is usually ready by the third answer.
   useEffect(() => {
     let live = true;
     location.current = getPosition();
-    loadStart(userId)
-      .then(([rows, quiz, shownName, plan, people]) => {
-        if (!live) return;
-        setCategories(rows);
-        setPrior(quiz);
-        setName(shownName);
-        setCompanions(people);
-        const first = applyPlan(rows, quiz, plan, people);
-        nextId.current += 1;
-        setBubbles([{ id: nextId.current, role: 'assistant', text: QUESTIONS[first] }]);
-        transcript.current = [{ role: 'assistant', body: QUESTIONS[first], question_key: first }];
-        setStep(first);
-      })
-      .catch(() => {
-        if (!live) return;
-        nextId.current += 1;
-        setBubbles([{ id: nextId.current, role: 'assistant', text: PROBLEM_TEXT.load, error: true }]);
-        setProblem('load');
-        setStep('error');
-      });
-    return () => {
-      live = false;
-    };
+    loadStart(userId).then(([rows, quiz, people]) => {
+      if (!live) return;
+      setCategories(rows); setPrior(quiz); setCompanions(people ?? []); privacyReady.current = people !== null;
+      setBubbles([{ id: ++nextId.current, role: 'assistant', text: 'Hey! What are we eating today?' }]);
+      setStep('welcome');
+    }).catch(() => { if (live) { setProblem('load'); setStep('error'); } });
+    return () => { live = false; };
   }, [userId]);
 
   // With the keyboard up, the composer sits right on it, not a dock's height above it.
@@ -369,120 +527,23 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const names = new Map((categories ?? []).map((c) => [c.id, c.name]));
   const favorites = (prior?.favorites ?? []).filter((id) => names.has(id));
   const cravingPick = preset.craving ?? null;
-  const budgetPick = pickBudget(preset, prior?.budget);
+  const budgetPick = preset.budget ?? null;
   const radiusPick = preset.radius ?? null;
 
   function cravingLabel(id: string | null): string {
     return id === null ? 'Anything' : (names.get(id) ?? id);
   }
 
-  // The 3 questions ------------------------------------------------------------
-
-  /** The questions after key in this search's order. */
-  function laterThan(key: FirstKey): FirstKey[] {
-    return order.current.slice(order.current.indexOf(key) + 1);
-  }
-
-  /** After answering key: the next question in the order, or the round after the last one. */
-  function advance(key: FirstKey) {
-    const next = laterThan(key)[0];
-    if (next) {
-      ask(next);
-      setStep(next);
-    } else {
-      fetchRound();
-    }
-  }
-
-  /** Trace: the chip this render highlighted for key (the one on screen at the answer). */
-  function noteShown(key: FirstKey) {
-    const shown = { ...prefillShown.current };
-    if (key === 'craving') shown.craving = cravingPick ?? undefined;
-    if (key === 'budget') shown.budget = budgetPick ?? undefined;
-    if (key === 'distance') shown.radius = radiusPick ?? undefined;
-    prefillShown.current = shown;
-  }
+  // Necessary survey questions -------------------------------------------------
 
   function chooseCompany(value: Exclude<CompanyAnswer, null>, text?: string) {
-    if (busy.current) return;
-    if (text === undefined) {
-      if (value !== 'solo') haptic('light'); // Continue confirms the selected companions.
-      else if (companyPick !== 'solo') haptic('selection');
-    }
-    companyTrace.current.shown = companyPick;
-    companyAnswer.current = value;
-    const label = value === 'solo' ? 'Solo' : value.length > 2 ? `${value.length} companions`
-      : companions.filter((c) => value.includes(c.id)).map((c) => c.name).join(', ');
-    const same = JSON.stringify(value) === JSON.stringify(companyTrace.current.received);
-    record('company', label, { solo: value === 'solo', companion_ids: value === 'solo' ? [] : value },
-      text !== undefined ? 'text' : same ? 'prefill' : 'chip', text ?? label);
-    advance('company');
+    if (busy.current || pending) return;
+    const company = value === 'solo' ? 'solo' : value.map((id) => `companion_${companions.findIndex((c) => c.id === id) + 1}`);
+    void answerField('company', company, text ?? (value === 'solo' ? 'Solo' : 'With company'));
   }
-
-  function chooseCraving(id: string | null, label: string) {
-    if (busy.current) return;
-    if (id === null || cravingPick !== id) haptic('selection');
-    noteShown('craving');
-    answers.current.craving = id;
-    record('craving', label, { craving: id }, id !== null && cravingPick === id ? 'prefill' : 'chip');
-    advance('craving');
-  }
-
-  function chooseBudget(level: number, label: string) {
-    if (busy.current) return;
-    if (budgetPick !== level) haptic('selection');
-    noteShown('budget');
-    answers.current.budget = level;
-    record('budget', label, { budget_level: level }, budgetPick === level ? 'prefill' : 'chip');
-    advance('budget');
-  }
-
-  function chooseDistance(radius: Radius, label: string) {
-    if (busy.current) return;
-    if (radiusPick !== radius) haptic('selection');
-    noteShown('distance');
-    answers.current.radius = radius;
-    record('distance', label, { radius_m: radius }, radiusPick === radius ? 'prefill' : 'chip');
-    advance('distance');
-  }
-
-  /** What a typed first answer said about later questions: pre-selects their chips (FR4). */
-  function prefill(key: FirstKey, a: Change) {
-    for (const c of a.exclude_categories) {
-      if (!answers.current.exclude.includes(c)) answers.current.exclude.push(c);
-    }
-    const later = laterThan(key);
-    setPreset((prev) => {
-      const next = { ...prev };
-      if (later.includes('craving') && a.craving && a.craving !== 'anything' && names.has(a.craving)) {
-        next.craving = a.craving;
-      }
-      if (later.includes('budget') && typeof a.budget === 'number') next.budget = a.budget;
-      if (later.includes('distance') && typeof a.distance === 'number') next.radius = a.distance;
-      return next;
-    });
-  }
-
-  /** A parsed first answer: the typed bubble stays; the answer is logged like its chip. */
-  function typedFirst(key: FirstKey, a: Change, text: string) {
-    noteShown(key);
-    prefill(key, a);
-    if (key === 'craving') {
-      const id = a.craving === 'anything' ? null : a.craving;
-      answers.current.craving = id;
-      record('craving', cravingLabel(id), a, 'text', text);
-      advance('craving');
-    } else if (key === 'budget' && typeof a.budget === 'number') {
-      answers.current.budget = a.budget;
-      record('budget', BUDGETS[a.budget - 1].label, a, 'text', text);
-      advance('budget');
-    } else if (key === 'distance' && typeof a.distance === 'number') {
-      const radius = a.distance;
-      answers.current.radius = radius;
-      record('distance', DISTANCES.find((d) => d.radius === radius)?.label ?? 'Close to me', a, 'text', text);
-      advance('distance');
-    }
-  }
+  function chooseCraving(id: string | null, label: string) { void answerField('craving', id, label); }
+  function chooseBudget(level: number, label: string) { void answerField('budget', level, label); }
+  function chooseDistance(radius: Radius, label: string) { void answerField('distance', radius, label); }
 
   // Follow-ups -----------------------------------------------------------------
 
@@ -493,139 +554,45 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     otis.cancel();
     noneOfThese.current = true;
     record('refine', 'None of these', { none_of_these: true }, 'chip');
-    if (nextQuestion) askLine(REFINE_QUESTIONS[nextQuestion.key], nextQuestion.key);
-    else askLine(REFINE_OPEN, 'refine');
+    askLine('I see, any clue what you may want?', 'refine');
     setRefining(true);
     return true;
-  }
-
-  /** A follow-up answer. asked: the information-gain question it answers (a chip), logged
-   * under that question's key; otherwise 'refine' (or 'open' after the best so far). */
-  function followUp(
-    change: Partial<Change>,
-    shown: string,
-    mode: 'chip' | 'text',
-    body: string = shown,
-    asked?: RefinementKey,
-  ) {
-    const key: QuestionKey = asked ?? (nextIsOpen.current ? 'open' : 'refine');
-    nextIsOpen.current = false;
-    record(key, shown, change, mode, body);
-    fetchRound(change);
   }
 
   function chooseFollowUp(change: Partial<Change>, label: string, asked?: RefinementKey) {
     if (busy.current) return;
     haptic('light');
     setUnsent(null);
-    followUp(change, label, 'chip', label, asked);
+    busy.current = true;
+    const patch: Patch = { exclude: change.exclude_categories ?? [], something_else: change.something_else ?? false };
+    if (change.craving !== undefined) patch.craving = { status: 'confirmed', value: change.craving === 'anything' ? null : change.craving ?? null };
+    if (typeof change.budget === 'number') patch.budget = { status: 'confirmed', value: change.budget };
+    else if (change.budget) patch.budget_step = change.budget;
+    if (typeof change.distance === 'number') patch.distance = { status: 'confirmed', value: change.distance };
+    else if (change.distance) patch.distance_step = change.distance;
+    record(asked ?? 'refine', label, change, 'chip');
+    void planSurvey(patch, 'chip').then(() => fetchRound()).catch(() => {
+      say('assistant', "Couldn't update the search.");
+    }).finally(() => { busy.current = false; });
   }
 
-  /** After a pick or None of these: a new session that starts at the craving. */
-  function startNewSearch(plan: PlanResponse | null) {
-    reasonsCache.invalidate();
-    otis.cancel();
-    sessionId.current = null;
-    shownIds.current = [];
-    transcript.current = [];
-    pendingChange.current = undefined;
-    nextIsOpen.current = false;
-    firstOfSearch.current = true;
-    setNextQuestion(null);
-    setRefining(false);
-    noneOfThese.current = false;
-    prefillReceived.current = {}; // reset before loading this search's plan
-    prefillShown.current = {};
-    answers.current = { ...answers.current, craving: null, exclude: [] };
-    companyAnswer.current = null;
-    setCompanyPick(null);
-    const usable = planOrder(plan).source === 'plan' ? plan : null;
-    applyPlan(categories ?? [], prior ?? { favorites: [], budget: null, mostlySolo: null }, usable, companions);
-    planSource.current = 'new_search';
-    setShowAll(false);
-    setDecided(false);
-    setStep('craving');
+  function startNewSearch() {
+    reasonsCache.invalidate(); otis.cancel();
+    sessionId.current = null; shownIds.current = []; transcript.current = [];
+    pendingChange.current = undefined; nextIsOpen.current = false; firstOfSearch.current = true;
+    setNextQuestion(null); setRefining(false); noneOfThese.current = false;
+    survey.current = emptySurvey(); conversation.current = null; companyAnswer.current = null;
+    answers.current = { craving: null, budget: null, radius: null, exclude: [] };
+    setCompanyPick(null); setPreset({}); setShowAll(false); setDecided(false); setStep('welcome');
+    setPending(null); setChoices([]); setReference(null); secondAction.current = undefined;
+    setActionError(null); setDuplicate(false); setOffered(null);
+    say('assistant', 'Hey! What are we eating today?');
   }
 
-  /** Typed text: the bubble shows now, "…" until the parse comes back. */
   function sendText(text: string) {
     if (busy.current) return;
     say('user', text);
-    parseText(text);
-  }
-
-  async function parseText(text: string) {
-    if (busy.current) return;
-    setUnsent(null);
-    const fresh = step === 'results' && decided; // the text is a new search's craving
-    const first: FirstKey | null = fresh ? 'craving' : isFirst(step) ? step : null;
-    if (first === 'company') {
-      const matched = matchCompany(text, companions);
-      if (matched === null) say('assistant', NOT_SURE);
-      else chooseCompany(matched, text);
-      return;
-    }
-    const key = first ?? (nextIsOpen.current ? 'open' : 'refine');
-    busy.current = true;
-    setParsing(true);
-    const operation = otis.begin();
-    if (!first || fresh) reasonsCache.invalidate();
-    let result: ParseResponse | null = null;
-    let freshPlan: PlanResponse | null = null;
-    let failed: Problem | null = null;
-    try {
-      [result, freshPlan] = await Promise.all([
-        parseAnswer(key, text),
-        fresh ? getQuestionPlan(localTimeIso(), true).catch(() => null) : Promise.resolve(null),
-      ]);
-    } catch (e) {
-      const kind = e instanceof ApiError ? e.kind : 'network';
-      failed = kind === 'auth' ? 'auth' : 'network';
-    } finally {
-      busy.current = false;
-      setParsing(false);
-    }
-    if (failed) {
-      otis.finish(operation);
-      // The bubble stays; the error line goes under it, and Try again resends the text.
-      say('assistant', PROBLEM_TEXT[failed], true);
-      setUnsent({ text, problem: failed });
-      return;
-    }
-    // Small talk: one line back, the question and its chips stay. Not an answer, not logged.
-    if (result?.status === 'chat' && result.reply) {
-      otis.finish(operation);
-      say('assistant', withName(result.reply, name));
-      return;
-    }
-    const parsed: Change | null = result?.status === 'ok' ? result.answer : null;
-    if (fresh) {
-      startNewSearch(freshPlan);
-      // This typed answer has no displayed craving chip; do not trace the previous search's.
-      if (parsed && parsed.craving !== null) {
-        prefill('craving', parsed);
-        answers.current.craving = parsed.craving === 'anything' ? null : parsed.craving;
-        record('craving', text, parsed, 'text', text);
-        advance('craving');
-      } else {
-        say('assistant', "Didn't catch that.");
-        ask('craving');
-        setStep('craving');
-      }
-      return;
-    }
-    if (!parsed) {
-      otis.finish(operation);
-      // Not sure, but it may have answered later questions (FR4 prefill).
-      const partial = result?.status === 'not_sure' ? result.answer : null;
-      if (partial && first) prefill(first, partial);
-      say('assistant', NOT_SURE);
-      return;
-    }
-    if (first) typedFirst(first, parsed, text);
-    else followUp(parsed, text, 'text');
-    // A third answer may already have begun the next operation; this token then does nothing.
-    otis.finish(operation);
+    void parseText(text);
   }
 
   // Rounds ---------------------------------------------------------------------
@@ -636,10 +603,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     return first ? 'Here are 3 spots.' : 'Here are a few more.';
   }
 
-  async function fetchRound(change?: Partial<Change>) {
+  async function fetchRound(change?: Partial<Change>, enhance = false) {
     reasonsCache.invalidate();
     const operation = otis.begin();
     pendingChange.current = change;
+    pendingEnhancement.current = enhance;
     busy.current = true;
     setProblem(null);
     setStep('loading');
@@ -668,13 +636,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         ...(sessionId.current
           ? { session_id: sessionId.current }
           : {
-              asked_order: order.current,
-              plan_source: planSource.current,
-              prefilled: { received: traceOf(prefillReceived.current), shown: traceOf(prefillShown.current) },
-              ...(companyInPool.current ? { company_prefilled: companyTrace.current } : {}),
+              asked_order: survey.current.asked,
             }),
         exclude_ids: shownIds.current,
         transcript: transcript.current,
+        survey: survey.current,
       });
       if (!result.logged && __DEV__) console.warn('Round not logged');
       transcript.current = [];
@@ -691,7 +657,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       shownIds.current = [...shownIds.current, ...result.picks.map((p) => p.id)];
       setUser(where.position);
       setDecided(false);
-      setLastRound({ radius: answers.current.radius, empty: !result.best_so_far && result.picks.length === 0 });
+      setLastRound({ radius: answers.current.radius ?? CLOSE, empty: !result.best_so_far && result.picks.length === 0 });
       const line = roundLine(result, firstOfSearch.current);
       firstOfSearch.current = false;
       const id = line ? say('assistant', line) : null;
@@ -703,7 +669,9 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         setRounds((prev) => [
           ...prev,
           { bubbleId: id, picks: result.picks, sessionId: result.session_id, round, final: result.best_so_far,
-            envelope: result.reasons_envelope, generation, lifecycle },
+            // Deterministic chips keep template reasons and trigger zero Muse calls.
+            // Typed recommendation rounds retain #82's optional signed enhancement.
+            envelope: enhance ? result.reasons_envelope : null, generation, lifecycle },
         ]);
       } else otis.finish(operation);
       if (result.best_so_far) {
@@ -741,25 +709,23 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     } else if (problem === 'load') {
       setProblem(null);
       loadStart(userId)
-        .then(([rows, quiz, shownName, plan, people]) => {
+        .then(([rows, quiz, people]) => {
           setCategories(rows);
           setPrior(quiz);
-          setName(shownName);
-          setCompanions(people);
-          const first = applyPlan(rows, quiz, plan, people);
-          ask(first);
-          setStep(first);
+          setCompanions(people ?? []); privacyReady.current = people !== null;
+          setStep('welcome');
+          say('assistant', 'Hey! What are we eating today?');
         })
         .catch(() => fail('load'));
     } else {
-      fetchRound(pendingChange.current);
+      fetchRound(pendingChange.current, pendingEnhancement.current);
     }
   }
 
   // Chips for the current step (none while loading or after a decision), then the composer,
   // which is always there (P1-19).
   let chips: ReactNode = null;
-  if (step === 'craving' && categories) {
+  if ((step === 'craving' || step === 'welcome') && categories) {
     const shown = showAll ? categories.map((c) => c.id) : favorites;
     // A pre-selected craving outside the favorites still gets its chip, first.
     const list = cravingPick && !shown.includes(cravingPick) ? [cravingPick, ...shown] : shown;
@@ -866,6 +832,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   const placeholder =
     step === 'results' ? (decided ? 'Craving something else?' : 'Or type what to change') : 'Or type it';
+  if (pending || choices.length || reference) chips = null;
+
   const composerOff = step === 'loading' || step === 'error' || !categories;
 
   const latest = rounds.length ? rounds[rounds.length - 1].bubbleId : null;
@@ -886,7 +854,19 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           onContentSizeChange={() => scroll.current?.scrollToEnd({ animated: true })}
         >
           {!categories && step !== 'error' && <ActivityIndicator style={styles.spinner} />}
-          {bubbles.map((b) => {
+          {[...bubbles.map((bubble) => ({ id: bubble.id, bubble })), ...outputs]
+            .sort((a, b) => a.id - b.id).map((entry) => {
+            if ('output' in entry) {
+              const { id, output } = entry;
+              return output.kind === 'history'
+                ? <HistoryCard key={id} data={output.data} categories={categories ?? []} people={companions} />
+                : <NearbyCard key={id} data={output.data} onSelect={pending?.kind === 'log_meal' ? (place) => {
+                  if (busy.current) return;
+                  const meal = pending.arguments as import('../lib/companionActions').MealDraft;
+                  setPending({ ...pending, placeName: place.name, arguments: { ...meal, place_id: place.id } });
+                } : undefined} />;
+            }
+            const b = entry.bubble;
             const r = rounds.find((x) => x.bubbleId === b.id);
             return (
               <Fragment key={b.id}>
@@ -931,6 +911,41 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               </Fragment>
             );
           })}
+          {!!choices.length && <View style={styles.chips}>{choices.map((meal) => <Chip key={meal.id}
+            label={`${meal.eaten_on} · ${meal.meal_slot ?? 'Time not set'} · ${meal.dish
+              ?? (meal.source === 'backfill' || meal.ate_at ? names.get(meal.category_id ?? '') : null) ?? 'Meal'}`}
+            onPress={() => { if (!busy.current) selectFeedback(meal); }} />)}<Chip label="Cancel" onPress={() => {
+              if (busy.current) return;
+              void cancelPending().then(() => continueSurvey()).catch(() => setActionError("Couldn't cancel. Retry."));
+            }} /></View>}
+          {reference && <MealReferenceCard reference={reference} categories={categories ?? []}
+            onFind={(intent) => {
+              if (busy.current) return;
+              busy.current = true;
+              void handleAction(intent).catch(() => say('assistant', "Couldn't find that meal."))
+                .finally(() => { busy.current = false; });
+            }} onCancel={() => { if (busy.current) return;
+              void cancelPending().then(() => continueSurvey()).catch(() => setActionError("Couldn't cancel. Retry.")); }} />}
+          {pending && <PendingCard key={pending.key} pending={pending} categories={categories ?? []} people={companions}
+            busy={actionBusy} error={actionError} duplicate={duplicate} onConfirm={confirmPending}
+            onChange={(value) => { setPending(value); setDuplicate(false); setActionError(null); }}
+            onCancel={() => { if (busy.current) return;
+              void cancelPending().then(() => continueSurvey()).catch(() => setActionError("Couldn't cancel. Retry.")); }}
+            onWhere={(text) => {
+              if (busy.current) return;
+              busy.current = true; setActionBusy(true);
+              void findNamed(text).then((data) => setOutputs((out) => [...out,
+                { id: ++nextId.current, output: { kind: 'nearby', data } }]))
+                .catch(() => setActionError("Couldn't find places. Retry."))
+                .finally(() => { busy.current = false; setActionBusy(false); });
+            }} />}
+          {actionError && !pending && <Text style={styles.errorText}>{actionError}</Text>}
+          {offered && <Chip label="Handle the other action" onPress={() => {
+            if (busy.current) return;
+            busy.current = true; setOffered(null);
+            void handleAction(offered).catch(() => say('assistant', "Couldn't open that action."))
+              .finally(() => { busy.current = false; });
+          }} />}
           {parsing && otisStatus.active && <TypingBubble />}
           {otisStatus.state === 'thinking' && !parsing && (
             <View style={[styles.bubble, styles.theirs]}>

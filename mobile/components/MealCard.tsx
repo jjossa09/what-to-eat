@@ -17,8 +17,9 @@ import {
 import { useReduceMotion, useReduceTransparency } from '../lib/accessibility';
 import { MAX_DISH } from '../lib/feedback';
 import { haptic } from '../lib/haptics';
+import { withInsightsDeadline } from '../lib/insights';
 import { canEdit, editMeal, type Meal, type MealEdit, mealWhen, slotLabel } from '../lib/meals';
-import { BUDGETS } from '../lib/profile';
+import { BUDGETS, loadCategories, loadCompanionChoices, type Category, type Companion } from '../lib/profile';
 import { colors, emojiFor, layout, mealCard, radii, spacing, type } from '../theme';
 import GlassFrame from './GlassFrame';
 import PressScale from './PressScale';
@@ -35,6 +36,7 @@ export type Rect = { x: number; y: number; width: number; height: number };
 
 type Props = {
   meal: Meal;
+  userId: string;
   /** The tapped row, in window coordinates: the card opens from and closes into it. */
   from: Rect;
   categoryName: (id: string | null) => string | null;
@@ -58,11 +60,26 @@ function whoText(meal: Meal): string {
   return 'Not set';
 }
 
-export default function MealCard({ meal, from, categoryName, onClose, onSaved }: Props) {
+export default function MealCard({ meal, userId, from, categoryName, onClose, onSaved }: Props) {
   const window = useWindowDimensions();
   const reduceMotion = useReduceMotion();
   const reduceTransparency = useReduceTransparency();
   const size = Math.min(mealCard.maxSize, window.width - 2 * layout.gutter);
+  const [foodChoices, setFoodChoices] = useState<Category[]>([]);
+  const [peopleChoices, setPeopleChoices] = useState<Companion[]>([]);
+  const [food, setFood] = useState<string | null>(null);
+  const [foodChanged, setFoodChanged] = useState(false);
+  const [personIds, setPersonIds] = useState<string[]>([]);
+  const [amount, setAmount] = useState('');
+  useEffect(() => {
+    let live = true;
+    if (userId) {
+      void withInsightsDeadline(() => loadCategories(), 5000)
+        .then((value) => { if (live) setFoodChoices(value); }).catch(() => undefined);
+      loadCompanionChoices(userId).then((value) => { if (live) setPeopleChoices(value); });
+    }
+    return () => { live = false; };
+  }, [userId]);
   const left = (window.width - size) / 2;
   const top = (window.height - size) / 2;
 
@@ -184,6 +201,9 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     setStars(meal.stars);
     setPrice(meal.priceTap);
     setSolo(meal.solo);
+    setFood(meal.ateAnswered || meal.source !== 'live' ? meal.category : null);
+    setFoodChanged(false); setPersonIds(meal.companionIds ?? []);
+    setAmount(meal.priceAmount?.toString() ?? '');
     setFailed(false);
     setEditing(true);
   }
@@ -196,6 +216,14 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     if (stars !== null && stars !== meal.stars) edit.stars = stars;
     if (price !== null && price !== meal.priceTap) edit.priceTap = price;
     if (solo !== null && solo !== meal.solo) edit.solo = solo;
+    if (foodChanged && food) edit.category = food;
+    if (JSON.stringify(personIds.slice().sort()) !== JSON.stringify((meal.companionIds ?? []).slice().sort())) edit.companionIds = personIds;
+    if (meal.source === 'backfill' && amount !== (meal.priceAmount?.toString() ?? '')) {
+      if (!/^\d+(\.\d{1,2})?$/.test(amount) || Number(amount) > 99999.99) {
+        interaction.endSave(); setFailed(true); return;
+      }
+      edit.priceAmount = Number(amount);
+    }
     if (Object.keys(edit).length === 0) {
       interaction.endSave();
       setEditing(false);
@@ -205,7 +233,7 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     setSaving(true);
     setFailed(false);
     try {
-      await editMeal(meal.id, edit);
+      await editMeal(meal.id, edit, meal.revision);
       await onSaved();
       if (!interaction.current()) return;
       haptic('success');
@@ -218,14 +246,18 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
     }
   }
 
-  const had = meal.dish ?? (meal.ateAnswered ? categoryName(meal.category) : null) ?? 'Not answered yet';
+  const had = meal.dish ?? (meal.ateAnswered || meal.source !== 'live' ? categoryName(meal.category) : null) ?? 'Not answered yet';
   const slot = slotLabel(meal.mealSlot);
   const header = (
     <View style={styles.header}>
       <Text style={styles.emoji}>{emojiFor(meal.category)}</Text>
-      <Text style={styles.place} numberOfLines={editing ? 2 : undefined}>
-        {meal.placeName}
-      </Text>
+      <View style={styles.title}>
+        <Text style={styles.place} numberOfLines={editing ? 2 : undefined}>
+          {meal.placeName}
+        </Text>
+        {meal.placeStatus === 'unknown' && <Text style={styles.label}>Place not recorded</Text>}
+        {meal.placeStatus === 'unresolved' && <Text style={styles.label}>Place not verified</Text>}
+      </View>
       {canEdit(meal) && !editing && (
         <PressScale feedback="light" onPress={startEdit} accessibilityRole="button" hitSlop={12} style={styles.editButton}>
           <Text style={styles.editText}>Edit</Text>
@@ -254,6 +286,10 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
               <>
                 {header}
                 <ScrollView style={styles.fill} contentContainerStyle={styles.form} keyboardShouldPersistTaps="handled">
+                  <Text style={styles.value}>Food actually eaten</Text>
+                  {!foodChoices.length && <Text style={styles.label}>Food choices unavailable; reopen to retry.</Text>}
+                  <View style={styles.chips}>{foodChoices.map((c) => <Chip key={c.id} label={c.name}
+                    disabled={saving} selected={food === c.id} onPress={() => { setFood(c.id); setFoodChanged(true); }} />)}</View>
                   <TextInput
                     style={styles.input}
                     value={dish}
@@ -287,9 +323,14 @@ export default function MealCard({ meal, from, categoryName, onClose, onSaved }:
                     ))}
                   </View>
                   <View style={styles.chips}>
-                    <Chip label="Solo" feedback="selection" disabled={saving} selected={solo === true} onPress={() => setSolo(true)} />
+                    <Chip label="Solo" feedback="selection" disabled={saving} selected={solo === true} onPress={() => { setSolo(true); setPersonIds([]); }} />
                     <Chip label="With people" feedback="selection" disabled={saving} selected={solo === false} onPress={() => setSolo(false)} />
+                    {peopleChoices.map((p) => <Chip key={p.id} label={p.name} disabled={saving} selected={personIds.includes(p.id)}
+                      onPress={() => { setSolo(false); setPersonIds(personIds.includes(p.id) ? personIds.filter((x) => x !== p.id) : [...personIds, p.id]); }} />)}
                   </View>
+                  {meal.source === 'backfill' && <TextInput accessibilityLabel="Amount paid" style={styles.input}
+                    placeholder="Amount paid" placeholderTextColor={colors.textSecondary} value={amount}
+                    keyboardType="decimal-pad" editable={!saving} onChangeText={setAmount} />}
                   {failed && <Text style={styles.error}>Couldn&apos;t save.</Text>}
                 </ScrollView>
                 {/* Pinned to the card's bottom, inside the body's padding (same inset all round). */}
@@ -368,8 +409,11 @@ const styles = StyleSheet.create({
   emoji: {
     fontSize: mealCard.emojiSize,
   },
-  place: {
+  title: {
     flex: 1,
+    gap: spacing.xs,
+  },
+  place: {
     fontSize: type.heading,
     fontWeight: '700',
     color: colors.text,

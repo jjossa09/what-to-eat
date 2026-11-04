@@ -19,11 +19,22 @@ insert into public.sessions (id, user_id, timezone, local_date, meal_slot, lat, 
   ('11111111-0000-0000-0000-0000000000a7', 'aaaaaaaa-0000-0000-0000-0000000000c7', 'America/New_York', '2026-11-02', 'dinner', 33.95, -84.55),
   ('11111111-0000-0000-0000-0000000000b7', 'bbbbbbbb-0000-0000-0000-0000000000c7', 'America/New_York', '2026-11-02', 'dinner', 33.95, -84.55);
 
-insert into public.meals (id, user_id, source, session_id, category_id, eaten_on, meal_slot, picked_at) values
-  ('22222222-0000-0000-0000-0000000000a7', 'aaaaaaaa-0000-0000-0000-0000000000c7', 'live', '11111111-0000-0000-0000-0000000000a7', 'thai', '2026-11-02', 'dinner', now()),
-  ('22222222-0000-0000-0000-0000000000b7', 'bbbbbbbb-0000-0000-0000-0000000000c7', 'live', '11111111-0000-0000-0000-0000000000b7', 'thai', '2026-11-02', 'dinner', now());
+insert into public.places(id,name,lat,lon,category_id)
+ values('synthetic:companion-policy','Synthetic place',1,2,'thai');
+
+insert into public.meals (id, user_id, source, session_id, category_id, eaten_on, meal_slot, picked_at, place_id, solo) values
+  ('22222222-0000-0000-0000-0000000000a7', 'aaaaaaaa-0000-0000-0000-0000000000c7', 'live', '11111111-0000-0000-0000-0000000000a7', 'thai', '2026-11-02', 'dinner', now(),'synthetic:companion-policy',false),
+  ('22222222-0000-0000-0000-0000000000b7', 'bbbbbbbb-0000-0000-0000-0000000000c7', 'live', '11111111-0000-0000-0000-0000000000b7', 'thai', '2026-11-02', 'dinner', now(),'synthetic:companion-policy',false);
 insert into public.meals (id, user_id, source, category_id, eaten_on, meal_slot) values
   ('22222222-0000-0000-0000-0000000000a8', 'aaaaaaaa-0000-0000-0000-0000000000c7', 'backfill', 'pizza', '2026-10-30', 'lunch');
+
+-- #75: the permitted live copy is grounded in the picked round's explicit company.
+insert into public.recommendation_events(user_id,session_id,round,place_id,event,rank,slot,decision_company)
+select s.user_id,s.id,1,'synthetic:companion-policy','shown',1,'discovery',
+ jsonb_build_object('confirmed',true,'solo',false,'companion_ids',jsonb_build_array(c.id))
+ from public.sessions s join public.companions c on c.user_id=s.user_id;
+insert into public.recommendation_events(user_id,session_id,round,place_id,event)
+ select user_id,id,1,'synthetic:companion-policy','picked' from public.sessions;
 
 create function public.test_expect_error(label text, call text) returns void language plpgsql as $$
 begin

@@ -1,14 +1,18 @@
 import { supabase } from './supabase';
+import { companionCall } from './api';
 
 // Meals tab and Profile "Most eaten" (P1-22), and the meal detail card (P1-24). Read under
 // existing RLS (own meals, own and shared places, own companions). Edits go through the
-// edit_meal() database function; meals has no update policy.
+// shared confirmed correction RPC; meals has no update policy.
 
 export type Meal = {
   id: string;
-  source: 'backfill' | 'live';
+  source: 'backfill' | 'live' | 'chat';
+  revision: number;
+  companionIds: string[];
   category: string | null;
   placeName: string;
+  placeStatus: 'verified' | 'unresolved' | 'unknown';
   eatenOn: string; // local date, YYYY-MM-DD
   mealSlot: 'breakfast' | 'lunch' | 'dinner' | 'late' | null;
   stars: number | null;
@@ -28,6 +32,7 @@ const MEALS_LIMIT = 200;
 type Row = {
   id: string;
   source: Meal['source'];
+  revision: number;
   category_id: string | null;
   eaten_on: string;
   meal_slot: Meal['mealSlot'];
@@ -40,13 +45,13 @@ type Row = {
   price_tap: number | null;
   price_level: number | null;
   price_amount: number | string | null; // numeric comes back as a string
-  places: { name: string; category_id: string | null } | null;
-  meal_companions: { companions: { name: string } | null }[] | null;
+  places: { name: string; category_id: string | null; unresolved: boolean } | null;
+  meal_companions: { companion_id: string; companions: { name: string } | null }[] | null;
 };
 
 const COLUMNS =
-  'id,source,category_id,eaten_on,meal_slot,stars,went,picked_at,dish,ate_at,solo,price_tap,' +
-  'price_level,price_amount,places(name,category_id),meal_companions(companions(name))';
+  'id,revision,source,category_id,eaten_on,meal_slot,stars,went,picked_at,dish,ate_at,solo,price_tap,' +
+  'price_level,price_amount,places(name,category_id,unresolved),meal_companions(companion_id,companions(name))';
 
 /** Newest first. Live picks the user said they skipped (went = false) are hidden. */
 export async function loadMeals(userId: string): Promise<Meal[]> {
@@ -62,9 +67,12 @@ export async function loadMeals(userId: string): Promise<Meal[]> {
   if (error) throw error;
   return (data ?? []).map((r) => ({
     id: r.id,
+    revision: r.revision,
+    companionIds: (r.meal_companions ?? []).map((c) => c.companion_id),
     source: r.source,
-    category: r.category_id ?? r.places?.category_id ?? null,
-    placeName: r.places?.name ?? 'Unknown place',
+    category: r.category_id,
+    placeName: r.places?.name ?? r.dish ?? 'Place not recorded',
+    placeStatus: r.places === null ? 'unknown' : r.places.unresolved ? 'unresolved' : 'verified',
     eatenOn: r.eaten_on,
     mealSlot: r.meal_slot,
     stars: r.stars,
@@ -80,23 +88,25 @@ export async function loadMeals(userId: string): Promise<Meal[]> {
   }));
 }
 
-/** The card's Edit: live meals with went = true (the database checks the same rule). */
+/** Actual live, backfilled and chat meals are editable; SQL enforces ownership and eligibility. */
 export function canEdit(meal: Meal): boolean {
-  return meal.source === 'live' && meal.went === true;
+  return meal.source === 'backfill' || meal.source === 'chat' || meal.went === true;
 }
 
-export type MealEdit = { dish?: string; stars?: number; priceTap?: number; solo?: boolean };
+export type MealEdit = { dish?: string; stars?: number; priceTap?: number; solo?: boolean;
+  category?: string; companionIds?: string[]; priceAmount?: number };
 
 /** Only changed fields; a blank dish clears it. Each change is logged as an edited event. */
-export async function editMeal(mealId: string, edit: MealEdit): Promise<void> {
-  const { error } = await supabase.rpc('edit_meal', {
-    p_meal_id: mealId,
-    ...(edit.dish !== undefined ? { p_dish: edit.dish } : {}),
-    ...(edit.stars !== undefined ? { p_stars: edit.stars } : {}),
-    ...(edit.priceTap !== undefined ? { p_price_tap: edit.priceTap } : {}),
-    ...(edit.solo !== undefined ? { p_solo: edit.solo } : {}),
-  });
-  if (error) throw error;
+export async function editMeal(mealId: string, edit: MealEdit, revision: number): Promise<void> {
+  await companionCall(`/meals/${mealId}/correct`, { revision, confirmed: true, changes: {
+    ...(edit.dish !== undefined ? { dish: edit.dish } : {}),
+    ...(edit.category !== undefined ? { category_id: edit.category } : {}),
+    ...(edit.stars !== undefined ? { stars: edit.stars } : {}),
+    ...(edit.priceTap !== undefined ? { price_tap: edit.priceTap } : {}),
+    ...(edit.priceAmount !== undefined ? { price_amount: edit.priceAmount } : {}),
+    ...(edit.solo !== undefined ? { solo: edit.solo } : {}),
+    ...(edit.companionIds !== undefined ? { companion_ids: edit.companionIds } : {}),
+  } });
 }
 
 /**

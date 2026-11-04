@@ -99,10 +99,10 @@ def parse_place(place: dict) -> StoredPlace | None:
 def parse_meal(row: dict) -> PastMeal | None:
     """One meals row -> PastMeal, or None if malformed. An unresolved (or missing) place gives
     place = None; a resolved place with bad fields drops the row."""
-    if row.get("source") not in ("backfill", "live"):
+    if row.get("source") not in ("backfill", "live", "chat"):
         return None
     # The query loads live meals with went = true only; this is the second check.
-    live = row["source"] == "live"
+    live = row["source"] in ("live", "chat")
     if live and row.get("went") is not True:
         return None
     place_row = row.get("places")
@@ -132,7 +132,7 @@ def parse_meal(row: dict) -> PastMeal | None:
         dish=dish.strip() or None if isinstance(dish, str) else None,
         food_answered=isinstance(row.get("ate_at"), str) and bool(row["ate_at"]),
         went=True if live else None,
-        stars=_stars(row.get("stars")) if live else None,
+        stars=_stars(row.get("stars")),
         solo=row.get("solo") if isinstance(row.get("solo"), bool) else None,
         companion_ids=read_ids(row.get("meal_companions"), "companion_id"),
         distance_m=(distance if isinstance(distance, int) and not isinstance(distance, bool)

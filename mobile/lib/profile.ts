@@ -109,7 +109,7 @@ export async function loadCompanions(userId: string): Promise<string[]> {
 export type Companion = { id: string; name: string };
 
 /** The current user's companions for company chips; names stay on the phone's parse path. */
-export async function loadCompanionChoices(userId: string): Promise<Companion[]> {
+export async function loadCompanionChoices(userId: string, requireComplete = false): Promise<Companion[]> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -117,13 +117,18 @@ export async function loadCompanionChoices(userId: string): Promise<Companion[]>
       (async () => {
         const { data, error } = await supabase.from('companions').select('id,name')
           .eq('user_id', userId).order('created_at').abortSignal(controller.signal);
+        if (error && requireComplete) throw new Error('Companions unavailable');
         return error ? [] : data ?? [];
       })(),
-      new Promise<Companion[]>((resolve) => {
-        timer = setTimeout(() => { resolve([]); controller.abort(); }, PLAN_TIMEOUT_MS);
+      new Promise<Companion[]>((resolve, reject) => {
+        timer = setTimeout(() => {
+          if (requireComplete) reject(new Error('Companions unavailable')); else resolve([]);
+          controller.abort();
+        }, PLAN_TIMEOUT_MS);
       }),
     ]);
   } catch {
+    if (requireComplete) throw new Error('Companions unavailable');
     return [];
   } finally {
     clearTimeout(timer);

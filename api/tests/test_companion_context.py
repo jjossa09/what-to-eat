@@ -651,8 +651,11 @@ class FunnelFake(funnel_t.Supabase):
             self.requests.append(request)
             session = {**funnel_t.SESSION, "outcome": self.outcome,
                        "session_companions": self.session_companions}
-            return httpx2.Response(200, json=[{"place_id": funnel_t.PLACE_ID,
-                                               "places": funnel_t.PLACE, "sessions": session}])
+            return httpx2.Response(200, json=[{
+                "place_id": funnel_t.PLACE_ID,
+                "decision_company": {"confirmed": True,
+                    "companion_ids": [r["companion_id"] for r in self.session_companions]},
+                "places": funnel_t.PLACE, "sessions": session}])
         if key == "GET session_companions":
             self.requests.append(request)
             return httpx2.Response(200, json=self.session_companions)
@@ -662,15 +665,15 @@ class FunnelFake(funnel_t.Supabase):
         return super().__call__(request)
 
 
-def test_a_pick_copies_the_session_companions_to_the_meal():
+def test_a_pick_delegates_confirmed_companion_copy_to_the_atomic_rpc():
     up = FunnelFake(session_companions=[B, A])
     response = funnel_t.send(up, "picked", {"round": 1, "place_id": funnel_t.PLACE_ID})
     assert response.status_code == 200
-    inserts = up.calls("POST", "meal_companions")
-    assert len(inserts) == 1, "P2-07 not implemented: the pick copies no companions to the meal"
-    rows = sorted(json.loads(inserts[0].content), key=lambda r: r["companion_id"])
-    assert rows == [{"meal_id": MEAL_ID, "companion_id": A, "user_id": funnel_t.USER_ID},
-                    {"meal_id": MEAL_ID, "companion_id": B, "user_id": funnel_t.USER_ID}]
+    assert response.json()["meal_id"] == MEAL_ID
+    assert len(up.calls("POST", "rpc/save_recommendation_pick")) == 1
+    assert up.calls("POST", "meal_companions") == []
+    # Exact two-companion persistence, retry and copy-failure behavior is exercised
+    # by food_companion_test.sql against the real RPC, rather than a transport mock.
     funnel_t.assert_as_user(up)
 
 

@@ -359,7 +359,8 @@ def data_summary(history: History) -> list[str]:
     days = (max(m.eaten_on for m in meals) - min(m.eaten_on for m in meals)).days + 1 if meals \
         else 0
     return [
-        f"- Meals loaded: {len(meals)} ({sources['backfill']} backfill, {sources['live']} live), "
+        f"- Meals loaded: {len(meals)} ({sources['backfill']} backfill, {sources['live']} live"
+        + (f", {sources['chat']} chat" if sources['chat'] else "") + "), "
         f"spanning {days} days.",
         f"- Meals at unresolved places (cuisine only, not place): {unresolved}.",
         f"- Countable meals skipped for having no meal slot: {no_slot}.",

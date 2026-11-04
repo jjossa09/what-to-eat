@@ -1,6 +1,6 @@
 # What to eat! Requirements
 
-Version 1.7 | 2026-11-02 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
+Version 1.8 | 2026-11-04 | Juan Castro | Meta Global AI Developer Hackathon, Indie track
 
 ## Overview
 
@@ -30,7 +30,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | ID | Requirement | Phase |
 |---|---|---|
 | FR3 | The app is a chat. One question per message, drawn from a pool: craving (category), budget, distance, who you're with. The distance question uses 2 chips: Close to me, I don't mind. | 1 |
-| FR4 | Exactly 3 questions (3 messages) before the first round of recommendations, chosen by the ML6 confidence gate from craving, budget, distance, and company. Company joins the pool when the user has at least one saved companion, whatever the quiz says. Weak predictions are asked first; answers the models predict confidently are asked last with their chip pre-selected and editable. The quiz budget is pre-selected even when the budget prediction is weak (it is the user's own answer). A new search counts the typed craving as its first answer and asks two more. Question text is fixed; Muse only parses answers. Cold start: the gate runs on the quiz prior. | 1-2 |
+| FR4 | Each new Eat conversation opens with "Hey! What are we eating today?" without Muse. Ask up to three necessary survey questions, one at a time, from craving, budget, distance and company when saved companions exist. The server stops when all applicable fields are explicit, the remaining predictions pass ML6, three questions were asked, or the user requests recommendations now. Zero follow-up questions is valid. Explicit multi-field answers and corrections apply immediately; explicitly uncertain fields are not asked again. The opening and action confirmations do not consume the survey-question budget. | 1-2 |
 | FR5 | Free-text answers are parsed by Muse into the same structured answers as quick-reply chips (ML7). | 1 |
 
 ### Recommendations
@@ -40,7 +40,7 @@ Every recommendation traces to data. When evidence is thin, the app asks instead
 | FR6 | Geoapify Places search (catering categories) from the current location, using the search radius defined in FR-R2. | 1 |
 | FR7 | Each candidate is scored deterministically (ML5); the top 3 are shown, each with a one-line reason written by Muse from the actual evidence (ML7). | 1 |
 | FR8 | The top 3 appear as compact cards and pins on an Apple Map, with "Powered by Geoapify" and "© OpenStreetMap contributors" shown (NFR5). Tapping Directions opens Apple Maps. | 1 |
-| FR9 | The user confirms which place they chose. 'None of these' asks a refinement question and keeps the session open. On the best-so-far round (ML10), 'None of these' ends the session as none. A session left without a decision keeps no outcome. | 1 |
+| FR9 | The user confirms which place they chose. The first "None of these" asks "I see, any clue what you may want?" and retains deterministic refinement chips and text input. The session remains open. On the best-so-far round (ML10), "None of these" ends the session as none. A session left without a decision keeps no outcome. | 1 |
 | FR9b | After the first round, the conversation stays open as long as needed; refinement follows the ML10 loop. | 1 |
 
 ### Feedback
@@ -68,6 +68,21 @@ Background location is out of scope: it needs a development build and a paid App
 | FR16 | Charts: price by meal slot (amount paid for backfill; price tap for live meals, else session budget level), most common category by meal slot, distance traveled, meals by companion, top categories. | 2 |
 | FR17 | A one-line Muse-written takeaway at the top of the Insights screen, phrased from computed stats only. | 2 |
 
+## Food companion (#75)
+
+- One bounded Muse response contains `intents` and a validated `patch`. Allowed intents: survey_patch, recommend_now, log_meal, rate_meal, find_place, history_query, preference_change, confirm, cancel, unknown. Code executes all actions.
+- Resolve pending confirm/cancel first, then at most one side effect, then requested reads, then survey/recommendation work. Explicitly offer a second side effect after the first; never execute it automatically. Unrelated messages cancel pending actions. Pending actions freeze survey questions. The survey patch still applies when appropriate.
+- Meals: require confirmed food and date; allow an unknown slot, place, company or rating. Relative dates resolve against the user's calendar/timezone; future dates are rejected and weekdays require clarification. An editable card and explicit Confirm tap precede every chat meal write. Warn about matching food/date/slot and require Add another for an intentional duplicate. Persisted idempotency keys prevent retry duplicates.
+- Chat-created meals use source=chat, no recommendation session and a nullable verified place. Only user-confirmed food trains cuisine; only a verified actual place trains place history. Never invent places, companions, slots or ratings. Do not retain the raw source message to create a meal.
+- On-demand feedback selects actual meals by eaten_on and known meal-slot chronology, never creation time. Ties and unknown times require selection from up to three candidates; broader matches require narrowing. Live, backfill and chat meals share owned, version-checked correction logic. One rating value per meal; updates do not insert duplicate feedback.
+- Nearby name lookup uses Geoapify's documented name filter, current distance setting and at most one widening to the existing 40,234 m maximum. Accept exact normalized names or exact provider brand names; normalize case, punctuation and articles. Sort by distance. Label results Nearby, with additional verified matches available. This is separate from personalized ranking and carries no invented recommendation reasons.
+- History ranges: today, yesterday, this_week (Monday through today), last_7_days, last_30_days, this_month. Lately means the last seven calendar days, inclusive. Always show the actual range. Reuse computed backend facts and existing charts (top, food, price, distance, companions). Distinguish partial evidence from zero; deterministic factual text is the fallback and requires no additional Muse call.
+- Only explicit persistent instructions open a taste-profile confirmation. Removing a favorite is distinct from adding a hard no. Profile editing and chat use the same version-checked writer, preserve 1-5 favorites, reject overlaps, and audit old/new values, identity, timestamp, source and action reference without raw chat content.
+- Eligible historical meals are editable without fabricated sessions. A dish-only change never confirms food. An explicit food-category correction changes the meal, never its place. Solo clears companion links transactionally; only confirmed owned companions are saved. Displayed recommendation rounds snapshot confirmed company independently of model context.
+- Unsupported menu, seating, hours, health or amenity constraints receive an honest limitation and an allowlisted unmatched category, never a new ranking signal. Session exclusions never update preferences or train the models.
+- P3-09 (#64) verifies behavior; all implementation stays in #75. #73 owns chain-aware ranking and remains a dependency until integrated and verified. Do not claim one card per chain from ID/co-location deduplication alone.
+- ML9 remains a time-ordered meal replay with fixed parameters, baselines and denominators. Conversation-question counts are verified separately, not retrofitted into meal replay. No new real-user evaluation or metrics publication without authorization.
+
 ## Prediction model
 
 Algorithms predict; Muse only handles language. Every value marked "starting value" is tuned only on live data, never on the backfill.
@@ -79,7 +94,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 | ML3 | Layer 1, cuisine model: recency-weighted counts per context, each level smoothed toward the broader one: quiz prior, user overall, meal slot, meal slot and weekday/weekend, then (when companions are selected) meals in this meal slot that included every selected companion. A level counts once it has at least one recency-weighted meal. Outputs a probability per category plus the number of meals behind it. | 2 |
 | ML4 | Layer 2, place model: return score from visits, recency, and 1-5 star ratings; 1-2 stars drop it sharply. New places are scored on category fit and distance fit. Price fit uses the user's own price data for that place; unknown = half. | 2 |
 | ML5 | Scoring: each real candidate is scored deterministically from ML3, ML4, price fit, and distance fit. OSM has no ratings or price levels, so neither is used. Top 3 = 2 familiar picks + 1 discovery slot (best candidate outside the user's usual categories). Phase 1 uses the quiz prior in place of ML3 and ML4. | 1 |
-| ML6 | Confidence gate: a prediction is weak if its top probability is under 0.4 or it rests on fewer than 5 meals in the context (Starting values). With 3 questions in the pool, the gate orders them (weak first) and skips none. With 4 (company included), it asks 3 and skips the most confident of the confident predictions, which becomes the answer (ties skip budget); if none is confident, company is skipped and stays unknown. A new search never skips craving. Craving uses the cuisine model (ML3); budget uses the user's paid price levels, smoothed toward the quiz budget the same way; company uses the user's past company (solo or a saved group), starting from the quiz: mostly solo gives solo 0.7 and the observed groups share 0.3 equally, with people gives solo 0.3 and the groups share 0.7, no answer gives equal shares; then the same smoothing and levels. Before any group is observed, solo keeps its quiz share and the rest goes to an "unseen group" that is never an answer: if it is the top prediction, company is weak. Distance is treated as weak until it has its own model. | 2 |
+| ML6 | Keep the existing confidence rule: top probability under 0.4 or fewer than 5 context meals is weak. The existing gate supplies ordering and model evidence; the conversation asks only unresolved weak fields, up to the FR4 cap. Track each value, status (unknown, predicted, uncertain, confirmed), source and turn separately from temporary exclusions. Explicit answers override predictions. Uncertainty remains explicit even if model evidence supplies a recommendation input. Recommend-now never requires confidence and never fabricates missing answers. Predicted company is recommendation context, never a confirmed meal label. | 2 |
 | ML7 | Muse is language only: parse free text into structured answers, write each pick's one-line reason from the actual evidence, run the conversation. Muse never reorders, removes, or adds places. One Muse call writes all 3 reasons; its output is checked against the candidate IDs. | 1 |
 | ML8 | Funnel logged per recommendation: shown, interested (card or directions tapped), rejected (with reason), picked, went, stars, price tap. | 1 |
 | ML9 | Evaluation: time-ordered replay on backfilled history (predict each meal using only earlier meals). Report cuisine and place top-3 hit rates against two baselines (always most frequent; random), with sample size stated. | 2 |
@@ -108,7 +123,7 @@ Algorithms predict; Muse only handles language. Every value marked "starting val
 - On import, each place name is resolved once to a Geoapify place so backfilled and live visits match. Ambiguous matches are confirmed by Juan.
 - A meal's category is the food eaten, for backfill (the CSV category) and live (the food answer). It never relabels a place: a place's category comes only from the ML2 mapping, including the human-verified exact-name overrides.
 - Backfill places that can't be resolved are stored with the CSV's name, mapped from the name alone, and flagged unresolved. Those meals count for the cuisine model, not for distance or place matching.
-- Backfill tests Layers 1 and 2 by meal slot and day. Companion patterns learn from live and backfill meals; star-based return scores learn from live use only. The offline evaluation (ML9) replays without companions.
+- Backfill tests Layers 1 and 2 by meal slot and day. Companion patterns learn from live and backfill meals; star-based return scores use genuine user-confirmed ratings, including corrections to historical meals. The offline evaluation (ML9) replays without companions.
 - ML9 place hit rate: the candidate pool for each replayed meal is the set of places seen in earlier meals. A first visit to a new place counts as a miss; the share of new-place meals is reported separately. Parameters are fixed before replay, not tuned on it.
 
 ## Adaptive search radius
@@ -129,7 +144,7 @@ The search area should grow more accurate to the user as usage increases. Values
 | NFR1 | Runs on iPhone through Expo Go; no App Store build required. | 1 |
 | NFR2 | Backend deployed on a free tier by the end of Phase 1 (Vercel Hobby; Render free with a keep-alive ping as fallback), so the app works away from home Wi-Fi. | 1 |
 | NFR3 | API keys live only on the backend; every API request requires a valid Supabase JWT. | 1 |
-| NFR4 | First round of recommendations in under about 8 seconds after the third answer: one places search and one Muse call per round. | 1 |
+| NFR4 | Target the first recommendation cards in about 8 seconds once ready. Return deterministic template reasons first, with optional signed Muse enhancement afterward. Preserve the 7.5 s round logging budget, 4 s shared Places budget (bounded widening), 10 s parse cap, 12 s reasons cap and endpoint/client deadlines. One parsing call per typed message; no Muse calls for greetings, acknowledgments or deterministic chips. Production timing requires runtime verification. | 1 |
 | NFR5 | Compliance: no nutrition, calorie, health, or diet claims anywhere. "Powered by Geoapify" and "© OpenStreetMap contributors" (linked to openstreetmap.org/copyright) shown wherever results appear. Everything presented was built Oct 26 to Nov 4; the backfill is pre-existing personal data, labeled as such in the demo and README. | All |
 | NFR6 | $0 out of pocket: free tiers only, no card on file (Geoapify free, Vercel Hobby, Supabase free, Expo Go). | All |
 
@@ -137,7 +152,7 @@ The search area should grow more accurate to the user as usage increases. Values
 
 **Mobile:** Expo (React Native, TypeScript). **Backend:** FastAPI (Python, uv) on Vercel Hobby. **Places:** Geoapify Places API (OpenStreetMap data, ODbL). **Map:** Apple Maps via react-native-maps. **Prediction:** deterministic scoring and models in the backend (ML3 to ML6, ML10). **AI:** Muse Spark via Meta Model API for language only (ML7); Muse Voice Transcribe for voice input. **Data and auth:** Supabase (Postgres).
 
-**Tables:** profiles (linked to Supabase auth users), taste_profiles, companions, sessions, session_companions, messages, meals (source = backfill or live), meal_companions, categories, places, recommendation_events. Went, stars, and the price tap are funnel events (ML8) and are also kept on the meal; there is no separate feedback table.
+**Tables:** companion_actions (pending and idempotent confirmed actions), preference_changes (old/new audit), meal_corrections (old/new audit), profiles (linked to Supabase auth users), taste_profiles, companions, sessions, session_companions, messages, meals (source = backfill or live), meal_companions, categories, places, recommendation_events. Went, stars, and the price tap are funnel events (ML8) and are also kept on the meal; there is no separate feedback table.
 
 ## Phases and deliverables
 
@@ -155,6 +170,11 @@ The search area should grow more accurate to the user as usage increases. Values
 - OSM cuisine tags are often missing. The name-keyword and chains pass (ML2) reduces this; places matching neither fall to Other and score lower on category fit.
 - Free-tier cold starts can eat into the 8 second budget (NFR4). Cold-start latency is measured at deploy.
 - The radius thresholds (80th percentile, 1 to 25 miles, 8 candidates) and all starting values above are untested guesses, to be tuned after 2 to 3 days of live data.
+
+## Changes from v1.7
+
+- #75: variable survey questions, validated actions, confirmation and idempotency, session exclusions, chat meals, historical feedback/editing, Nearby lookup, bounded history and charts, audited taste editing, and explicit training provenance.
+- Recommendation reasons remain template-first (#82); #73 remains responsible for chain-aware ranking.
 
 ## Changes from v1.6
 

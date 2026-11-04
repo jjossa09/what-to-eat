@@ -57,7 +57,7 @@ def _owned_id(row: object, user_id: str) -> str:
 def _meal(row: dict, user_id: str) -> Meal:
     mid = _owned_id(row, user_id)
     source, eaten, day = row["source"], row["eaten_on"], row["day_of_week"]
-    if source not in ("live", "backfill") or not isinstance(eaten, str):
+    if source not in ("live", "backfill", "chat") or not isinstance(eaten, str):
         raise ValueError
     eaten_on = date.fromisoformat(eaten)
     if eaten_on.isoformat() != eaten or type(day) is not int or not 1 <= day <= 7:
@@ -144,7 +144,8 @@ async def _companions(client, base, user_id, headers, timeout) -> tuple[frozense
         previous = rows
 
 
-async def response(user_id: str, token: str, as_of: date, *, client: httpx2.AsyncClient) -> dict:
+async def response(user_id: str, token: str, as_of: date, *, client: httpx2.AsyncClient,
+                   from_date: date | None = None, meal_slot: str | None = None) -> dict:
     """Failed reads return no counts; malformed rows are omitted and mark incomplete data."""
     try:
         settings = get_settings()
@@ -156,7 +157,9 @@ async def response(user_id: str, token: str, as_of: date, *, client: httpx2.Asyn
             _read(client, f"{base}/meals", {
                 "select": MEALS_SELECT, "user_id": f"eq.{user_id}",
                 "eaten_on": f"lte.{as_of.isoformat()}",
-                "or": "(source.eq.backfill,and(source.eq.live,went.is.true))",
+                **({"and": f"(eaten_on.gte.{from_date.isoformat()})"} if from_date else {}),
+                **({"meal_slot": f"eq.{meal_slot}"} if meal_slot else {}),
+                "or": "(source.eq.backfill,and(source.in.(live,chat),went.is.true))",
                 "order": "eaten_on.desc,id.desc", "limit": MEALS_LIMIT,
             }, headers, timeout),
             _companions(client, base, user_id, headers, timeout),

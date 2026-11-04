@@ -57,7 +57,7 @@ def aggregate(meals: Iterable[Meal], as_of: date) -> dict:
             "missing_price_meals": sum(m.paid_level is None and m.budget_level is None
                                        for m in visits),
             "backfill_distance_meals": sum(m.source == "backfill" for m in visits),
-            "missing_distance_meals": sum(m.source == "live" and m.distance_m is None
+            "missing_distance_meals": sum(m.source in ("live", "chat") and m.distance_m is None
                                           for m in visits),
         },
     }

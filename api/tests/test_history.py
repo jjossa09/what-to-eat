@@ -176,7 +176,7 @@ def test_select_loads_went_and_stars():
     assert {"went", "stars"} <= fields
 
 
-def test_stars_are_live_only_and_went_false_is_dropped():
+def test_genuine_historical_stars_are_kept_and_went_false_is_dropped():
     meals = [
         meal_row(stars=5),
         meal_row(stars=9),
@@ -188,4 +188,4 @@ def test_stars_are_live_only_and_went_false_is_dropped():
     result = run_load(Supabase(meals=meals)).meals
     assert [(m.source, m.went, m.stars) for m in result] == [
         ("live", True, 5), ("live", True, None), ("live", True, None),
-        ("backfill", None, None)]
+        ("backfill", None, 4)]  # #75 permits explicitly confirmed historical feedback.
