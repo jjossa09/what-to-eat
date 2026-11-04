@@ -1,4 +1,3 @@
-import * as Haptics from 'expo-haptics';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AppState,
@@ -19,6 +18,7 @@ import {
   saveFeedback,
 } from '../lib/feedback';
 import { cachePending, onForeground, reschedule, stopReminder } from '../lib/notify';
+import { haptic } from '../lib/haptics';
 import { BUDGETS, type Category, loadCategories } from '../lib/profile';
 import { colors, emojiFor, radii, spacing, type } from '../theme';
 import PressScale from './PressScale';
@@ -40,10 +40,6 @@ const STAR_ADVANCE_MS = 350; // lets the filled stars show before moving on
 const STARS = [1, 2, 3, 4, 5];
 const PROGRESS: Partial<Record<Step, number>> = { food: 0, stars: 1, price: 2 };
 
-function tapHaptic() {
-  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-}
-
 export default function FeedbackPrompt({ userId }: { userId: string }) {
   const [meal, setMeal] = useState<PendingMeal | null>(null);
   const [step, setStep] = useState<Step>('went');
@@ -58,6 +54,16 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   const [retry, setRetry] = useState<(() => void) | null>(null);
   const open = useRef(false);
   const saved = useRef({ food: false, stars: false }); // what already reached the database
+  const life = useRef({ mounted: true, generation: 0, busy: false });
+  const advance = useRef<(() => void) | null>(null);
+  const starPick = useRef(0);
+  const [foreground, setForeground] = useState(AppState.currentState === 'active');
+  const clearAdvance = useCallback(() => { advance.current?.(); advance.current = null; }, []);
+  useEffect(() => {
+    const current = life.current;
+    current.mounted = true;
+    return () => { current.mounted = false; current.generation++; clearAdvance(); };
+  }, [clearAdvance]);
 
   useEffect(() => {
     loadCategories()
@@ -66,21 +72,30 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   }, []);
 
   const close = useCallback(() => {
+    clearAdvance();
+    life.current.generation++;
+    life.current.busy = false;
     open.current = false;
     setMeal(null);
+    setSaving(false);
     setRetry(null);
-  }, []);
+  }, [clearAdvance]);
 
   // Shows the pop-up for what checkFeedback found. A likely visit is recorded first.
   const present = useCallback((start: FeedbackStart) => {
     if (start.kind === 'none' || open.current) return;
+    const generation = ++life.current.generation;
     open.current = true;
     const show = (at: Step, undo: boolean) => {
+      if (!life.current.mounted || generation !== life.current.generation) return;
+      life.current.busy = false;
+      setSaving(false);
       saved.current = { food: start.kind === 'resumeStars', stars: !start.meal.askStars };
       const placeCategory = start.meal.categoryId;
       setCategory(placeCategory && placeCategory !== 'other' ? placeCategory : null);
       setDish(start.meal.dish ?? '');
       setStars(0);
+      starPick.current = 0;
       setRetry(null);
       setCanUndoWent(undo && start.meal.askStars); // the database refuses it once rated
       setFirst(at);
@@ -105,8 +120,10 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
 
   const check = useCallback(() => {
     if (open.current) return;
+    const generation = life.current.generation;
     checkFeedback(userId)
       .then(({ start, unanswered }) => {
+        if (!life.current.mounted || generation !== life.current.generation) return;
         cachePending(unanswered);
         present(start);
       })
@@ -116,8 +133,11 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   // On open, and each time the app comes back to the foreground. Going to the background is the
   // reminder's "activity" (FR10): it is rescheduled from the cache, with no network call.
   useEffect(() => {
+    const current = life.current;
     check();
     const sub = AppState.addEventListener('change', (state) => {
+      setForeground(state === 'active');
+      if (state !== 'active') clearAdvance();
       if (state === 'active') {
         onForeground();
         check();
@@ -125,8 +145,8 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         reschedule();
       }
     });
-    return () => sub.remove();
-  }, [check]);
+    return () => { sub.remove(); current.generation++; clearAdvance(); };
+  }, [check, clearAdvance]);
 
   useEffect(() => {
     if (step !== 'thanks' || !meal) return;
@@ -134,23 +154,19 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     return () => clearTimeout(timer);
   }, [step, meal, close]);
 
-  // One tap on a star: the stars fill, then the price step follows (Back returns to change it).
-  // With a price already saved (meal card Edit, P1-24), the star tap finishes instead.
-  useEffect(() => {
-    if (step !== 'stars' || stars === 0 || meal?.askPrice === false) return;
-    const timer = setTimeout(() => setStep('price'), STAR_ADVANCE_MS);
-    return () => clearTimeout(timer);
-  }, [step, stars, meal]);
-
   // "Did you go?" and "I didn't go": saved right away.
   async function saveWent(went: boolean) {
-    if (!meal || saving) return;
-    tapHaptic();
+    if (!meal || life.current.busy) return;
+    const generation = life.current.generation;
+    life.current.busy = true;
+    clearAdvance();
     setSaving(true);
     setRetry(null);
     try {
       await saveFeedback(meal.id, { went });
+      if (!life.current.mounted || generation !== life.current.generation) return;
       stopReminder(meal.id);
+      haptic('success');
       if (went) {
         setFirst('food');
         setStep('food');
@@ -158,38 +174,65 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         setStep('thanks');
       }
     } catch {
-      setRetry(() => () => saveWent(went));
+      if (life.current.mounted && generation === life.current.generation) setRetry(() => () => saveWent(went));
     } finally {
-      setSaving(false);
+      if (life.current.mounted && generation === life.current.generation) {
+        life.current.busy = false;
+        setSaving(false);
+      }
     }
   }
 
   // Finish: food, stars, then the price if one was tapped. A retry continues where it stopped.
   // chosen: the star just tapped, when finishing straight from the stars step. Stars already
   // saved (meal card Edit): finishes from the food step with no star.
-  async function finish(priceTap: number | null, chosen: number = stars) {
-    if (!meal || saving || !category || (!saved.current.stars && chosen === 0)) return;
-    tapHaptic();
+  const finish = useCallback(async function finish(priceTap: number | null, chosen: number = stars) {
+    if (!meal || life.current.busy || !category || (!saved.current.stars && chosen === 0)) return;
+    const generation = life.current.generation;
+    const current = () => life.current.mounted && generation === life.current.generation;
+    life.current.busy = true;
+    clearAdvance();
     setSaving(true);
     setRetry(null);
     try {
       if (!saved.current.food) {
         const clean = dish.trim();
         await saveFeedback(meal.id, { category, dish: clean ? clean : null });
+        if (!current()) return;
         saved.current.food = true;
       }
       if (!saved.current.stars) {
         await saveFeedback(meal.id, { stars: chosen });
+        if (!current()) return;
         saved.current.stars = true;
       }
       if (priceTap !== null) await saveFeedback(meal.id, { priceTap });
+      if (!current()) return;
       setStep('thanks');
+      haptic('success');
     } catch {
-      setRetry(() => () => finish(priceTap, chosen));
+      if (current()) setRetry(() => () => finish(priceTap, chosen));
     } finally {
-      setSaving(false);
+      if (current()) { life.current.busy = false; setSaving(false); }
     }
-  }
+  }, [meal, category, dish, stars, clearAdvance]);
+
+  // One cancellable delay for either path. A final star gets only the save confirmation;
+  // a buffered star gets selection feedback, with no haptic on passive advancement.
+  useEffect(() => {
+    if (!foreground || step !== 'stars' || stars === 0 || !meal) return;
+    let live = true;
+    const generation = life.current.generation;
+    const timer = setTimeout(() => {
+      if (!live || !life.current.mounted || generation !== life.current.generation
+        || life.current.busy || starPick.current !== stars) return;
+      if (meal.askPrice) setStep('price');
+      else void finish(null, stars);
+    }, STAR_ADVANCE_MS);
+    const stop = () => { live = false; clearTimeout(timer); };
+    advance.current = stop;
+    return () => { stop(); if (advance.current === stop) advance.current = null; };
+  }, [foreground, step, stars, meal, finish]);
 
   // Back only to steps not yet saved: food and stars are held until finish.
   const canGoBack =
@@ -197,10 +240,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     (step === 'price' ? !saved.current.stars : step === 'stars' && first === 'food' && !saved.current.food);
 
   function back() {
-    tapHaptic();
+    if (life.current.busy) return;
+    clearAdvance();
+    haptic('light');
     setRetry(null);
     if (step === 'price') {
       setStars(0); // tap again to choose; the old choice would advance at once
+      starPick.current = 0;
       setStep('stars');
     } else if (step === 'stars') {
       setStep('food');
@@ -219,8 +265,8 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     body = (
       <>
         <View style={styles.row}>
-          <Chip label="Yes" onPress={() => saveWent(true)} />
-          <Chip label="No" onPress={() => saveWent(false)} />
+          <Chip label="Yes" feedback={false} disabled={saving} onPress={() => saveWent(true)} />
+          <Chip label="No" feedback={false} disabled={saving} onPress={() => saveWent(false)} />
         </View>
         <View style={styles.center}>
           <TextLink
@@ -248,10 +294,9 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
               key={c.id}
               label={`${emojiFor(c.id)} ${c.name}`}
               selected={c.id === category}
-              onPress={() => {
-                tapHaptic();
-                setCategory(c.id);
-              }}
+              feedback="selection"
+              disabled={saving}
+              onPress={() => setCategory(c.id)}
             />
           ))}
         </ScrollView>
@@ -266,19 +311,19 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         />
         <PrimaryButton
           label={meal.askStars ? 'Next' : 'Done'}
+          feedback={meal.askStars ? 'light' : false}
           disabled={!category || saving}
           onPress={() => {
             if (!meal.askStars) {
               finish(null);
               return;
             }
-            tapHaptic();
             setStep('stars');
           }}
         />
         {canUndoWent && (
           <View style={styles.center}>
-            <TextLink label="I didn't go" onPress={() => saveWent(false)} />
+            <TextLink feedback={false} label="I didn't go" onPress={() => saveWent(false)} />
           </View>
         )}
       </>
@@ -290,11 +335,13 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         {STARS.map((n) => (
           <PressScale
             key={n}
+            disabled={saving}
             onPress={() => {
-              tapHaptic();
+              if (life.current.busy || starPick.current === n) return;
+              clearAdvance();
+              starPick.current = n;
               setStars(n);
-              // Price already saved: no price step, the star finishes (after the fill shows).
-              if (!meal.askPrice) setTimeout(() => finish(null, n), STAR_ADVANCE_MS);
+              if (meal.askPrice) haptic('selection');
             }}
             accessibilityRole="button"
             accessibilityLabel={`${n} star${n > 1 ? 's' : ''}`}
@@ -314,11 +361,11 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
       <>
         <View style={styles.row}>
           {BUDGETS.map((b) => (
-            <Chip key={b.level} label={b.label} onPress={() => finish(b.level)} />
+            <Chip key={b.level} label={b.label} feedback={false} disabled={saving} onPress={() => finish(b.level)} />
           ))}
         </View>
         <View style={styles.center}>
-          <TextLink label="Skip" onPress={() => finish(null)} />
+          <TextLink label="Skip" feedback={false} onPress={() => finish(null)} />
         </View>
       </>
     );
@@ -331,7 +378,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
       <KeyboardAvoidingView behavior="padding" style={styles.scrim}>
         <GlassCard>
           <View style={styles.header}>
-            {canGoBack ? <TextLink label="Back" onPress={back} /> : <View />}
+            {canGoBack ? <TextLink feedback={false} label="Back" onPress={back} /> : <View />}
             {progress !== undefined && <Dots step={progress} total={3} />}
           </View>
           <View style={styles.badge}>
@@ -342,7 +389,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
           {retry && (
             <View style={styles.row}>
               <Text style={styles.error}>Couldn&apos;t save. Try again.</Text>
-              <Chip label="Try again" onPress={retry} />
+              <Chip label="Try again" feedback={false} disabled={saving} onPress={retry} />
             </View>
           )}
         </GlassCard>

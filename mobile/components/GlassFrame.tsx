@@ -10,10 +10,10 @@ import { blur, colors, frame } from '../theme';
 // Shared glass frame (P1-19, P1-24): the map's "What to eat?!" button and the meal detail card,
 // so both share one style. Apple-style, like the dock (P1-22). Back to front, clipped to the
 // shape:
-//   1. fully clear glass: Liquid Glass "clear" on iOS 26+, else a light BlurView with no tint;
+//   1. clear glass by default; frosted adds a stronger blur and a light fill for text;
 //   2. the rim: the accent gradient (bottom to top) in stacked bands from the edge inward,
 //      fading to transparent within rim.width. Nothing red under the center.
-// Reduce Transparency: a plain frosted fill under the rim. Values in theme.ts (frame).
+// Reduce Transparency: an opaque fill under the rim. Values in theme.ts (frame).
 
 // Checked once, as in the dock: isGlassEffectAPIAvailable guards iOS 26 betas without the API.
 const LIQUID_GLASS = isLiquidGlassAvailable() && isGlassEffectAPIAvailable();
@@ -24,6 +24,7 @@ type Props = {
   shape: 'circle' | 'rounded';
   size?: number;
   radius?: number;
+  variant?: 'clear' | 'frosted';
   style?: ViewStyle;
 };
 
@@ -40,8 +41,9 @@ function rimBands() {
 
 const BANDS = rimBands();
 
-export default function GlassFrame({ children, shape, size, radius = 0, style }: Props) {
+export default function GlassFrame({ children, shape, size, radius = 0, variant = 'clear', style }: Props) {
   const reduce = useReduceTransparency();
+  const frosted = variant === 'frosted';
   const id = useId().replace(/[^a-zA-Z0-9]/g, ''); // gradient ids, unique per frame
   const [box, setBox] = useState(size ? { w: size, h: size } : { w: 0, h: 0 });
   const r = shape === 'circle' ? box.w / 2 : radius;
@@ -70,10 +72,13 @@ export default function GlassFrame({ children, shape, size, radius = 0, style }:
         {reduce ? (
           <View style={[StyleSheet.absoluteFill, styles.solid]} />
         ) : LIQUID_GLASS ? (
-          <GlassView glassEffectStyle={frame.glassStyle} style={[StyleSheet.absoluteFill, { borderRadius: r }]} />
+          <GlassView glassEffectStyle={frosted ? frame.frosted.glassStyle : frame.glassStyle}
+            style={[StyleSheet.absoluteFill, { borderRadius: r }]} />
         ) : (
-          <BlurView intensity={frame.blurIntensity} tint={blur.tint} style={StyleSheet.absoluteFill} />
+          <BlurView intensity={frosted ? frame.frosted.blurIntensity : frame.blurIntensity}
+            tint={blur.tint} style={StyleSheet.absoluteFill} />
         )}
+        {!reduce && frosted && <View style={[StyleSheet.absoluteFill, styles.frosted]} />}
         {box.w > 0 && (
           <Svg width={box.w} height={box.h} style={StyleSheet.absoluteFill} pointerEvents="none">
             <Defs>{gradient(`rim${id}`)}</Defs>
@@ -111,6 +116,9 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   solid: {
-    backgroundColor: colors.glassStrong,
+    backgroundColor: frame.solidFill,
+  },
+  frosted: {
+    backgroundColor: frame.frosted.fill,
   },
 });

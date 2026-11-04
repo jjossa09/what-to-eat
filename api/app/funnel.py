@@ -6,7 +6,6 @@ set and filtered explicitly. The shared places cache is the one exception: upser
 uses the service role, and no other function may. Never log the token or a response body.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -373,6 +372,7 @@ async def log_shown(
     reasons: tuple[str, ...],
     reasons_source: str,
     *,
+    budget_level: int | None,
     client: httpx2.AsyncClient,
 ) -> None:
     """One 'shown' row per card, in one insert."""
@@ -387,17 +387,18 @@ async def log_shown(
         }
         for pick, reason in zip(picks, reasons, strict=True)
     ]
-    await log_shown_rows(user_id, token, ref, rows, client=client)
+    await log_shown_rows(user_id, token, ref, rows, budget_level=budget_level, client=client)
 
 
 async def log_shown_rows(
-    user_id: str, token: str, ref: RoundRef, cards: list[dict], *, client: httpx2.AsyncClient,
+    user_id: str, token: str, ref: RoundRef, cards: list[dict], *,
+    budget_level: int | None, client: httpx2.AsyncClient,
 ) -> None:
     """Shown rows from card fields (place_id, rank, slot, score, pick_reason, reasons_source)."""
     if not cards:
         return
     rows = [{"user_id": user_id, "session_id": ref.session_id, "round": ref.round,
-             "event": "shown", **card} for card in cards]
+             "event": "shown", **card, "decision_budget_level": budget_level} for card in cards]
     await _send(client, "POST", "recommendation_events", _user_headers(token), json=rows)
 
 
@@ -428,7 +429,7 @@ async def log_messages(
 
 SHOWN_SELECT = (
     "place_id,places(category_id,lat,lon),"
-    "sessions(lat,lon,local_date,meal_slot,budget_level,solo,outcome,session_companions(companion_id))"
+    "sessions(lat,lon,local_date,meal_slot,solo,outcome,session_companions(companion_id))"
 )
 
 
@@ -488,40 +489,37 @@ async def close_session(
 async def log_pick(
     user_id: str, token: str, session_id: str, round_: int, place_id: str,
     *, client: httpx2.AsyncClient,
-) -> None:
-    """Picked: claims the session's outcome, then the event and the live meal (FR9, R3)."""
+) -> str:
+    """Atomically save or verify this exact pick, then copy companions best-effort."""
     shown = await find_shown(user_id, token, session_id, round_, place_id, client=client)
     session, place = shown["sessions"], shown["places"]
-    if session.get("outcome") is not None:
-        raise Conflict
+    # Validate the existing embed before any primary write, as before. A transport
+    # failure copying these links AFTER commit must never invalidate the saved pick.
     companions = _session_companions(session.get("session_companions"))
-    await close_session(user_id, token, session_id, "picked", client=client)
-    meal = {
-        "user_id": user_id,
-        "source": "live",
-        "session_id": session_id,
-        "place_id": place_id,
-        "category_id": place.get("category_id"),
-        "eaten_on": session.get("local_date"),
-        "meal_slot": session.get("meal_slot"),
-        "picked_at": _now(),
-        "solo": session.get("solo"),
-        "budget_level": session.get("budget_level"),
-        "distance_m": _distance(session, place),
-    }
     headers = _user_headers(token)
-    options = {"params": {"select": "id"}, "prefer": "return=representation"} if companions else {}
-    rows, _ = await asyncio.gather(
-        _send(client, "POST", "meals", headers, json=meal, **options),
-        log_event(user_id, token, session_id, round_, place_id, "picked", {}, client=client),
-    )
-    if companions:
-        if not rows or not isinstance(rows[0], dict) or not rows[0].get("id"):
-            logger.warning("Funnel meal_companions skipped: meal insert returned no id")
-            return
+    rows = await _send(client, "POST", "rpc/save_recommendation_pick", headers, json={
+        "p_session_id": session_id, "p_round": round_, "p_place_id": place_id,
+        "p_distance_m": _distance(session, place),
+    }, prefer="return=representation")
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        raise FunnelUpstreamError
+    result = rows[0]
+    status = result.get("status")
+    if status == "not_found":
+        raise NotFound
+    if status == "conflict":
+        raise Conflict
+    if status not in ("saved", "replayed"):
+        raise FunnelUpstreamError  # Includes unrepairable legacy partial decisions.
+    try:
+        meal_id = str(UUID(result["meal_id"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise FunnelUpstreamError from None
+    if status == "saved" and companions:
         await _write_companions(client, "meal_companions", headers,
-                                [{"meal_id": rows[0]["id"], "companion_id": cid, "user_id": user_id}
-                                 for cid in companions])
+                                [{"meal_id": meal_id, "companion_id": cid,
+                                  "user_id": user_id} for cid in companions])
+    return meal_id
 
 
 def _distance(session: dict, place: dict) -> int | None:

@@ -1,12 +1,13 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useFocusEffect } from '@react-navigation/native';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, BackHandler, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, BackHandler, RefreshControl, StyleSheet, Text, View } from 'react-native';
 
 import {
   CompanionMealsChart, FoodBySlotChart, MealDistanceChart, PriceBySlotChart, TopCategoriesChart,
 } from '../components/charts/InsightCharts';
 import { OpeningMotion } from '../components/charts/OpeningMotion';
+import PressScale from '../components/PressScale';
 import ScrollWithBar from '../components/ScrollWithBar';
 import { GlassScreen, PrimaryButton, ScreenTitle, TextLink, useTabBarSpace } from '../components/ui';
 import { defaultDistanceSlot, type InsightsState } from '../lib/insights';
@@ -44,12 +45,13 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
     <OpeningMotion cards={state.status === 'ready' ? state.cards : undefined} selectedSlot={activeSlot}>
     <GlassScreen tabBar>
       <View style={styles.header}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Back to Profile"
+        <PressScale feedback="light" accessibilityRole="button" accessibilityLabel="Back to Profile"
           hitSlop={spacing.sm} onPress={onClose} style={styles.back}>
           <Ionicons name="chevron-back" size={spacing.xxl} color={colors.text} />
-        </Pressable>
-        <ScreenTitle>Insights</ScreenTitle>
+          <Text style={styles.backText}>Profile</Text>
+        </PressScale>
       </View>
+      <ScreenTitle>Insights</ScreenTitle>
       {state.status === 'loading' ? <View style={[styles.center, { paddingBottom: space }]}>
         <ActivityIndicator color={colors.textSecondary} accessibilityLabel="Loading insights" />
       </View> : state.status === 'unavailable' ? <View style={[styles.center, { paddingBottom: space }]}>
@@ -77,8 +79,9 @@ export default function InsightsScreen({ state, onClose, onRefresh }: {
 }
 
 const styles = StyleSheet.create({
-  header: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.lg },
-  back: { width: 44, height: 44, justifyContent: 'center', alignItems: 'center' },
+  header: { marginBottom: spacing.sm },
+  back: { alignSelf: 'flex-start', minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
+  backText: { color: colors.text, fontSize: type.body },
   center: { flex: 1, justifyContent: 'center', gap: spacing.lg },
   scroll: { gap: spacing.lg, paddingBottom: spacing.lg },
   note: { color: colors.textSecondary, fontSize: type.small },

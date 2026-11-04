@@ -11,6 +11,7 @@ export const colors = {
   error: '#C2410C',
   glass: 'rgba(255,255,255,0.6)',
   glassStrong: 'rgba(255,255,255,0.8)',
+  glassFrosted: 'rgba(255,255,255,0.9)',
   glassBorder: 'rgba(255,255,255,0.9)',
   hairline: 'rgba(31,26,23,0.08)',
   shadow: '#1F1A17',
@@ -67,6 +68,9 @@ export const blur = {
   tint: 'light' as const,
 };
 
+// Shared horizontal edge for page content, the dock, and map overlays.
+export const layout = { gutter: 20 };
+
 // Shared glass frame (P1-19, P1-24): the map's "What to eat?!" button and the meal detail card.
 // The interior is fully clear glass (Liquid Glass "clear" on iOS 26+, else a light blur with no
 // tint). The accent gradient lives only in the rim: strong at the edge, fading to transparent
@@ -78,6 +82,8 @@ export const frame = {
   end: { x: 0.5, y: 0 },
   glassStyle: 'clear' as const, // Liquid Glass (expo-glass-effect: 'clear' | 'regular' | 'none')
   blurIntensity: 20, // fallback below iOS 26: a BlurView with no tint layer
+  frosted: { glassStyle: 'regular' as const, blurIntensity: blur.intensity, fill: colors.glassFrosted },
+  solidFill: colors.gradient[0], // opaque with Reduce Transparency
   // Rim bands from the edge inward; opacity = edgeOpacity * (1 - i / bands) ^ falloff.
   rim: { width: 11, bands: 12, edgeOpacity: 0.9, falloff: 2 },
   shadowOpacity: 0.18,
@@ -116,7 +122,7 @@ export const scrollBar = {
 // Floating tab bar (iOS 26 dock style): a capsule inset from the screen edges.
 export const dock = {
   height: 62,
-  sideInset: 24, // from the left and right screen edges
+  sideInset: layout.gutter,
   bottomInset: 16, // from the bottom, or the home indicator if that is higher
   iconSize: 22,
   labelSize: 10,
@@ -131,6 +137,12 @@ export const motion = {
   release: { stiffness: 300, damping: 22, mass: 1 },
   // One small bounce when the Map tab opens (the "What to eat?!" button).
   bounce: { scale: 1.08, upMs: 140, settle: { stiffness: 260, damping: 14, mass: 1 } },
+};
+
+export const otis = {
+  size: 64,
+  compactSize: 60,
+  happyMs: 1200,
 };
 
 // "…" bubble while a typed message is parsed (P1-19): three dots pulsing in turn.

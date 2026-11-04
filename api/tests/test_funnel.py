@@ -17,6 +17,7 @@ SERVICE_KEY = "test-service-role-key"
 SUPABASE_HOST = "test-project.supabase.co"
 SESSION_ID = "11111111-1111-1111-1111-111111111111"
 PLACE_ID = "node/1"
+MEAL_ID = "22222222-2222-2222-2222-222222222222"
 SESSION = {"lat": 33.95, "lon": -84.55, "local_date": "2026-10-29", "meal_slot": "dinner",
            "budget_level": 2, "solo": None, "outcome": None}
 PLACE = {"category_id": "thai", "lat": 33.953, "lon": -84.55}
@@ -41,6 +42,9 @@ class Supabase:
         self.shown, self.outcome, self.claim = shown, outcome, claim
         self.session_exists, self.fail, self.exc = session_exists, set(fail), exc
         self.requests: list[httpx2.Request] = []
+        self.meals: list[dict] = []
+        self.picked_events: list[dict] = []
+        self.meal_id = MEAL_ID
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -55,12 +59,33 @@ class Supabase:
             if not self.shown:
                 return httpx2.Response(200, json=[])
             return httpx2.Response(200, json=[{
-                "place_id": PLACE_ID, "places": PLACE,
+                "place_id": request.url.params["place_id"].removeprefix("eq."), "places": PLACE,
                 "sessions": {**SESSION, "outcome": self.outcome}}])
         if key == "PATCH sessions":
             return httpx2.Response(200, json=[{"id": SESSION_ID}] if self.claim else [])
         if key == "GET sessions":
             return httpx2.Response(200, json=[{"id": SESSION_ID}] if self.session_exists else [])
+        if key == "POST save_recommendation_pick":
+            body = json.loads(request.content)
+            if self.outcome == "picked":
+                if not self.meals or not self.picked_events:
+                    return httpx2.Response(200, json=[{"status": "inconsistent", "meal_id": None}])
+                event = self.picked_events[0]
+                same = (event["round"], event["place_id"]) == (body["p_round"], body["p_place_id"])
+                return httpx2.Response(200, json=[{
+                    "status": "replayed" if same else "conflict",
+                    "meal_id": self.meal_id if same else None}])
+            if self.outcome is not None or not self.claim:
+                return httpx2.Response(200, json=[{"status": "conflict", "meal_id": None}])
+            self.meals.append({"user_id": USER_ID, "source": "live", "session_id": SESSION_ID,
+                "place_id": body["p_place_id"], "category_id": PLACE["category_id"],
+                "eaten_on": SESSION["local_date"], "meal_slot": SESSION["meal_slot"],
+                "picked_at": "2026-11-03T12:00:00Z", "solo": SESSION["solo"],
+                "budget_level": 2, "distance_m": body["p_distance_m"]})
+            self.picked_events.append({"user_id": USER_ID, "session_id": SESSION_ID,
+                "round": body["p_round"], "place_id": body["p_place_id"], "event": "picked"})
+            self.outcome = "picked"
+            return httpx2.Response(200, json=[{"status": "saved", "meal_id": self.meal_id}])
         if key in ("POST recommendation_events", "POST meals"):
             return httpx2.Response(201)
         raise AssertionError(f"unexpected call {key}")
@@ -174,20 +199,18 @@ def test_picked_logs_event_meal_and_outcome():
     assert response.status_code == 200
     assert_shown_lookup(up)
 
-    (claim,) = up.calls("PATCH", "sessions")
-    assert claim.url.params["id"] == f"eq.{SESSION_ID}"
-    assert claim.url.params["user_id"] == f"eq.{USER_ID}"
-    assert claim.url.params["outcome"] == "is.null"
-    patch = json.loads(claim.content)
-    assert patch["outcome"] == "picked" and patch["ended_at"]
-
-    (event,) = up.calls("POST", "recommendation_events")
-    assert json.loads(event.content) == {
+    (rpc,) = up.calls("POST", "rpc/save_recommendation_pick")
+    assert json.loads(rpc.content) == {"p_session_id": SESSION_ID, "p_round": 1,
+        "p_place_id": PLACE_ID,
+        "p_distance_m": distance_m(SESSION["lat"], SESSION["lon"], PLACE["lat"], PLACE["lon"])}
+    assert response.json() == {"logged": True, "meal_id": MEAL_ID}
+    assert up.outcome == "picked"
+    assert up.picked_events == [{
         "user_id": USER_ID, "session_id": SESSION_ID, "round": 1, "place_id": PLACE_ID,
-        "event": "picked"}
+        "event": "picked"}]
 
-    (meal,) = up.calls("POST", "meals")
-    row = json.loads(meal.content)
+    (row,) = up.meals
+    row = dict(row)
     assert row["picked_at"]
     del row["picked_at"]
     assert row == {
@@ -196,8 +219,9 @@ def test_picked_logs_event_meal_and_outcome():
         "budget_level": 2,
         "distance_m": distance_m(SESSION["lat"], SESSION["lon"], PLACE["lat"], PLACE["lon"])}
 
-    paths = [(r.method, r.url.path) for r in up.requests]
-    assert paths.index(("PATCH", "/rest/v1/sessions")) < paths.index(("POST", "/rest/v1/meals"))
+    # Core writes now share a DB transaction; there are no split REST writes.
+    assert up.calls("PATCH", "sessions") == up.calls("POST", "meals") == []
+    assert up.calls("POST", "recommendation_events") == []
     assert_as_user(up)
 
 
@@ -218,7 +242,7 @@ def test_picked_race_loses_the_claim_is_409():
 def test_meal_unique_conflict_is_409():
     class Taken(Supabase):
         def __call__(self, request):
-            if request.method == "POST" and request.url.path.endswith("/meals"):
+            if request.method == "POST" and request.url.path.endswith("/save_recommendation_pick"):
                 self.requests.append(request)
                 return httpx2.Response(409, json={"message": "duplicate key"})
             return super().__call__(request)
