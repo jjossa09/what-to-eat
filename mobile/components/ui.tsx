@@ -121,9 +121,10 @@ export function SecondaryButton({ label, onPress, disabled = false, feedback = '
   );
 }
 
-export function TextLink({ label, onPress, feedback = 'light' }: Pick<ButtonProps, 'label' | 'onPress' | 'feedback'>) {
+export function TextLink({ label, onPress, feedback = 'light', disabled = false }: Pick<ButtonProps, 'label' | 'onPress' | 'feedback' | 'disabled'>) {
   return (
-    <PressScale onPress={onPress} feedback={feedback} accessibilityRole="button" style={styles.link} hitSlop={12}>
+    <PressScale onPress={onPress} feedback={feedback} disabled={disabled} accessibilityRole="button"
+      accessibilityState={{ disabled }} style={styles.link} hitSlop={12}>
       <Text style={styles.linkText}>{label}</Text>
     </PressScale>
   );

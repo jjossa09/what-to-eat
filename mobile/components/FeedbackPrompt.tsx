@@ -48,6 +48,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
   const [canUndoWent, setCanUndoWent] = useState(false);
   const [categories, setCategories] = useState<Category[]>([]);
   const [category, setCategory] = useState<string | null>(null);
+  const categoryPick = useRef<string | null>(null);
   const [dish, setDish] = useState('');
   const [stars, setStars] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -92,7 +93,8 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
       setSaving(false);
       saved.current = { food: start.kind === 'resumeStars', stars: !start.meal.askStars };
       const placeCategory = start.meal.categoryId;
-      setCategory(placeCategory && placeCategory !== 'other' ? placeCategory : null);
+      categoryPick.current = placeCategory && placeCategory !== 'other' ? placeCategory : null;
+      setCategory(categoryPick.current);
       setDish(start.meal.dish ?? '');
       setStars(0);
       starPick.current = 0;
@@ -271,6 +273,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         <View style={styles.center}>
           <TextLink
             label="Not now"
+            disabled={saving}
             onPress={() => {
               stopReminder(meal.id); // the pop-up still asks on later opens
               close();
@@ -294,9 +297,14 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
               key={c.id}
               label={`${emojiFor(c.id)} ${c.name}`}
               selected={c.id === category}
-              feedback="selection"
+              feedback={false}
               disabled={saving}
-              onPress={() => setCategory(c.id)}
+              onPress={() => {
+                if (life.current.busy || categoryPick.current === c.id) return;
+                categoryPick.current = c.id;
+                setCategory(c.id);
+                haptic('selection');
+              }}
             />
           ))}
         </ScrollView>
@@ -323,7 +331,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
         />
         {canUndoWent && (
           <View style={styles.center}>
-            <TextLink feedback={false} label="I didn't go" onPress={() => saveWent(false)} />
+            <TextLink feedback={false} disabled={saving} label="I didn't go" onPress={() => saveWent(false)} />
           </View>
         )}
       </>
@@ -365,7 +373,7 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
           ))}
         </View>
         <View style={styles.center}>
-          <TextLink label="Skip" feedback={false} onPress={() => finish(null)} />
+          <TextLink label="Skip" feedback={false} disabled={saving} onPress={() => finish(null)} />
         </View>
       </>
     );
@@ -377,10 +385,15 @@ export default function FeedbackPrompt({ userId }: { userId: string }) {
     <Modal transparent animationType="fade" visible onRequestClose={close}>
       <KeyboardAvoidingView behavior="padding" style={styles.scrim}>
         <GlassCard>
-          <View style={styles.header}>
-            {canGoBack ? <TextLink feedback={false} label="Back" onPress={back} /> : <View />}
-            {progress !== undefined && <Dots step={progress} total={3} />}
-          </View>
+          {progress !== undefined && (
+            <View style={styles.header}>
+              <View style={styles.headerSide}>
+                {canGoBack && <TextLink feedback={false} label="Back" onPress={back} />}
+              </View>
+              <Dots step={progress} total={3} />
+              <View style={styles.headerSide} />
+            </View>
+          )}
           <View style={styles.badge}>
             <Text style={styles.badgeEmoji}>{emoji}</Text>
           </View>
@@ -413,6 +426,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     minHeight: spacing.xxl,
   },
+  headerSide: {
+    flex: 1,
+  },
   badge: {
     alignSelf: 'center',
     width: BADGE,
@@ -439,12 +455,14 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   center: {
+    alignSelf: 'center',
     alignItems: 'center',
   },
   chipScroll: {
     maxHeight: 180,
   },
   input: {
+    textAlign: 'center',
     backgroundColor: colors.glassStrong,
     borderRadius: radii.pill,
     borderWidth: 1,

@@ -328,6 +328,7 @@ function mascotFixture(assets) {
     react: h.react, 'react-native': rn.module, '../theme': theme,
     '../lib/accessibility': { useReduceMotion: () => { motionReads++; return reduceMotion; } },
     './otisAssets': { otisAssets: assets },
+    './GlassFrame': 'GlassFrame',
   }).default;
   return { h, rn, Otis, setReduceMotion: (value) => { reduceMotion = value; },
     get motionReads() { return motionReads; } };
@@ -381,16 +382,21 @@ test('production Otis loads only idle while all three approved RGBA PNGs remain 
   f.h.unmount();
 });
 
-test('static Otis retains 64/60 pt sizing, 4 pt clearance and decorative noninteractive accessibility', () => {
+test('static Otis retains 64/60 pt artwork inside padded glass and decorative noninteractive accessibility', () => {
   const f = mascotFixture({ idle: 1 });
   for (const state of ['idle', 'thinking', 'happy']) {
     for (const keyboard of [false, true]) {
       const tree = f.h.flush(f.Otis, { state, active: true, keyboard });
       const style = flatten(tree.props.style), image = staticImage(tree);
-      assert.equal(style.width, keyboard ? 60 : 64);
-      assert.equal(style.height, keyboard ? 60 : 64);
-      assert.equal(style.marginBottom, 4);
+      assert.equal(style.width, keyboard ? 76 : 80);
+      assert.equal(style.height, keyboard ? 76 : 80);
+      assert.equal(style.position, 'absolute');
+      assert.equal(style.top, 0);
       assert.equal(style.alignSelf, 'center');
+      const glass = nodes(tree, 'GlassFrame')[0];
+      assert.equal(glass.props.size, style.width);
+      assert.equal(glass.props.shape, 'circle');
+      assert.equal(glass.props.variant, 'frosted');
       assert.equal(style.transform, undefined);
       assert.equal(style.opacity, undefined);
       assert.equal(tree.props.pointerEvents, 'none');
@@ -400,7 +406,7 @@ test('static Otis retains 64/60 pt sizing, 4 pt clearance and decorative noninte
       assert.equal(image.props.accessible, false);
       assert.equal(image.props.resizeMode, 'contain');
       assert.equal(image.props.fadeDuration, 0);
-      assert.equal(image.props.style, f.rn.module.StyleSheet.absoluteFill);
+      assert.deepEqual(flatten(image.props.style), { width: keyboard ? 60 : 64, height: keyboard ? 60 : 64 });
     }
   }
   assertNoMascotWork(f);
@@ -463,7 +469,7 @@ test('a supplied replacement asset recovers from failure and null artwork keeps 
   const replacement = { idle: 2 };
   const tree = f.h.flush(f.Otis, { ...props, assets: replacement });
   assert.equal(staticImage(tree).props.source, 2);
-  assert.equal(flatten(tree.props.style).width, 64);
+  assert.equal(flatten(tree.props.style).width, 80);
   staticImage(tree).props.onError();
   assert.equal(f.h.flush(f.Otis, { ...props, assets: replacement }), null);
   assertNoMascotWork(f);
@@ -563,8 +569,8 @@ test('actual Eat keeps thinking after template cards and settles only after all 
   const f = await chatFixture();
   assert.equal(nodes(f.tree, 'Otis')[0].props.state, 'thinking');
   const layout = nodes(f.tree, 'KeyboardAvoidingView')[0].props.children;
-  assert.equal(layout[0].type, 'Otis');
-  assert.equal(layout[1].type, 'ScrollWithBar');
+  assert.equal(layout[0].type, 'ScrollWithBar');
+  assert.equal(layout[1].type, 'Otis');
   assert.ok(nodes(f.tree, 'Text').some((node) => node.props.children === 'Finishing reasons…'
     && node.props.accessibilityLiveRegion === 'polite'));
   f.cards.h.flush(f.cards.default, f.cardProps());

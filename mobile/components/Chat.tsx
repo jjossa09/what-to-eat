@@ -230,6 +230,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const [unsent, setUnsent] = useState<{ text: string; problem: Problem } | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [keyboard, setKeyboard] = useState(false);
+  const [otisUnavailable, setOtisUnavailable] = useState(false);
   // Pre-selected chips: from the plan (confident predictions, P2-05) or a typed answer that
   // covered a later question (FR4).
   const [preset, setPreset] = useState<Prefill>({});
@@ -874,10 +875,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   return (
     <GlassScreen tabBar>
       <KeyboardAvoidingView behavior="padding" style={styles.fill}>
-        <Otis state={otisStatus.state} active={otisStatus.active} keyboard={keyboard} />
         <ScrollWithBar
           scrollRef={scroll}
-          contentContainerStyle={styles.thread}
+          contentContainerStyle={[styles.thread, {
+            paddingTop: otisUnavailable ? 0
+              : (keyboard ? otisTheme.compactSize : otisTheme.size) + 2 * spacing.sm + spacing.xs,
+          }]}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
           onContentSizeChange={() => scroll.current?.scrollToEnd({ animated: true })}
@@ -937,6 +940,9 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
             </View>
           )}
         </ScrollWithBar>
+        {/* Draw glass after the conversation so it samples messages scrolling beneath it. */}
+        <Otis state={otisStatus.state} active={otisStatus.active} keyboard={keyboard}
+          onUnavailable={() => setOtisUnavailable(true)} />
         {/* A tap outside the input or chips closes the keyboard. */}
         <Pressable
           accessible={false}
