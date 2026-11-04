@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from datetime import date
 
 import httpx2
@@ -291,11 +292,15 @@ def test_templates_are_short_and_clean():
             assert 0 < len(line) <= muse.MAX_REASON_CHARS
             assert not muse.HEALTH_TERMS.search(line)
             assert "—" not in line
+            assert pick.scored.place.geoapify_categories == []
+            assert not any(label in line for label in muse.CATEGORY_LABELS.values())
 
 
-def test_template_mentions_craving():
-    picks = top3(craving="mexican")
-    assert muse.template_reason(picks[0]).startswith("Matches your Mexican craving")
+def test_template_without_provider_metadata_uses_factual_fallback():
+    pick = top3(craving="mexican")[0]
+    assert pick.scored.place.category == "mexican"
+    assert pick.scored.place.geoapify_categories == []
+    assert muse.template_reason(pick) == "A spot nearby, 0.7 mi away."
 
 
 def test_salads_bowls_label_is_not_a_health_term():
@@ -426,6 +431,9 @@ def test_evidence_sends_the_food_category_count_and_signals():
 
 def test_template_says_how_often_the_food_was_had():
     korean = next(p for p in category_picks() if p.scored.place.id == "node/1")
+    assert muse.template_reason(korean) == "A spot nearby, 0.2 mi away."
+    korean = replace(korean, scored=replace(korean.scored, place=replace(
+        korean.scored.place, geoapify_categories=["catering.restaurant.korean"])))
     line = muse.template_reason(korean)
     assert line.startswith("Korean, you've had it 2 times")
     assert not muse.PAST_VISIT_TERMS.search(line) and len(line) <= muse.MAX_REASON_CHARS

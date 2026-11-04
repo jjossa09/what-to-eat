@@ -48,6 +48,40 @@ export function draftMeal(intent: Extract<Intent, { type: 'log_meal' }>, people:
     stars: intent.stars, allow_duplicate: false };
 }
 
+export function enrichMeal(pending: Pending, intent: Extract<Intent, { type: 'log_meal' }>, people: readonly Person[]): Pending {
+  const before = pending.arguments as MealDraft;
+  const update = draftMeal(intent, people);
+  const arguments_ = { ...before, allow_duplicate: false,
+    ...(intent.category !== null ? { category_id: update.category_id } : {}),
+    ...(intent.date !== null ? { eaten_on: update.eaten_on } : {}),
+    ...(intent.slot !== null ? { meal_slot: update.meal_slot } : {}),
+    ...(intent.dish !== null ? { dish: update.dish } : {}),
+    ...(intent.stars !== null ? { stars: update.stars } : {}),
+    ...(intent.solo !== null || intent.company.length ? { solo: update.solo, companion_ids: update.companion_ids } : {}),
+    ...(intent.place_name ? { place_id: null } : {}),
+  };
+  return { ...pending, arguments: arguments_,
+    ...(intent.place_name ? { placeName: undefined } : {}),
+    ...(intent.date ? { dateHint: intent.date.kind === 'weekday' ? 'Which date did you mean?' : undefined } : {}),
+  };
+}
+
+export function missingMealLine(meal: MealDraft): string | null {
+  if (!meal.category_id) return meal.dish ? 'Which food category was it?' : 'Sure! What did you eat?';
+  if (!meal.eaten_on) return 'When did you eat it?';
+  return null;
+}
+
+export function lookupFailureLine(error: unknown): string {
+  const e = error as { code?: string; message?: string; kind?: string } | null;
+  if (e?.kind === 'auth') return 'Please sign in again.';
+  const code = e?.code ?? e?.message;
+  if (code === 'lookup_location') return 'Location is unavailable; you can save without a restaurant.';
+  if (code === 'lookup_timeout' || code?.toLowerCase().includes('timeout')) return 'Place lookup timed out; retry or save without a restaurant.';
+  if (code === 'lookup_invalid_response') return 'Place data was invalid; retry or save without a restaurant.';
+  return 'Place lookup failed; retry or save without a restaurant.';
+}
+
 const namedCache = new Map<string, NearbyResult>();
 export async function nearby(name: string, position: { lat: number; lon: number }, radius: number | null) {
   const path = `/places/search?name=${encodeURIComponent(name)}&lat=${position.lat}&lng=${position.lon}${radius === null ? '' : `&radius_m=${radius}`}`;
@@ -74,7 +108,11 @@ export async function persistPending(pending: Pending, conversationId: string) {
   };
   if (canonical(prepared.arguments) !== canonical(pending.arguments)) throw new Error('Action changed; reopen it');
   // Server echoes the validated payload that the confirmation actually persists.
-  return { prepared, save: () => companionCall<{ status: 'saved' | 'duplicate'; meal_id?: string }>(
+  return { prepared, save: async () => {
+    const result = await companionCall<{ status: 'saved' | 'duplicate'; meal_id?: string }>(
     '/conversation/actions/confirm', { conversation_id: conversationId, action_id: prepared.id,
-      arguments: prepared.arguments, confirmed: true }) };
+      arguments: prepared.arguments, confirmed: true });
+    if (!result || !['saved', 'duplicate'].includes(result.status)) throw new Error('Save was not confirmed');
+    return result;
+  } };
 }

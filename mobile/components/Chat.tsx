@@ -32,9 +32,9 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { haptic } from '../lib/haptics';
-import { changedLine, dispatch, emptySurvey, privateMessage, resolveDate, validInterpretation,
+import { changedLine, dispatch, emptySurvey, invalidFieldLine, limitationLines, parseFailureLine, privateMessage, resolveDate, validInterpretation,
   type Intent, type Patch, type Survey, type SurveyKey } from '../lib/companion';
-import { changePreference, draftMeal, nearby, persistPending, type HistoryResult,
+import { changePreference, draftMeal, enrichMeal, lookupFailureLine, missingMealLine, nearby, persistPending, type HistoryResult,
   type MealRecord, type Output, type Pending, type Profile } from '../lib/companionActions';
 import { withInsightsDeadline } from '../lib/insights';
 import { remindAfterPick } from '../lib/notify';
@@ -314,7 +314,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   async function findNamed(name_: string) {
     const here = await withInsightsDeadline(() => getPosition(), 5000);
-    if (!here.ok) throw new Error('Location unavailable');
+    if (!here.ok) throw new Error('lookup_location');
     location.current = Promise.resolve(here);
     return nearby(name_, here.position, answers.current.radius);
   }
@@ -323,12 +323,19 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     actionTurn.current++;
     setActionError(null); setDuplicate(false);
     if (intent.type === 'log_meal') {
-      setPending({ key: `turn:${actionTurn.current}`, kind: 'log_meal',
+      const draft: Pending = pending?.kind === 'log_meal' ? enrichMeal(pending, intent, companions) : { key: `turn:${actionTurn.current}`, kind: 'log_meal',
         arguments: draftMeal(intent, companions),
-        ...(intent.date?.kind === 'weekday' ? { dateHint: `Which ${intent.date.value}? Enter the date.` } : {}) });
+        ...(intent.date?.kind === 'weekday' ? { dateHint: `Which ${intent.date.value}? Enter the date.` } : {}) };
+      setPending(draft);
+      const missing = missingMealLine(draft.arguments as import('../lib/companionActions').MealDraft);
+      if (missing) say('assistant', missing);
       if (intent.place_name) {
-        const data = await findNamed(intent.place_name);
-        setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+        try {
+          const data = await findNamed(intent.place_name);
+          setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+          say('assistant', data.places.length ? 'Select your restaurant, or save without a place.'
+            : 'No verified match; you can save without a restaurant.');
+        } catch (error) { say('assistant', lookupFailureLine(error)); }
       }
     } else if (intent.type === 'rate_meal') {
       const eaten = resolveDate(intent.date);
@@ -353,8 +360,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       const profile = await companionCall<Profile>('/conversation/profile');
       setPending({ key: `turn:${actionTurn.current}`, kind: 'preference_change', arguments: changePreference(profile, intent) });
     } else if (intent.type === 'find_place') {
-      const data = await findNamed(intent.name);
-      setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+      try {
+        const data = await findNamed(intent.name);
+        setOutputs((out) => [...out, { id: ++nextId.current, output: { kind: 'nearby', data } }]);
+      } catch (error) { say('assistant', lookupFailureLine(error)); }
     } else if (intent.type === 'history_query') {
       const data = await companionCall<HistoryResult>('/conversation/history', { range: intent.range,
         chart_id: intent.chart_id, slot: intent.slot, timezone: deviceTimezone() });
@@ -364,6 +373,10 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
 
   async function confirmPending(another = false) {
     if (!pending || busy.current) return;
+    if (pending.kind === 'log_meal') {
+      const missing = missingMealLine(pending.arguments as import('../lib/companionActions').MealDraft);
+      if (missing) { say('assistant', missing); return; }
+    }
     busy.current = true; setActionBusy(true); setActionError(null);
     const current = pending.kind === 'log_meal' && another
       ? { ...pending, arguments: { ...pending.arguments, allow_duplicate: true } } as Pending : pending;
@@ -375,6 +388,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       const result = await request.save();
       if (!mounted.current) return;
       if (result.status === 'duplicate') { setDuplicate(true); return; }
+      if (result.status !== 'saved') throw new Error('Save was not confirmed');
       setPending(null); setDuplicate(false);
       if (current.kind === 'preference_change') {
         void withInsightsDeadline(() => loadTastePrior(userId), 5000)
@@ -410,20 +424,27 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         return;
       }
       const response: unknown = await companionCall('/conversation/parse', {
-        ...privateMessage(text, companions), asked: isFirst(step) ? step : null });
+        ...privateMessage(text, companions), asked: isFirst(step) ? step : null,
+        pending_meal: pending?.kind === 'log_meal' });
       if (!mounted.current) return;
       if (!validInterpretation(response, new Set((categories ?? []).map((c) => c.id))) || !response.understood) {
-        say('assistant', "Didn't catch that. Could you rephrase?"); return;
+        say('assistant', parseFailureLine(response)); return;
       }
       interpreted = true;
+      const invalid = Array.isArray(response.invalid_fields) ? response.invalid_fields : [];
+      const clarification = invalidFieldLine(response.patch.unmatched?.includes('price_range')
+        ? invalid.filter((key) => key !== 'budget') : invalid);
+      if (clarification) say('assistant', clarification);
       const selected = dispatch(response.intents);
       const p = response.patch;
       const supported = !!(p.craving || p.budget || p.distance || p.company || p.exclude?.length
         || p.allow?.length || p.budget_step || p.distance_step || p.something_else || selected.recommend);
       const hasPatch = supported || !!p.unmatched?.length;
       const confirmsPending = !!(pending || choices.length || reference) && selected.confirmation?.type === 'confirm';
+      const continuesMeal = pending?.kind === 'log_meal' && selected.effect?.type === 'log_meal'
+        && !selected.confirmation;
       if (pending || choices.length || reference) {
-        if (!confirmsPending) await cancelPending();
+        if (!confirmsPending && !continuesMeal) await cancelPending();
       } else if (selected.confirmation) say('assistant', 'There is no action waiting for confirmation.');
       if (step === 'results' && decided && hasPatch && !selected.effect && !selected.reads.length) startNewSearch();
       let plan: SurveyPlan | undefined;
@@ -432,10 +453,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         plan = await planSurvey(response.patch, 'typed', selected.recommend);
         const acknowledgement = changedLine(before, plan.state, names);
         if (acknowledgement) say('assistant', acknowledgement);
-        if (p.unmatched?.length) say('assistant', "I can't verify that from place data.");
+        for (const line of limitationLines(p.unmatched ?? [])) say('assistant', line);
       }
       if (confirmsPending) {
-        say('assistant', 'Check the card, then tap Confirm.'); return;
+        say('assistant', pending?.kind === 'log_meal' ? 'Check the card, then tap Save.'
+          : 'Check the card, then tap Confirm.'); return;
       }
       if (!hasPatch && !selected.effect && !selected.reads.length) {
         if (selected.confirmation?.type === 'cancel') await continueSurvey();
@@ -443,12 +465,20 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         return;
       }
       if (selected.effect) {
-        secondAction.current = response.intents.filter((i) => ['log_meal', 'rate_meal', 'preference_change'].includes(i.type))[1];
+        if (!continuesMeal) secondAction.current = response.intents.filter((i) => ['log_meal', 'rate_meal', 'preference_change'].includes(i.type))[1];
         if (secondAction.current) say('assistant', "Let's handle one action at a time.");
         await handleAction(selected.effect);
       }
       for (const read of selected.reads) await handleAction(read);
       if (selected.effect || selected.reads.length) return;
+      if (p.unmatched?.includes('price_range') && p.budget?.status !== 'confirmed') {
+        say('assistant', 'Which budget level works: $ to $$$$?');
+        setStep('budget'); return;
+      }
+      if (p.unmatched?.includes('menu') && !p.craving) {
+        say('assistant', 'Which food category would you like?');
+        setStep('craving'); return;
+      }
       if (!supported && step === 'results') return;
       if (step === 'results' && !decided) {
         const p = response.patch;
@@ -598,9 +628,14 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   // Rounds ---------------------------------------------------------------------
 
   function roundLine(result: RoundResponse, first: boolean): string | null {
+    if (result.required_craving) {
+      const food = names.get(result.required_craving) ?? 'that cuisine';
+      if (!result.picks.length) return `No verified ${food} matches in this search.`;
+      if (result.picks.length < 3) return `Found ${result.picks.length} verified ${food} ${result.picks.length === 1 ? 'match' : 'matches'}.`;
+    }
     if (result.best_so_far) return result.picks.length ? 'Best so far.' : null;
     if (!result.picks.length) return 'No spots nearby.';
-    return first ? 'Here are 3 spots.' : 'Here are a few more.';
+    return first ? `Here are ${result.picks.length} spots.` : 'Here are a few more.';
   }
 
   async function fetchRound(change?: Partial<Change>, enhance = false) {
@@ -891,6 +926,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                       // Reject events from before a parse, new round or search reset,
                       // including the interval before the old cards rerender read-only.
                       if (busy.current || b.id !== latest || sessionId.current !== r.sessionId
+                        || r.generation !== decisionGeneration || pending
                         || nextId.current !== conversationId || !reasonsCache.isCurrent(decisionGeneration)) return false;
                       reasonsCache.invalidate();
                       otis.cancel();
@@ -900,7 +936,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                     user={user}
                     sessionId={r.sessionId}
                     round={r.round}
-                    readOnly={b.id !== latest}
+                    readOnly={b.id !== latest || r.generation !== decisionGeneration || !!pending}
                     onSay={(text) => say('assistant', text)}
                     onPicked={() => remindAfterPick(userId)}
                     onDecided={() => setDecided(true)}
@@ -936,7 +972,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
               busy.current = true; setActionBusy(true);
               void findNamed(text).then((data) => setOutputs((out) => [...out,
                 { id: ++nextId.current, output: { kind: 'nearby', data } }]))
-                .catch(() => setActionError("Couldn't find places. Retry."))
+                .catch((error) => setActionError(lookupFailureLine(error)))
                 .finally(() => { busy.current = false; setActionBusy(false); });
             }} />}
           {actionError && !pending && <Text style={styles.errorText}>{actionError}</Text>}
@@ -950,7 +986,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           {otisStatus.state === 'thinking' && !parsing && (
             <View style={[styles.bubble, styles.theirs]}>
               <Text accessibilityLiveRegion="polite" style={styles.bubbleText}>
-                {step === 'loading' ? 'Finding spots…' : 'Finishing reasons…'}
+                {step === 'loading' ? 'Finding spots…' : 'Checking optional reasons…'}
               </Text>
             </View>
           )}

@@ -61,8 +61,7 @@ class LanguageRoute(APIRoute):
                     return await handler(request)
             except TimeoutError:
                 if path == "/conversation/parse":
-                    return JSONResponse({"intents": [{"type": "unknown"}],
-                                         "patch": {}, "understood": False})
+                    return JSONResponse(conversation.parse_failure("timeout"))
                 return JSONResponse(reasons.EMPTY if path == "/reasons" else NOT_SURE)
             except RequestValidationError:
                 if path == "/reasons":
@@ -154,6 +153,8 @@ async def places_search(
     if longitude is None or (lng is not None and lon is not None and lng != lon):
         raise HTTPException(422, "Supply one longitude")
     widened = False
+    started = time.perf_counter()
+    lookup_status = "error"
     try:
         if name is None:
             result = await places.search(lat, longitude, radius_m, client=client)
@@ -168,18 +169,32 @@ async def places_search(
                                                  name=name, bias=True)
                     matches = places.named_matches(result.places, name)
                 result = replace(result, places=matches)
-                await quietly(funnel.upsert_places(matches, client=client), "named places")
+                lookup_status = "matched" if matches else "no_match"
+            await quietly(funnel.upsert_places(matches, client=client), "named places",
+                          deadline=started + widening.PLACES_BUDGET_S)
     except places.PlacesError as e:
+        if name is not None:
+            lookup_status = ("timeout" if isinstance(e, places.PlacesTimeout) else
+                             "invalid_response" if isinstance(e, places.PlacesInvalidResponse)
+                             else "provider_error")
+            raise HTTPException(504 if lookup_status == "timeout" else 502,
+                                f"lookup_{lookup_status}") from None
         raise places_error(e) from None
     except TimeoutError:
-        raise HTTPException(504, "Place lookup timed out") from None
+        lookup_status = "timeout"
+        raise HTTPException(504, "lookup_timeout") from None
+    finally:
+        if name is not None:
+            logger.info("Named lookup status=%s elapsed_ms=%d", lookup_status,
+                        round((time.perf_counter() - started) * 1000))
     return {
         "radius_m": result.radius_m,
         "count": len(result.places),
         "truncated": result.truncated,
         "places": [{k: v for k, v in asdict(p).items() if k != "brand" or v is not None}
                    for p in result.places],
-        **({"widened": widened, "presentation": "nearby"} if name is not None else {}),
+        **({"widened": widened, "presentation": "nearby", "status": lookup_status}
+           if name is not None else {}),
     }
 
 
@@ -382,6 +397,7 @@ async def recommendations(
         search_radius_m=result.radius_m,
         companion_ids=frozenset(str(c) for c in body.companion_ids),
         craving=answers.craving,
+        required_craving=required_craving(body, answers),
         budget_level=answers.budget_level,
         radius_m=radius,
         exclude_ids=frozenset(body.exclude_ids) | shown_before,
@@ -458,6 +474,7 @@ async def recommendations(
         "truncated": result.truncated,
         "best_so_far": False,
         "answers": answers_out(answers),
+        "required_craving": context.required_craving,
         "next_question": chosen.as_dict(),
         "picks": [
             {
@@ -485,6 +502,21 @@ def answers_out(answers: refine.Answers) -> dict:
         "radius_m": answers.radius_m,
         "exclude_categories": list(answers.exclude_categories),
     }
+
+
+def required_craving(body: RecommendationsRequest, answers: refine.Answers) -> str | None:
+    """Survey provenance distinguishes an explicit constraint from a soft prediction.
+
+    Older clients send direct answers, so a non-null craving there is explicit too.
+    A refinement's positive craving is explicit even when the original was predicted.
+    """
+    if body.refine and body.refine.craving is not None:
+        return answers.craving
+    if body.survey is None:
+        return answers.craving
+    field = body.survey.craving
+    return (answers.craving if field.status == "confirmed"
+            and field.source in ("typed", "chip") else None)
 
 
 def company_snapshot(body: RecommendationsRequest) -> dict:
@@ -580,7 +612,11 @@ async def best_so_far_round(
         for pid, s in place_scores(user_history, as_of=new.local_date).items()
     }
     budget = answers.budget_level or user_history.prior.budget_level
-    best = refine.best_so_far(ref.shown, answers, new.search_radius_m, body.lat, body.lon,
+    required = required_craving(body, answers)
+    eligible = tuple(card for card in ref.shown
+                     if card.category not in user_history.prior.hard_nos
+                     and places.verified_cuisine(card.category, card.geoapify_categories, required))
+    best = refine.best_so_far(eligible, answers, new.search_radius_m, body.lat, body.lon,
                               known, budget)
     cards = [
         {
@@ -588,8 +624,8 @@ async def best_so_far_round(
             "rank": rank_,
             "slot": card.slot,
             "score": card.score,
-            "pick_reason": card.pick_reason or best_reason(meters),
-            "reasons_source": card.reasons_source if card.pick_reason else muse.TEMPLATE,
+            "pick_reason": cached_reason(card) or best_reason(meters),
+            "reasons_source": card.reasons_source if cached_reason(card) else muse.TEMPLATE,
         }
         for rank_, (card, meters) in enumerate(best, start=1)
     ]
@@ -621,6 +657,7 @@ async def best_so_far_round(
         "radius_m": new.search_radius_m,
         "truncated": False,
         "best_so_far": True,
+        "required_craving": required,
         "answers": answers_out(answers),
         "next_question": None,  # the cap asks the open question (ML10)
         "picks": [
@@ -643,6 +680,15 @@ async def best_so_far_round(
 
 def best_reason(meters: int) -> str:
     return f"One of your best so far, {muse.format_distance(meters)} away."
+
+
+def cached_reason(card: funnel.ShownCard) -> str | None:
+    """Retain generic cached prose only. Cuisine, menu, craving and numeric claims need
+    fresh evidence; an old reason is never evidence for the current craving."""
+    line = card.pick_reason
+    if not line or any(character.isdigit() for character in line):
+        return None
+    return line if muse.grounded_reason(line, {"id": card.place_id, "signals": []}) else None
 
 
 @app.post("/reasons")
@@ -690,6 +736,7 @@ class CompanionParseRequest(conversation.Strict):
     text: str = Field(min_length=1, max_length=200)
     asked: conversation.Key | None = None
     companion_refs: list[str] = Field(default_factory=list, max_length=20)
+    pending_meal: bool = False
 
     @field_validator("companion_refs")
     @classmethod
@@ -702,7 +749,8 @@ class CompanionParseRequest(conversation.Strict):
 @app.post("/conversation/parse")
 async def companion_parse(body: CompanionParseRequest,
     user_id: str = Depends(current_user), client: httpx2.AsyncClient = Depends(get_http_client)):
-    return await conversation.parse(body.text, body.asked, body.companion_refs, client=client)
+    return await conversation.parse(body.text, body.asked, body.companion_refs, client=client,
+                                    pending_meal=body.pending_meal)
 
 
 class CompanionPlanRequest(BaseModel):
@@ -842,8 +890,17 @@ async def companion_prepare(body: actions.Prepare, auth: tuple[str, str] = Depen
 async def companion_confirm(body: actions.Confirmation,
     auth: tuple[str, str] = Depends(current_auth),
     client: httpx2.AsyncClient = Depends(get_http_client)):
-    return await actions.rpc("confirm_companion_action", {"p_id": body.action_id,
+    result = await actions.rpc("confirm_companion_action", {"p_id": body.action_id,
         "p_conversation_id": body.conversation_id, "p_arguments": body.arguments}, auth[1], client)
+    if not isinstance(result, dict) or result.get("status") not in ("saved", "duplicate"):
+        raise HTTPException(503, "Save was not confirmed")
+    if result["status"] == "saved" and ("category_id" in body.arguments
+                                         or "meal_id" in body.arguments):
+        try:
+            UUID(result["meal_id"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise HTTPException(503, "Save was not confirmed") from None
+    return result
 
 
 class CancelAction(BaseModel):

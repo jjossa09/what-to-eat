@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from time import perf_counter
@@ -21,6 +22,7 @@ import httpx2
 
 from app.categories import OTHER
 from app.config import MissingSettingError, get_settings
+from app.places import verified_cuisine
 from app.scoring import DISCOVERY, Pick
 
 MUSE_URL = "https://api.meta.ai/v1/chat/completions"
@@ -180,8 +182,10 @@ def format_distance(meters: int) -> str:
 def template_reason(pick: Pick) -> str:
     """Deterministic one-liner from the evidence; used whenever Muse's output is not."""
     e = pick.scored.evidence
-    label = CATEGORY_LABELS.get(e.category)
-    if "craving_match" in e.reasons and label:
+    label = (CATEGORY_LABELS.get(e.category) if verified_cuisine(
+        e.category, pick.scored.place.geoapify_categories, e.category) else None)
+    if ("craving_match" in e.reasons and label
+            and verified_cuisine(e.category, pick.scored.place.geoapify_categories, e.craving)):
         lead = f"Matches your {label} craving"
     elif e.visits > 1:
         lead = f"You've been here {e.visits} times"
@@ -215,6 +219,8 @@ def pick_evidence(pick: Pick) -> dict:
     return {
         "id": place.id,
         "category": CATEGORY_LABELS.get(e.category) if e.category != OTHER else None,
+        "cuisine_verified": e.category != OTHER and verified_cuisine(
+            e.category, place.geoapify_categories, e.category),
         "distance": format_distance(e.distance_m),
         "craving": CATEGORY_LABELS.get(e.craving) if e.craving else None,
         "visited_before": e.visits > 0,
@@ -236,6 +242,33 @@ def star_claims_ok(line: str, stars_mean: float | None) -> bool:
         return not RATING_TERMS.search(line)
     shown = stars_shown(stars_mean)
     return all(float(n) == shown for n in STAR_CLAIM.findall(line))
+
+
+# Enhancements are optional. A small factual vocabulary deliberately falls back rather
+# than letting unconstrained prose invent a menu item or a cuisine synonym. Category
+# words are added only from the provider-grounded category in the signed evidence.
+REASON_WORDS = frozenset((
+    "a an the this that it its is are was be been you your you've have had here there "
+    "and or with for from of to in at by on one two three first second third new another "
+    "near nearby close closer closest away mi mile miles m meters distance within only "
+    "before times time visit visits visited last days day ago since often again usual "
+    "favorite favorites category food choice pick spot place option different something "
+    "rated rating stars star gave fits fit budget price known unknown own matches match "
+    "craving reason fine good back based recorded stored just far but"
+).split())
+
+
+def grounded_reason(line: str, evidence: dict) -> bool:
+    words = set(re.findall(r"[a-z]+(?:'[a-z]+)?", line.casefold()))
+    category = (evidence.get("category") or "") if evidence.get("cuisine_verified") else ""
+    allowed = REASON_WORDS | set(re.findall(r"[a-z]+", category.casefold()))
+    allowed |= set(re.findall(r"[a-z]+", evidence["id"].casefold()))
+    if words - allowed:
+        return False
+    if "craving" in words or "matches" in words or "match" in words:
+        return bool(evidence.get("cuisine_verified")
+                    and "craving_match" in evidence.get("signals", []))
+    return True
 
 
 def request_body(picks: tuple[Pick, ...]) -> dict:
@@ -281,6 +314,7 @@ def check_output(
     finish_reason: str | None = None,
     never_visited: frozenset[str] = frozenset(),
     stars: dict[str, float | None] | None = None,
+    evidence: dict[str, dict] | None = None,
 ) -> dict[str, str]:
     """Muse content -> {id: line} for exactly these ids, or RejectedOutput with a code.
 
@@ -316,6 +350,8 @@ def check_output(
             raise RejectedOutput("past_visit_claim")
         if stars is not None and not star_claims_ok(line, stars.get(entry["id"])):
             raise RejectedOutput("rating_claim")
+        if evidence is not None and not grounded_reason(line, evidence[entry["id"]]):
+            raise RejectedOutput("unsupported_claim")
         lines[entry["id"]] = line
     return lines
 
@@ -398,6 +434,11 @@ class Reply:
     telemetry: CallTelemetry | None = None
 
 
+# Per-request failure metadata. Never stores language or identifiers, and preserves the
+# shared call's existing Reply-or-None contract for older callers.
+last_failure: ContextVar[str | None] = ContextVar("muse_failure", default=None)
+
+
 def validation_done(reply: Reply, outcome: str) -> None:
     if reply.telemetry is not None:
         reply.telemetry.emit(outcome)
@@ -420,10 +461,12 @@ async def call(
     trace = CallTelemetry(call_type, timeout, body["max_completion_tokens"])
 
     def failed(code: str):
+        last_failure.set(code)
         trace.failure_class = code
         trace.emit("not_run")
         return None
 
+    last_failure.set(None)
     if timeout <= 0:
         return failed("RoundDeadline")
     try:
@@ -507,7 +550,8 @@ async def write_reasons(
     try:
         never_visited = frozenset(p.scored.place.id for p in picks if p.scored.evidence.visits == 0)
         stars = {p.scored.place.id: p.scored.evidence.stars_mean for p in picks}
-        lines = check_output(content, ids, finish_reason, never_visited, stars)
+        lines = check_output(content, ids, finish_reason, never_visited, stars,
+                             {p.scored.place.id: pick_evidence(p) for p in picks})
     except RejectedOutput as e:
         logger.warning(
             "Muse output rejected: %s (%s)", e, rejection_note(content, finish_reason, usage)

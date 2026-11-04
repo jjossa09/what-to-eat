@@ -109,7 +109,7 @@ export function getInsights(asOf: string): Promise<InsightsResponse> {
 export type ApiErrorKind = 'network' | 'server' | 'auth' | 'conflict' | 'notfound';
 
 export class ApiError extends Error {
-  constructor(public kind: ApiErrorKind) {
+  constructor(public kind: ApiErrorKind, public code?: string) {
     super(kind);
   }
 }
@@ -268,6 +268,7 @@ export type RoundAnswers = {
 };
 
 export type RoundResponse = {
+  required_craving?: string | null;
   reasons_envelope?: ReasonsEnvelope | null;
   session_id: string | null;
   round: number | null;
@@ -333,7 +334,14 @@ export function companionCall<T>(path: string, body?: unknown): Promise<T> {
       headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    if (!response.ok) throw new ApiError(response.status === 401 ? 'auth' : response.status === 409 ? 'conflict' : 'server');
+    if (!response.ok) {
+      let code: string | undefined;
+      if (path.startsWith('/places/search?')) {
+        const detail = await response.json().catch(() => null);
+        if (['lookup_timeout', 'lookup_provider_error', 'lookup_invalid_response'].includes(detail?.detail)) code = detail.detail;
+      }
+      throw new ApiError(response.status === 401 ? 'auth' : response.status === 409 ? 'conflict' : 'server', code);
+    }
     return await response.json() as T;
   }, 16_000);
 }
