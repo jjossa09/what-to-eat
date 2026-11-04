@@ -24,7 +24,9 @@ export type Intent =
   | { type: 'find_place'; name: string }
   | { type: 'history_query'; range: HistoryRange; chart_id: ChartId; slot: Slot | null }
   | { type: 'preference_change'; operation: 'add_favorite' | 'remove_favorite' | 'add_hard_no' | 'remove_hard_no'; category: string };
-export type Interpretation = { intents: Intent[]; patch: Patch; understood: boolean };
+export type Interpretation = { intents: Intent[]; patch: Patch; understood: boolean;
+  status?: 'ok' | 'partial' | 'unsupported' | 'ambiguous' | 'timeout' | 'truncated' | 'invalid_json' | 'invalid_fields' | 'unavailable';
+  invalid_fields?: string[] };
 export type Person = { id: string; name: string };
 export const SURVEY_KEYS: SurveyKey[] = ['craving', 'budget', 'distance', 'company'];
 export const CHARTS: ChartId[] = ['top', 'food', 'price', 'distance', 'companions'];
@@ -85,7 +87,7 @@ export function changedLine(before: Survey, after: Survey, labels: ReadonlyMap<s
     if (field.status !== 'confirmed' || JSON.stringify(field) === JSON.stringify(before[key])) continue;
     if (key === 'craving') changes.push(field.value === null ? 'anything' : labels.get(String(field.value)) ?? 'food updated');
     if (key === 'budget') changes.push('$'.repeat(Number(field.value)));
-    if (key === 'distance') changes.push(field.value === 15000 ? 'close by' : 'any distance');
+    if (key === 'distance') changes.push(field.value === 15000 ? 'close by' : 'wider search');
     if (key === 'company') changes.push(field.value === 'solo' ? 'solo' : 'company updated');
   }
   if (JSON.stringify(before.exclusions) !== JSON.stringify(after.exclusions)) changes.push('exclusions updated');
@@ -127,8 +129,8 @@ export function validInterpretation(value: unknown, categories?: ReadonlySet<str
   if (patch.budget_step != null && !['cheaper', 'pricier'].includes(patch.budget_step)) return false;
   if (patch.distance_step != null && !['closer', 'farther'].includes(patch.distance_step)) return false;
   if (patch.something_else !== undefined && typeof patch.something_else !== 'boolean') return false;
-  if (patch.unmatched !== undefined && (!strings(patch.unmatched, 6)
-    || !patch.unmatched.every((x) => ['menu', 'seating', 'hours', 'health', 'amenity', 'other'].includes(x)))) return false;
+  if (patch.unmatched !== undefined && (!strings(patch.unmatched, 8)
+    || !patch.unmatched.every((x) => ['menu', 'seating', 'hours', 'health', 'amenity', 'other', 'price_range', 'result_count'].includes(x)))) return false;
   return typeof v.understood === 'boolean' && Array.isArray(v.intents) && v.intents.length <= 8
     && v.intents.every((i) => i && typeof i === 'object' && allowed.has(i.type))
     && v.intents.every((i) => {
@@ -145,4 +147,33 @@ export function validInterpretation(value: unknown, categories?: ReadonlySet<str
         && ['add_favorite', 'remove_favorite', 'add_hard_no', 'remove_hard_no'].includes(i.operation);
       return Object.keys(i).every((key) => key === 'type');
     });
+}
+
+export function parseFailureLine(response: unknown): string {
+  const status = response && typeof response === 'object' ? (response as Interpretation).status : null;
+  if (status === 'timeout') return 'That took too long; try again or use a chip.';
+  if (status === 'unavailable') return 'Chat parsing is unavailable; try a chip or retry.';
+  if (status === 'truncated') return 'That response was cut short; try one request at a time.';
+  if (status === 'invalid_json' || status === 'invalid_fields') return 'I couldn’t validate that; try a chip or rephrase.';
+  return 'Are you looking for food, or logging a meal?';
+}
+
+export function limitationLines(unmatched: readonly string[]): string[] {
+  const lines = new Set<string>();
+  for (const kind of unmatched) {
+    if (kind === 'price_range') lines.add('I use $ to $$$$ budgets; exact prices aren’t verified.');
+    else if (kind === 'result_count') lines.add('I show up to three verified places per round.');
+    else if (kind === 'menu') lines.add('I can’t verify menu items; try a supported food category.');
+    else lines.add('I can’t verify that from place data.');
+  }
+  return [...lines];
+}
+
+export function invalidFieldLine(fields: readonly string[]): string | null {
+  if (fields.includes('budget') || fields.includes('budget_step')) return 'Which budget level works: $ to $$$$?';
+  if (fields.includes('distance') || fields.includes('distance_step')) return 'Stay close, or use a wider search?';
+  if (fields.includes('craving') || fields.includes('meal_category')) return 'Which food category did you mean?';
+  if (fields.includes('meal_date')) return 'What date did you eat it?';
+  if (fields.includes('meal_stars')) return 'Ratings use 1 to 5 stars.';
+  return fields.length ? 'I kept the clear details; please clarify the rest.' : null;
 }

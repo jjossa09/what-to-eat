@@ -50,6 +50,7 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
 }) {
   const [showFood, setShowFood] = useState(false);
   const [placeName, setPlaceName] = useState('');
+  const [editing, setEditing] = useState(false);
   const meal = pending.kind === 'log_meal' ? pending.arguments as MealDraft : null;
   const preferences = pending.kind === 'preference_change' ? pending.arguments as ProfileDraft : null;
   const rating = pending.kind === 'rate_meal' ? pending.arguments as { meal_id: string; revision: number; changes: { stars: number | null } } : null;
@@ -61,6 +62,16 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
     <Text style={styles.label}>{meal ? 'Log this meal?' : preferences ? 'Change your taste profile?' : 'Save this rating?'}</Text>
     {!meal && pending.placeName && <Text style={styles.note}>{pending.placeName}</Text>}
     {meal && <>
+      <Text style={styles.note}>{meal.dish || categories.find((c) => c.id === meal.category_id)?.name || 'Food not set'}</Text>
+      {!!meal.dish && <Text style={styles.note}>{categories.find((c) => c.id === meal.category_id)?.name ?? 'Food category not set'}</Text>}
+      <Text style={styles.note}>{meal.eaten_on || 'Date not set'} · {meal.meal_slot ?? 'Time not set'}</Text>
+      <Text style={styles.note}>{meal.place_id && pending.placeName ? pending.placeName : 'Without a restaurant'}</Text>
+      {!!meal.companion_ids.length && <Text style={styles.note}>{people.filter((p) => meal.companion_ids.includes(p.id)).map((p) => p.name).join(', ')}</Text>}
+      {meal.solo === true && <Text style={styles.note}>Solo</Text>}
+      {meal.stars !== null && <Text style={styles.note}>{meal.stars} ★</Text>}
+      <Chip label={editing ? 'Done editing' : 'Edit'} disabled={busy} onPress={() => setEditing(!editing)} />
+    </>}
+    {meal && editing && <>
       {!meal.timezone && <Text style={styles.error}>Your device timezone is unavailable.</Text>}
       <Chip label={categories.find((c) => c.id === meal.category_id)?.name ?? 'Choose food'} disabled={busy}
         onPress={() => setShowFood(!showFood)} />
@@ -96,7 +107,7 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
     </>}
     {preferences && <PreferenceFields value={preferences} categories={categories} disabled={busy}
       onChange={(arguments_) => onChange({ ...pending, arguments: arguments_ })} />}
-    {(meal || rating) && <>
+    {((meal && editing) || rating) && <>
       <Text style={styles.label}>Your rating{meal ? ' (optional)' : ''}</Text>
       <View style={styles.chips}>{[1, 2, 3, 4, 5].map((n) => <Chip key={n} label={`${n} ★`} disabled={busy}
         selected={stars === n} onPress={() => meal ? setMeal({ stars: n })
@@ -104,7 +115,7 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
     </>}
     {duplicate && <Text style={styles.note}>A matching meal exists; add another?</Text>}
     {error && <Text accessibilityLiveRegion="polite" style={styles.error}>{error}</Text>}
-    <PrimaryButton label={duplicate ? 'Add another' : 'Confirm'} disabled={!ready} busy={busy}
+    <PrimaryButton label={duplicate ? 'Add another' : meal ? 'Save' : 'Confirm'} disabled={!ready} busy={busy}
       feedback={false} onPress={() => onConfirm(duplicate)} />
     <SecondaryButton label="Cancel" disabled={busy} onPress={onCancel} />
   </View></GlassCard>;

@@ -103,6 +103,7 @@ async def response(body: Envelope, user_id: str, token: str, *, client: httpx2.A
             reply.content, ids, reply.finish_reason,
             frozenset(p["id"] for p in picks if not p["visited_before"]),
             {p["id"]: p.get("stars_mean") for p in picks},
+            {p["id"]: p for p in picks},
         )
     except muse.RejectedOutput as error:
         muse.validation_done(reply, f"rejected:{error}")

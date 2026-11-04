@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from app.categories import OTHER, map_category
 from app.cuisine_model import CuisinePrediction, predict
 from app.place_model import PlaceScore, place_scores
-from app.places import Candidate, distance_m
+from app.places import Candidate, distance_m, verified_cuisine
 from app.refine import radius_level
 from app.scoring_rules import (
     CLOSE_M,
@@ -109,6 +109,7 @@ class Context:
     radius_m: int | None = None  # distance chip: 1500, 5000, 15000
     exclude_ids: frozenset[str] = frozenset()  # rejected earlier in this session (ML10)
     exclude_categories: frozenset[str] = frozenset()  # ruled out in the chat ("not burgers")
+    required_craving: str | None = None  # explicit positive answer, never a prediction
 
 
 def meal_context(local: datetime) -> tuple[str, date, bool]:
@@ -375,6 +376,7 @@ def rank(
         if c.category not in history.prior.hard_nos
         and c.category not in context.exclude_categories
         and c.id not in context.exclude_ids
+        and verified_cuisine(c.category, c.geoapify_categories, context.required_craving)
     ]
     ranked = tuple(
         sorted(

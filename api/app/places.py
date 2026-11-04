@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import httpx2
 
 from app.categories import map_category
+from app.category_rules import CUISINE_TAGS
 from app.config import MissingSettingError, get_settings
 
 PLACES_URL = "https://api.geoapify.com/v2/places"
@@ -46,6 +47,16 @@ class PlacesTimeout(PlacesError):
 
 class PlacesUpstreamError(PlacesError):
     pass
+
+
+class PlacesInvalidResponse(PlacesUpstreamError):
+    pass
+
+
+def verified_cuisine(category: str, tags: Iterable[str], required: str | None) -> bool:
+    """Explicit requests require provider cuisine evidence, never a name-only mapping."""
+    return required is None or category == required and any(
+        tag in tags and cuisine == required for tag, cuisine in CUISINE_TAGS)
 
 
 @dataclass(frozen=True)
@@ -90,12 +101,22 @@ def place_key(props: dict) -> str | None:
 def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
     """One GeoJSON feature -> Candidate, or None if it has no name, coordinates, or key."""
     props = feature.get("properties") or {}
+    if not isinstance(props, dict):
+        raise PlacesInvalidResponse
+    datasource = props.get("datasource") or {}
+    if (not isinstance(datasource, dict)
+            or not isinstance(datasource.get("raw") or {}, dict)
+            or not isinstance(props.get("categories") or [], list)):
+        raise PlacesInvalidResponse
     name = props.get("name")
     plat, plon = props.get("lat"), props.get("lon")
     key = place_key(props)
     if not isinstance(name, str) or not name.strip() or key is None:
         return None
     if not all(isinstance(v, int | float) and not isinstance(v, bool) for v in (plat, plon)):
+        return None
+    if not (math.isfinite(plat) and math.isfinite(plon)
+            and -90 <= plat <= 90 and -180 <= plon <= 180):
         return None
     categories = [c for c in props.get("categories") or [] if isinstance(c, str)]
     name = name.strip()
@@ -177,7 +198,7 @@ async def search(
             raise TypeError
     except (ValueError, KeyError, TypeError):
         logger.warning("Geoapify returned an unreadable body")
-        raise PlacesUpstreamError from None
+        raise PlacesInvalidResponse from None
 
     places: list[Candidate] = []
     for feature in features:
@@ -189,7 +210,11 @@ async def search(
 
 
 def normalized_name(value: str) -> str:
-    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", value).casefold())
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    # Possessive punctuation is optional in typed names: McDonald's / McDonalds.
+    # Keep other word boundaries intact; do not turn approximate names into matches.
+    normalized = re.sub(r"['’`](?=s\b)", "", normalized)
+    tokens = re.findall(r"[^\W_]+", normalized)
     return " ".join(t for t in tokens if t not in ("the", "a", "an"))
 
 

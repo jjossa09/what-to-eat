@@ -59,6 +59,7 @@ class ShownCard:
     lon: float
     category: str
     address: str | None
+    geoapify_categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,7 +235,7 @@ async def open_round(
 # The session, with every shown card and its cached place: one read per later round.
 SESSION_SELECT = (
     "id,outcome,recommendation_events(round,place_id,score,slot,pick_reason,reasons_source,"
-    "places(name,lat,lon,category_id,address))"
+    "places(name,lat,lon,category_id,address,geoapify_categories))"
 )
 
 
@@ -263,6 +264,8 @@ def _shown_card(event) -> ShownCard | None:
         lon=float(place["lon"]),
         category=place.get("category_id") or "other",
         address=address if isinstance(address, str) else None,
+        geoapify_categories=tuple(x for x in (place.get("geoapify_categories") or [])
+                                 if isinstance(x, str)),
     )
 
 

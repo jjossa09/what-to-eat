@@ -11,7 +11,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 import httpx2
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from app import answers, gate, muse, refine
 from app.scoring import History
@@ -21,6 +21,8 @@ Slot = Literal["breakfast", "lunch", "dinner", "late"]
 Chart = Literal["top", "food", "price", "distance", "companions"]
 Range = Literal["today", "yesterday", "this_week", "last_7_days", "last_30_days", "this_month"]
 Source = Literal["quiz", "model", "chip", "typed"]
+Limitation = Literal["menu", "seating", "hours", "health", "amenity", "other",
+                     "price_range", "result_count"]
 
 
 class Strict(BaseModel):
@@ -42,8 +44,7 @@ class Patch(Strict):
     budget_step: Literal["cheaper", "pricier"] | None = None
     distance_step: Literal["closer", "farther"] | None = None
     something_else: bool = False
-    unmatched: list[Literal["menu", "seating", "hours", "health", "amenity", "other"]] = Field(
-        default_factory=list, max_length=6)
+    unmatched: list[Limitation] = Field(default_factory=list, max_length=8)
 
     @field_validator("exclude", "allow")
     @classmethod
@@ -186,8 +187,7 @@ class Survey(Strict):
     asked: list[Key] = Field(default_factory=list, max_length=3)
     turn: int = Field(default=0, ge=0, le=10000)
     recommend_now: bool = False
-    unmatched: list[Literal["menu", "seating", "hours", "health", "amenity", "other"]] = Field(
-        default_factory=list, max_length=6)
+    unmatched: list[Limitation] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def valid(self):
@@ -337,32 +337,137 @@ SYSTEM = (
     "Preserve intent order. For an action message don't turn its eaten food or preferences "
     "into a survey patch unless the user separately asks to change the current search. "
     "Confirm/cancel refer only to a pending action. No health or personality claims."
+    " Extract every independently supported detail in mixed messages. Exact dollar ranges "
+    "are not price guarantees: add unmatched price_range. Budget bands per meal: 1 below "
+    "$15, 2 $15-$30, 3 over $30-$60, 4 over $60. Set a budget only if the whole stated range "
+    "fits one band; $10-$20 spans bands, so budget is null. Preserve cuisine and distance. "
+    "'I don't mind how far' means distance 35000, the existing wider-search setting. "
+    "A number of restaurants is never a distance: requesting other than three adds unmatched "
+    "result_count; 'nearby' may independently set distance 15000. Never invent a radius. "
+    "For dish searches, only the supported categorical foods (such as pizza, wings, sushi, "
+    "sandwiches) can map directly; specific menu items add unmatched menu with no positive "
+    "craving unless a supported category is separately explicit. For food actually eaten, "
+    "map the user's dish, never the restaurant's cuisine: nuggets and fries are chicken_wings, "
+    "even at McDonald's. 'Delicious' is not a numeric rating. 'Can you log a meal for me?' "
+    "is log_meal with unknown fields, never confirm. If pending_meal is true, a related "
+    "food/date/place follow-up is log_meal with only newly stated details, not survey_patch. "
+    "Unrelated search requests remain survey work. Never supply missing meal dates or food."
 )
 
 
-async def parse(text: str, asked: Key | None, refs: list[str], *, client: httpx2.AsyncClient):
+def parse_failure(status: str) -> dict:
+    return {"intents": [{"type": "unknown"}], "patch": {}, "understood": False,
+            "status": status, "invalid_fields": []}
+
+
+def checked_interpretation(data: object, refs: list[str]) -> tuple[Interpretation, list[str]]:
+    """Keep independently valid fields without accepting malformed actions or coercion.
+
+    Unknown object keys still reject that object. Conflicting fields are both omitted;
+    they must not choose a side or trigger a mutation. No repair call or text heuristics.
+    """
+    if not isinstance(data, dict) or set(data) - {"patch", "intents"}:
+        raise ValueError("shape")
+    raw_patch, raw_intents = data.get("patch", {}), data.get("intents", [])
+    if (not isinstance(raw_patch, dict) or set(raw_patch) - Patch.model_fields.keys()
+            or not isinstance(raw_intents, list) or len(raw_intents) > 8):
+        raise ValueError("shape")
+    kept, invalid = {}, []
+    for key, value in raw_patch.items():
+        try:
+            field = Patch.model_validate({key: value})
+            if key == "company" and field.company and isinstance(field.company.value, list):
+                if any(c not in refs for c in field.company.value):
+                    raise ValueError("company")
+            kept[key] = value
+        except (ValueError, TypeError):
+            invalid.append(key)
+    # Cross-field validation remains strict, including exclusions and corrections.
+    conflicts = []
+    if kept.get("craving") and kept["craving"].get("value") in kept.get("exclude", []):
+        conflicts.extend(("craving", "exclude"))
+    if set(kept.get("exclude", [])) & set(kept.get("allow", [])):
+        conflicts.extend(("exclude", "allow"))
+    for absolute, step in (("budget", "budget_step"), ("distance", "distance_step")):
+        if kept.get(absolute) is not None and kept.get(step) is not None:
+            conflicts.extend((absolute, step))
+    for key in conflicts:
+        kept.pop(key, None)
+        invalid.append(key)
+    if "price_range" in kept.get("unmatched", []) and kept.get("budget") is None:
+        # A newly stated but unrepresentable range must not retain an earlier explicit
+        # budget as though it satisfied the new request. Ask for a supported level.
+        kept["budget"] = {"status": "uncertain", "value": None}
+    intents = []
+    adapter = TypeAdapter(Intent)
+    for raw in raw_intents:
+        try:
+            intent = adapter.validate_python(raw)
+            if isinstance(intent, MealIntent) and any(c not in refs for c in intent.company):
+                raise ValueError("company")
+            intents.append(intent)
+        except (ValueError, TypeError):
+            # Meal collection may keep known food/date when an optional field is bad.
+            # An extra key still rejects the action, rather than hiding a protocol error.
+            if (not isinstance(raw, dict) or raw.get("type") != "log_meal"
+                    or set(raw) - MealIntent.model_fields.keys()):
+                invalid.append("intent")
+                continue
+            meal = {"type": "log_meal"}
+            for key, value in raw.items():
+                if key == "type":
+                    continue
+                try:
+                    one = MealIntent.model_validate({"type": "log_meal", key: value})
+                    if key == "company" and any(c not in refs for c in one.company):
+                        raise ValueError("company")
+                    meal[key] = value
+                except (ValueError, TypeError):
+                    invalid.append(f"meal_{key}")
+            if meal.get("solo") is True and meal.get("company"):
+                meal.pop("solo", None)
+                meal.pop("company", None)
+                invalid.append("meal_company")
+            intents.append(MealIntent.model_validate(meal))
+    # Never allow a damaged message to confirm an existing side effect.
+    if invalid:
+        intents = [i for i in intents if i.type != "confirm"]
+    return Interpretation(intents=intents, patch=Patch.model_validate(kept)), sorted(set(invalid))
+
+
+async def parse(text: str, asked: Key | None, refs: list[str], *, client: httpx2.AsyncClient,
+                pending_meal: bool = False):
     body = {"model": muse.MODEL, "reasoning_effort": muse.REASONING_EFFORT,
             "max_completion_tokens": answers.MAX_COMPLETION_TOKENS, "temperature": 0,
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content":
-                json.dumps({"message": text, "asked": asked, "companions": refs})}],
+                json.dumps({"message": text, "asked": asked, "companions": refs,
+                            "pending_meal": pending_meal})}],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "companion_actions", "strict": True,
                 "schema": strict_schema(Interpretation.model_json_schema())}}}
+    muse.last_failure.set(None)
     reply = await muse.call(body, client=client, call_type="parse")
     if reply is None:
-        return {"intents": [{"type": "unknown"}], "patch": {}, "understood": False}
+        failure = muse.last_failure.get() or ""
+        return parse_failure("timeout" if "Timeout" in failure or failure == "RoundDeadline"
+                             else "unavailable")
+    if reply.finish_reason == "length":
+        muse.validation_done(reply, "rejected:truncated")
+        return parse_failure("truncated")
     try:
-        if reply.finish_reason == "length":
-            raise ValueError("truncated")
-        parsed = Interpretation.model_validate_json(reply.content)
-        for intent in parsed.intents:
-            if isinstance(intent, MealIntent) and any(c not in refs for c in intent.company):
-                raise ValueError("unknown companion")
-        if parsed.patch.company and isinstance(parsed.patch.company.value, list):
-            if any(c not in refs for c in parsed.patch.company.value):
-                raise ValueError("unknown companion")
+        data = json.loads(reply.content)
+    except (ValueError, TypeError):
+        muse.validation_done(reply, "rejected:json")
+        return parse_failure("invalid_json")
+    try:
+        parsed, invalid = checked_interpretation(data, refs)
     except (ValueError, TypeError):
         muse.validation_done(reply, "rejected:protocol")
-        return {"intents": [{"type": "unknown"}], "patch": {}, "understood": False}
-    muse.validation_done(reply, "accepted")
-    return {**parsed.model_dump(), "understood": True}
+        return parse_failure("invalid_fields")
+    meaningful = any(i.type != "unknown" for i in parsed.intents) or any(
+        value not in (None, [], False) for value in parsed.patch.model_dump().values())
+    status = ("partial" if invalid and meaningful else "invalid_fields" if invalid
+              else "unsupported" if parsed.patch.unmatched else "ok" if meaningful else "ambiguous")
+    muse.validation_done(reply, "accepted:partial" if invalid else "accepted")
+    return {**parsed.model_dump(), "understood": meaningful, "status": status,
+            "invalid_fields": invalid}
