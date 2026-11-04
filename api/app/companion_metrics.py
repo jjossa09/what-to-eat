@@ -33,7 +33,7 @@ def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) 
     sources = {cid: Counter() for cid in saved}
     unlinked = contradictory = with_company = 0
     for meal in meals:
-        if meal.eaten_on > as_of or (meal.source == "live" and meal.went is not True):
+        if meal.eaten_on > as_of or (meal.source in ("live", "chat") and meal.went is not True):
             continue
         if meal.solo is True and meal.companion_ids:
             contradictory += 1
@@ -71,6 +71,8 @@ def aggregate(companion_ids: Iterable[str], meals: Iterable[Meal], as_of: date) 
             if enough and food_n else None,
             "pattern_status": "available" if enough else "insufficient_data",
         })
+        if sources[cid]["chat"]:
+            companions[-1]["source_counts"]["chat"] = sources[cid]["chat"]
     return {"companions": companions, "with_company_meal_count": with_company, "coverage": {
         "unlinked_meals": unlinked, "contradictory_company_meals": contradictory,
     }}

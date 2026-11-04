@@ -75,7 +75,7 @@ def counts(meal: PastMeal, as_of: date, hard_nos: frozenset[str]) -> bool:
         return False
     if meal.category_id not in PREDICTABLE or meal.category_id in hard_nos:
         return False
-    return meal.source == "backfill" or (meal.source == "live" and meal.food_answered)
+    return meal.source == "backfill" or (meal.source in ("live", "chat") and meal.food_answered)
 
 
 def quiz_prior(favorites: frozenset[str], hard_nos: frozenset[str]) -> dict[str, float]:

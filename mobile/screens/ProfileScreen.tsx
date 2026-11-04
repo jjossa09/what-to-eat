@@ -3,9 +3,11 @@ import { type ReactNode, useCallback, useRef, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import ScrollWithBar from '../components/ScrollWithBar';
+import { PreferenceFields } from '../components/CompanionCards';
 import { Chip, GlassCard, GlassScreen, PrimaryButton, SecondaryButton, useTabBarSpace } from '../components/ui';
-import { getInsights } from '../lib/api';
-import { type InsightsState, loadInsights, localInsightsDate } from '../lib/insights';
+import { companionCall, getInsights } from '../lib/api';
+import { profileDraft, type Profile, type ProfileDraft } from '../lib/companionActions';
+import { type InsightsState, loadInsights, localInsightsDate, withInsightsDeadline } from '../lib/insights';
 import {
   BUDGETS,
   type Category,
@@ -19,7 +21,7 @@ import {
 import { chart, colors, emojiFor, spacing, type } from '../theme';
 import InsightsScreen from './InsightsScreen';
 
-// Read-only profile (P1-22). Editing is a later ticket.
+// Profile and taste editing share the confirmed, version-checked preference writer with chat.
 
 type Data = {
   name: string | null;
@@ -51,6 +53,27 @@ export default function ProfileScreen({ userId, onSignOut, showInsights, onInsig
   const [failed, setFailed] = useState(false);
   const [insights, setInsights] = useState<InsightsState>({ status: 'loading' });
   const insightRequest = useRef(0);
+  const [editing, setEditing] = useState<ProfileDraft | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const editLock = useRef(false);
+  async function openEditor() {
+    if (editLock.current) return;
+    editLock.current = true; setEditBusy(true); setEditError(null);
+    try { setEditing(profileDraft(await companionCall<Profile>('/conversation/profile'), 'profile')); }
+    catch { setEditError("Couldn't load your taste profile."); }
+    finally { editLock.current = false; setEditBusy(false); }
+  }
+  async function saveEditor() {
+    if (!editing || editLock.current) return;
+    editLock.current = true; setEditBusy(true); setEditError(null);
+    try {
+      await companionCall('/profile/preferences', editing);
+      setEditing(null);
+      void withInsightsDeadline(() => fetchProfile(), 5000).catch(() => setFailed(true));
+    } catch { setEditError("Couldn't save. If your profile changed, cancel and reopen."); }
+    finally { editLock.current = false; setEditBusy(false); }
+  }
 
   const refreshInsights = useCallback(async (categories: Category[]) => {
     const requestId = ++insightRequest.current;
@@ -167,6 +190,13 @@ export default function ProfileScreen({ userId, onSignOut, showInsights, onInsig
         </GlassCard>
 
         <SecondaryButton label="Insights" onPress={() => onInsightsChange(true)} />
+        {editing ? <GlassCard>
+          <PreferenceFields value={editing} onChange={setEditing} categories={data.categories} disabled={editBusy} />
+          <PrimaryButton label="Confirm changes" feedback={false} onPress={saveEditor} busy={editBusy}
+            disabled={editing.favorites.length < 1 || editing.favorites.length > 5} />
+          <SecondaryButton label="Cancel" disabled={editBusy} onPress={() => { setEditing(null); setEditError(null); }} />
+        </GlassCard> : <SecondaryButton label="Edit taste quiz" disabled={editBusy} onPress={openEditor} />}
+        {editError && <Text accessibilityLiveRegion="polite" style={styles.muted}>{editError}</Text>}
         <PrimaryButton label="Sign out" onPress={onSignOut} />
       </ScrollWithBar>
     </GlassScreen>

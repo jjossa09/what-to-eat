@@ -108,6 +108,10 @@ Repeat visits only (n = 10):
 | Most frequent so far | 60.0% (6/10), CI 31.3% to 83.2% | 70.0% (7/10), CI 39.7% to 89.2% |
 | Random | 16.6% expected (analytic) | 49.7% expected (analytic) |
 
+## #75 contract note
+
+This is the preserved November 1 result, not a new #75 run. Variable question counts and action provenance are verified separately from this time-ordered meal replay. Confirmed chat food can count as cuisine evidence; a verified actual place is required for place evidence. Unknown meal slots remain outside slot-based replay. Model parameters, temporal boundaries, baseline definitions and hit-rate methodology are unchanged. Historical edits change input data, not past published results. No real-user rerun or chain-level result has been published here.
+
 ## Limitations
 
 - Small n: intervals are wide; differences inside overlapping intervals are not evidence of a real difference.

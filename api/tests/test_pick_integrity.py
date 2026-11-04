@@ -96,9 +96,10 @@ def test_rpc_failure_stays_retryable_and_lost_response_can_replay(fault):
     assert json.loads(up.calls("POST", "rpc/save_recommendation_pick")[1].content) == original
 
 
-def test_companion_copy_failure_cannot_invalidate_committed_pick():
+def test_pick_never_makes_a_secondary_companion_write():
     up = companion_t.FunnelFake(session_companions=[companion_t.A], fail=["POST meal_companions"])
-    # FunnelFake's link handler normally succeeds; fail the actual secondary transport.
+    # Any accidentally reintroduced secondary write hits this failure canary.
+    # The real optional-copy failure inside SQL is covered by food_companion_test.sql.
     original = up.__call__
 
     def send(request):
@@ -116,7 +117,7 @@ def test_companion_copy_failure_cannot_invalidate_committed_pick():
     assert response.status_code == 200
     assert response.json() == {"logged": True, "meal_id": companion_t.MEAL_ID}
     assert len(up.calls("POST", "rpc/save_recommendation_pick")) == 1
-    assert len(up.calls("POST", "meal_companions")) == 1
+    assert len(up.calls("POST", "meal_companions")) == 0
 
 
 @pytest.mark.parametrize("budget", [1, 3, None])

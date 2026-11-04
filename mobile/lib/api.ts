@@ -48,7 +48,7 @@ export type InsightCompanion = {
   companion_id: string;
   meal_count: number;
   category_meal_count: number;
-  source_counts: { live: number; backfill: number };
+  source_counts: { live: number; backfill: number; chat?: number };
   weekdays: { iso_day: number; meal_count: number }[];
   categories: InsightCategory[];
   leading_day_ids: number[] | null;
@@ -218,8 +218,9 @@ export type RoundRequest = {
   local_time: string;
   timezone?: string;
   craving: string | null;
-  budget_level: number;
-  radius_m: 15000 | 35000;
+  budget_level: number | null;
+  radius_m: 15000 | 35000 | null;
+  survey?: import('./companion').Survey;
   exclude_categories: string[];
   /** A follow-up's change; the server applies it to the answers above. */
   refine?: Partial<Change>;
@@ -317,6 +318,24 @@ export function getReasons(envelope: ReasonsEnvelope): Promise<ReasonsResponse> 
 
 export function getRecommendations(body: RoundRequest): Promise<RoundResponse> {
   return request<RoundResponse>('POST', '/recommendations', body);
+}
+
+/** Companion actions include auth and body reading in one deadline, with no automatic retry. */
+export function companionCall<T>(path: string, body?: unknown): Promise<T> {
+  return withInsightsDeadline(async (signal) => {
+    if (!API_URL) throw new ApiError('server');
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) throw new ApiError('auth');
+    if (signal.aborted) throw new ApiError('network');
+    const response = await fetch(`${API_URL.replace(/\/$/, '')}${path}`, {
+      method: body === undefined ? 'GET' : 'POST', signal,
+      headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    if (!response.ok) throw new ApiError(response.status === 401 ? 'auth' : response.status === 409 ? 'conflict' : 'server');
+    return await response.json() as T;
+  }, 16_000);
 }
 
 export type Place = {

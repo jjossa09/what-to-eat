@@ -6,6 +6,8 @@ upstream detail beyond the status code.
 
 import logging
 import math
+import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -56,6 +58,7 @@ class Candidate:
     category: str  # ML2 id from the P1-20 mapper
     geoapify_categories: list[str]
     address: str | None
+    brand: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,7 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
         return None
     categories = [c for c in props.get("categories") or [] if isinstance(c, str)]
     name = name.strip()
+    brand = ((props.get("datasource") or {}).get("raw") or {}).get("brand")
     return Candidate(
         id=key,
         name=name,
@@ -105,6 +109,7 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
         category=map_category(categories, name),
         geoapify_categories=categories,
         address=props.get("formatted") or None,
+        brand=brand.strip() if isinstance(brand, str) and brand.strip() else None,
     )
 
 
@@ -132,6 +137,7 @@ async def search(
     radius_m: int | None = None,
     *,
     bias: bool = False,
+    name: str | None = None,
     client: httpx2.AsyncClient,
 ) -> SearchResult:
     """Exactly one Geoapify Places call. Returns named places, nearest first, deduped."""
@@ -147,6 +153,8 @@ async def search(
         "limit": LIMIT,
         "apiKey": api_key,
     }
+    if name is not None:
+        params["name"] = name
     # Recommendations (bias=True, P1-19): always the nearest 100, so picks are the same for
     # the same spot (unbiased results come back in no set order). The Map tab's area
     # searches stay unbiased above PROXIMITY_MAX_RADIUS_M, to spread pins over the view.
@@ -178,3 +186,15 @@ async def search(
         places.append(place)
     return SearchResult(radius_m=radius_m, truncated=len(features) >= LIMIT,
                         places=deduplicate(places))
+
+
+def normalized_name(value: str) -> str:
+    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", value).casefold())
+    return " ".join(t for t in tokens if t not in ("the", "a", "an"))
+
+
+def named_matches(candidates: list[Candidate], name: str) -> list[Candidate]:
+    wanted = normalized_name(name)
+    return sorted((p for p in candidates if wanted and (
+        normalized_name(p.name) == wanted or isinstance(p.brand, str)
+        and normalized_name(p.brand) == wanted)), key=lambda p: (p.distance_m, p.id))

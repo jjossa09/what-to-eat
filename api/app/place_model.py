@@ -43,7 +43,7 @@ class PlaceScore:
 def is_visit(meal: PastMeal, as_of: date) -> bool:
     if meal.place is None or meal.eaten_on >= as_of:
         return False
-    return meal.source == "backfill" or (meal.source == "live" and meal.went is True)
+    return meal.source == "backfill" or (meal.source in ("live", "chat") and meal.went is True)
 
 
 def familiarity(weighted_visits: float) -> float:

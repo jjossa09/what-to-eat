@@ -122,6 +122,7 @@ export default function MealsScreen({ userId }: { userId: string }) {
       {content}
       {open && openMeal && (
         <MealCard
+          userId={userId}
           meal={openMeal}
           from={open.from}
           categoryName={(id) => (id ? (names.get(id) ?? null) : null)}

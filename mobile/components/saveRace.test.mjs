@@ -5,6 +5,7 @@ import ts from 'typescript';
 import { OtisController } from '../lib/otis.ts';
 import { ReasonsCache } from '../lib/reasons.ts';
 import * as questionPlan from '../lib/questionPlan.ts';
+import * as companion from '../lib/companion.ts';
 
 // Execute production handlers and effects. Native layout, spring physics and tactile strength
 // are intentionally left to iPhone verification. Timers and requests settle explicitly.
@@ -119,8 +120,8 @@ const hosts = { Chip: 'Chip', GlassCard: 'GlassCard', GlassScreen: 'GlassScreen'
 class ApiError extends Error { constructor(kind) { super(kind); this.kind = kind; } }
 const pick = { id: 'synthetic-place', name: 'Synthetic Cafe', category: 'pizza', reason: 'Close by.',
   distance_m: 200, lat: 1, lon: 2 };
-const parsed = { status: 'ok', answer: { craving: 'pizza', budget_level: null, radius_m: null,
-  exclude_categories: [] } };
+const parsed = { understood: true, intents: [{ type: 'survey_patch' }],
+  patch: { craving: { status: 'confirmed', value: 'pizza' } } };
 const result = (round, final = false) => ({ session_id: 'synthetic-session', round, logged: true,
   picks: [{ ...pick, id: `synthetic-place-${round}` }],
   answers: { craving: 'pizza', budget_level: 1, radius_m: 15000, exclude_categories: [] },
@@ -132,6 +133,19 @@ async function fixture({ final = false } = {}) {
     const pending = deferred(); saves.push({ kind, args, ...pending }); return pending.promise;
   };
   const api = { ApiError,
+    companionCall: async (path, body) => {
+      if (path === '/conversation/parse') {
+        const pending = deferred(); parses.push({ key: body.asked, text: body.text, ...pending });
+        return pending.promise;
+      }
+      assert.equal(path, '/conversation/plan');
+      const state = structuredClone(body.state);
+      for (const key of companion.SURVEY_KEYS) if (body.patch?.[key]) {
+        state[key] = { ...body.patch[key], source: body.source, turn: state.turn + 1 };
+      }
+      const next_key = ['craving', 'budget', 'distance'].find((key) => state[key].status !== 'confirmed') ?? null;
+      return { state, next_key, ready: next_key === null, conversation_id: 'synthetic-conversation' };
+    },
     getQuestionPlan: async () => ({ questions: ['craving', 'budget', 'distance']
       .map((key) => ({ key, prefill: null })) }),
     getRecommendations: (body) => {
@@ -149,7 +163,9 @@ async function fixture({ final = false } = {}) {
   const Chat = load('./Chat.tsx', { react: h.react, 'react-native': rn.module, '../theme': theme,
     '@react-navigation/native': { useNavigation: () => navigation,
       useFocusEffect: (effect) => h.react.useEffect(effect, [effect]) },
-    '../lib/api': api, '../lib/location': {
+    '../lib/api': api, '../lib/companion': companion, '../lib/companionActions': {},
+    '../lib/insights': { withInsightsDeadline: (work) => work() },
+    './CompanionCards': {}, '../lib/location': {
       getPosition: async () => ({ ok: true, position: { lat: 1, lon: 2 } }),
     },
     '../lib/profile': { loadTastePrior: async () => ({ favorites: ['pizza'], budget: 2, mostlySolo: true }),
@@ -180,7 +196,7 @@ async function fixture({ final = false } = {}) {
     return c.h.flush(c.Component, props);
   };
   render(); await tick();
-  for (const label of ['Pizza', '$', 'Close to me']) find(render(), 'Chip', label).props.onPress();
+  for (const label of ['Pizza', '$', 'Close to me']) { find(render(), 'Chip', label).props.onPress(); await tick(); }
   await tick(); requests[0].resolve(result(1, final)); await tick(); card(); feedback.length = 0;
   const send = (text = 'Synthetic refinement') => nodes(render(), 'Composer')[0].props.onSend(text);
   const begin = (index = 0, label = 'Pick this') => find(card(index), 'Chip', label).props.onPress();
@@ -229,7 +245,7 @@ test('genuine 409 closes only the original search without a saved claim, celebra
   assert.equal(f.lines().includes('Enjoy Synthetic Cafe!'), false);
   assert.deepEqual(f.feedback, []); assert.deepEqual(f.reminders, []);
   assert.equal(nodes(f.card(), 'Chip').some((node) => ['Pick this', 'Try again'].includes(node.props.label)), false);
-  f.send('Synthetic new search'); assert.equal(f.parses.at(-1).key, 'craving'); f.dispose();
+  f.send('Synthetic new search'); assert.equal(f.parses.at(-1).key, null); f.dispose();
 });
 
 for (const phase of ['parsing', 'fetching', 'results']) {
@@ -247,7 +263,7 @@ for (const phase of ['parsing', 'fetching', 'results']) {
     if (phase === 'parsing') { f.parses[0].resolve(parsed); await tick(); }
     if (phase !== 'results') { f.requests[1].resolve(result(2)); await tick(); }
     f.send('Synthetic next refinement');
-    assert.equal(f.parses.at(-1).key, 'refine');
+    assert.equal(f.parses.at(-1).key, null);
     f.dispose();
   });
 }
@@ -257,11 +273,11 @@ for (const response of ['not_sure', 'network']) {
     const f = await fixture(); f.begin(); f.send();
     f.saves[0].resolve({ logged: true }); await tick();
     if (response === 'network') f.parses[0].reject(new ApiError('network'));
-    else f.parses[0].resolve({ status: 'not_sure', answer: null });
+    else f.parses[0].resolve({ understood: false, intents: [{ type: 'unknown' }], patch: {} });
     await tick();
     assert.equal(nodes(f.render(), 'Composer')[0].props.placeholder, 'Or type what to change');
     assert.equal(f.lines().includes('Enjoy Synthetic Cafe!'), false);
-    f.send(); assert.equal(f.parses.at(-1).key, 'refine');
+    f.send(); assert.equal(f.parses.at(-1).key, null);
     assert.deepEqual(f.reminders, ['synthetic-user']); f.dispose();
   });
 }
@@ -285,7 +301,7 @@ for (const kind of ['network', 'conflict']) {
       assert.deepEqual(f.feedback, []);
     }
     assert.deepEqual(f.reminders, kind === 'network' ? ['synthetic-user'] : []);
-    f.send(); assert.equal(f.parses.at(-1).key, 'refine'); f.dispose();
+    f.send(); assert.equal(f.parses.at(-1).key, null); f.dispose();
   });
 }
 
@@ -331,15 +347,15 @@ test('new search reset rejects a delayed earlier success and retains its legitim
   f.begin(1); f.saves[1].reject(new ApiError('conflict')); await tick();
   assert.equal(f.lines().includes('Already saved.'), false);
   assert.ok(nodes(f.card(1), 'Text').some((node) => node.props.children === 'Search already decided.'));
-  f.send('Synthetic new craving'); assert.equal(f.parses[0].key, 'refine');
-  assert.equal(f.parses.at(-1).key, 'craving');
-  f.parses.at(-1).resolve({ status: 'not_sure', answer: null }); await tick();
-  assert.ok(find(f.render(), 'Chip', 'Pizza')); // The new search is asking its first question.
+  f.send('Synthetic new craving'); assert.equal(f.parses[0].key, null);
+  assert.equal(f.parses.at(-1).key, null);
+  f.parses.at(-1).resolve(parsed); await tick();
+  assert.ok(find(f.render(), 'Chip', '$')); // The new first message supplied food only.
   f.feedback.length = 0; f.saves[0].resolve({ logged: true }); await tick();
   assert.equal(f.lines().includes('Enjoy Synthetic Cafe!'), false);
   assert.deepEqual(f.feedback, []); assert.deepEqual(f.reminders, ['synthetic-user']);
   // Completing the new search must send a fresh session, not the earlier one.
-  for (const label of ['Pizza', '$', 'Close to me']) find(f.render(), 'Chip', label).props.onPress();
+  for (const label of ['$', 'Close to me']) { find(f.render(), 'Chip', label).props.onPress(); await tick(); }
   await tick(); assert.equal(f.requests.at(-1).body.session_id, undefined); f.dispose();
 });
 
