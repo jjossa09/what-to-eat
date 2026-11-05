@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -33,15 +34,18 @@ from app.answers import QuestionKey as ParseKey
 from app.answers import parse as parse_text
 from app.auth import current_auth, current_user
 from app.categories import CATEGORY_IDS, OTHER
+from app.chains import ChainResolver, retained_identity
 from app.config import get_settings
 from app.logs import configure_logging
-from app.place_model import place_scores
+from app.place_model import chain_scores, is_visit, place_scores
 from app.refine import Change
 from app.scoring import Context, History, meal_context, models_for
 
 configure_logging()
-PARSE_DEADLINE_S = 13.0
+PARSE_DEADLINE_S = 13.0  # legacy /answers/parse
+COMPANION_PARSE_DEADLINE_S = 17.0
 REASONS_DEADLINE_S = 15.0
+RECOMMENDATIONS_DEADLINE_S = 24.0  # includes request validation and auth
 NOT_SURE = {"status": "not_sure", "answer": None, "source": "none", "reply": None}
 
 
@@ -53,9 +57,19 @@ class LanguageRoute(APIRoute):
 
         async def bounded(request):
             path = request.url.path
+            if path == "/recommendations":
+                try:
+                    async with asyncio.timeout(RECOMMENDATIONS_DEADLINE_S):
+                        return await handler(request)
+                except TimeoutError:
+                    logger.warning("Recommendations endpoint deadline exceeded")
+                    return JSONResponse({"detail": "Recommendation request timed out"},
+                                        status_code=504)
             if path not in ("/reasons", "/answers/parse", "/conversation/parse"):
                 return await handler(request)
-            seconds = REASONS_DEADLINE_S if path == "/reasons" else PARSE_DEADLINE_S
+            seconds = (REASONS_DEADLINE_S if path == "/reasons" else
+                       min(COMPANION_PARSE_DEADLINE_S, get_settings().MUSE_PARSE_DEADLINE_S)
+                       if path == "/conversation/parse" else PARSE_DEADLINE_S)
             try:
                 async with asyncio.timeout(seconds):
                     return await handler(request)
@@ -79,7 +93,8 @@ logger = logging.getLogger(__name__)
 MAX_RADIUS_M = widening.MAX_RADIUS_M
 # ML10: after 3 rounds without a pick, round 4 is the best options so far.
 CAP_ROUND = 4
-ROUND_BUDGET_S = 7.5
+OPEN_ROUND_BUDGET_S = 7.5  # unchanged session-opening/cached-only work
+ROUND_BUDGET_S = 13.5  # initial 8 + optional search 2 + 3.5 for normal round persistence
 
 
 async def get_places_client() -> AsyncIterator[httpx2.AsyncClient]:
@@ -191,7 +206,8 @@ async def places_search(
         "radius_m": result.radius_m,
         "count": len(result.places),
         "truncated": result.truncated,
-        "places": [{k: v for k, v in asdict(p).items() if k != "brand" or v is not None}
+        "places": [{k: v for k, v in asdict(p).items()
+                    if k not in ("brand", "brand_wikidata") or v is not None}
                    for p in result.places],
         **({"widened": widened, "presentation": "nearby", "status": lookup_status}
            if name is not None else {}),
@@ -235,6 +251,8 @@ class RecommendationsRequest(BaseModel):
     companion_ids: list[UUID] = Field(default_factory=list)
     transcript: list[TranscriptMessage] = Field(default_factory=list, max_length=40)
     survey: conversation.Survey | None = None
+    requirements_changed: bool = False  # changed search requirements bypass cached cap cards
+    request_source: Literal["typed", "chip", "retry", "unknown"] = "unknown"
     # Round 1 (P2-05): the question order the phone used and where it came from ("plan" or
     # "fallback"). Loosely typed on purpose: a bad value is logged as invalid, never refused.
     asked_order: list[JsonValue] | None = Field(default=None, max_length=10)
@@ -313,6 +331,21 @@ async def load_history(
         return None
 
 
+def recommendation_result(
+    payload: dict, budget: widening.PlacesBudget, started: float, *, http_status: int = 200,
+) -> dict:
+    """Content-free timing, including failures; never log the request body or identity."""
+    logger.info("Recommendation request: %s", json.dumps({
+        "request_id": budget.request_id, "source": budget.source,
+        "http_status": http_status, "search_status": payload["search_status"],
+        "using_cached": payload.get("using_cached", False),
+        "picks": len(payload.get("picks", [])), "places_calls": budget.calls,
+        "places_ms": round(budget.used_s * 1000),
+        "elapsed_ms": round((time.perf_counter() - started) * 1000),
+    }, separators=(",", ":")))
+    return payload
+
+
 @app.post("/recommendations")
 async def recommendations(
     body: RecommendationsRequest,
@@ -338,11 +371,14 @@ async def recommendations(
     default_radius = get_settings().PLACES_RADIUS_M
     current = refine.Answers(body.craving, body.budget_level, refine.chip_radius(body.radius_m),
                              tuple(body.exclude_categories))
-    applied = (refine.apply(body.refine, current, default_radius) if body.refine
+    applied = (refine.apply(body.refine, current, default_radius,
+                           preserve_craving=required_craving(body, current) is not None)
+               if body.refine
                else refine.Applied(current, ()))
     answers = applied.answers
+    required = required_craving(body, answers)
     radius = answers.radius_m or default_radius
-    places_budget = widening.PlacesBudget()
+    places_budget = widening.PlacesBudget(request_id=str(uuid4()), source=body.request_source)
     slot, local_date, is_weekend = meal_context(body.local_time)
     new_session = funnel.NewSession(
         timezone=body.timezone or offset_zone(body.local_time),
@@ -362,12 +398,14 @@ async def recommendations(
     session_id = str(body.session_id) if body.session_id else None
     opening = quietly(
         funnel.open_round(user_id, token, session_id, new_session, client=client), "session",
-        deadline=deadline,
+        deadline=started + OPEN_ROUND_BUDGET_S,
     )
+    loaded, ref = None, None
     try:
         if session_id is None:
             result, loaded, ref = await asyncio.gather(
-                places_budget.search(body.lat, body.lon, radius, client=client),
+                places_budget.search(body.lat, body.lon, radius, client=client,
+                                     required_craving=required),
                 load_history(user_id, token, client),
                 opening,
             )
@@ -378,14 +416,28 @@ async def recommendations(
             )
             if ref and ref.closed:
                 raise HTTPException(status.HTTP_409_CONFLICT, "Session already has an outcome")
-            if ref and ref.round == CAP_ROUND and not body.answered_open_question():
-                return await best_so_far_round(
+            if (ref and ref.round == CAP_ROUND and not body.answered_open_question()
+                    and not body.requirements_changed):
+                cached = await best_so_far_round(
                     body, user_id, token, ref, applied, new_session, loaded, started,
                     client=client,
                 )
-            result = await places_budget.search(body.lat, body.lon, radius, client=client)
+                return recommendation_result(cached, places_budget, started)
+            result = await places_budget.search(body.lat, body.lon, radius, client=client,
+                                                required_craving=required)
     except places.PlacesError as e:
-        raise places_error(e) from None
+        if ref and ref.shown:
+            fallback = await best_so_far_round(body, user_id, token, ref, applied,
+                                               new_session, loaded, started, client=client)
+            issue = "timeout" if isinstance(e, places.PlacesTimeout) else "provider_error"
+            return recommendation_result({**fallback, "best_so_far": False,
+                    "search_status": "partial" if fallback["picks"] else issue,
+                    "search_issue": issue, "using_cached": True}, places_budget, started)
+        error = places_error(e)
+        recommendation_result({"search_status": "timeout" if isinstance(e, places.PlacesTimeout)
+                               else "provider_error"}, places_budget, started,
+                              http_status=error.status_code)
+        raise error from None
 
     shown_before = frozenset(c.place_id for c in ref.shown) if ref else frozenset()
     context = Context(
@@ -460,7 +512,7 @@ async def recommendations(
         (time.perf_counter() - started) * 1000,
         muse.TEMPLATE,
     )
-    return {
+    return recommendation_result({
         "session_id": ref.session_id if ref else session_id,
         "round": ref.round if ref else None,
         "logged": logged,
@@ -472,6 +524,13 @@ async def recommendations(
         "cold_start": ranking.cold_start,
         "radius_m": result.radius_m,
         "truncated": result.truncated,
+        "search_status": ("partial" if ranking.top3 and (
+            result.truncated or widened.search_status != "complete") else
+            "incomplete" if result.truncated and widened.search_status == "complete"
+            else widened.search_status),
+        "search_issue": (widened.search_status if widened.search_status in (
+            "timeout", "provider_error", "incomplete")
+                         else "incomplete" if result.truncated else None),
         "best_so_far": False,
         "answers": answers_out(answers),
         "required_craving": context.required_craving,
@@ -491,7 +550,7 @@ async def recommendations(
             }
             for pick, reason in zip(ranking.top3, template_lines, strict=True)
         ],
-    }
+    }, places_budget, started)
 
 
 def answers_out(answers: refine.Answers) -> dict:
@@ -604,16 +663,28 @@ async def best_so_far_round(
     No places search and no Muse call: the cards and their reasons were shown before (R2).
     Fewer than 3 can fit; none means the app goes straight to the open question.
     """
-    deadline = started + ROUND_BUDGET_S
+    deadline = started + OPEN_ROUND_BUDGET_S
     answers = applied.answers
     user_history = loaded or History()
+    earlier_places = {meal.place.id: meal.place for meal in user_history.meals
+                      if is_visit(meal, new.local_date)}
+    shown = list(ref.shown)
+    for index, card in enumerate(shown):
+        if before := earlier_places.get(card.place_id):
+            brand, qid = retained_identity(card, before)
+            shown[index] = replace(card, brand=brand, brand_wikidata=qid)
+    resolver = ChainResolver([*shown, *earlier_places.values()])
+    chain_history = chain_scores(user_history, new.local_date, resolver)
     known = {
         pid: s.known_price_level
         for pid, s in place_scores(user_history, as_of=new.local_date).items()
     }
+    for card in shown:
+        if chain := chain_history.get(resolver.key(card)):
+            known[card.place_id] = chain.known_price_level
     budget = answers.budget_level or user_history.prior.budget_level
     required = required_craving(body, answers)
-    eligible = tuple(card for card in ref.shown
+    eligible = tuple(card for card in shown
                      if card.category not in user_history.prior.hard_nos
                      and places.verified_cuisine(card.category, card.geoapify_categories, required))
     best = refine.best_so_far(eligible, answers, new.search_radius_m, body.lat, body.lon,
@@ -657,6 +728,7 @@ async def best_so_far_round(
         "radius_m": new.search_radius_m,
         "truncated": False,
         "best_so_far": True,
+        "search_status": "cached",
         "required_craving": required,
         "answers": answers_out(answers),
         "next_question": None,  # the cap asks the open question (ML10)
@@ -737,6 +809,20 @@ class CompanionParseRequest(conversation.Strict):
     asked: conversation.Key | None = None
     companion_refs: list[str] = Field(default_factory=list, max_length=20)
     pending_meal: bool = False
+    recent_context: list[conversation.ContextLine] = Field(default_factory=list, max_length=6)
+    active_craving: str | None = None
+    local_time: datetime | None = Field(default=None, strict=False)
+    timezone: str | None = Field(default=None, max_length=64)
+
+    _craving = field_validator("active_craving")(RecommendationsRequest.known_craving.__func__)
+    _timezone = field_validator("timezone")(RecommendationsRequest.known_timezone.__func__)
+
+    @field_validator("local_time")
+    @classmethod
+    def offset_required(cls, value):
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("local time must include its UTC offset")
+        return value
 
     @field_validator("companion_refs")
     @classmethod
@@ -749,8 +835,14 @@ class CompanionParseRequest(conversation.Strict):
 @app.post("/conversation/parse")
 async def companion_parse(body: CompanionParseRequest,
     user_id: str = Depends(current_user), client: httpx2.AsyncClient = Depends(get_http_client)):
+    local = body.local_time
+    if local is not None and body.timezone:
+        local = local.astimezone(ZoneInfo(body.timezone))
     return await conversation.parse(body.text, body.asked, body.companion_refs, client=client,
-                                    pending_meal=body.pending_meal)
+                                    pending_meal=body.pending_meal,
+                                    recent_context=body.recent_context,
+                                    active_craving=body.active_craving,
+                                    today=local.date() if local else None)
 
 
 class CompanionPlanRequest(BaseModel):

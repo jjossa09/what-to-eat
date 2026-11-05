@@ -13,6 +13,7 @@ from uuid import UUID
 
 import httpx2
 
+from app.chains import brand_text, wikidata_id
 from app.config import MissingSettingError, get_settings
 from app.places import Candidate, distance_m
 from app.scoring import Pick
@@ -60,6 +61,8 @@ class ShownCard:
     category: str
     address: str | None
     geoapify_categories: tuple[str, ...] = ()
+    brand: str | None = None
+    brand_wikidata: str | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +238,7 @@ async def open_round(
 # The session, with every shown card and its cached place: one read per later round.
 SESSION_SELECT = (
     "id,outcome,recommendation_events(round,place_id,score,slot,pick_reason,reasons_source,"
-    "places(name,lat,lon,category_id,address,geoapify_categories))"
+    "places(name,lat,lon,category_id,address,geoapify_categories,brand,brand_wikidata))"
 )
 
 
@@ -266,6 +269,8 @@ def _shown_card(event) -> ShownCard | None:
         address=address if isinstance(address, str) else None,
         geoapify_categories=tuple(x for x in (place.get("geoapify_categories") or [])
                                  if isinstance(x, str)),
+        brand=brand_text(place.get("brand")),
+        brand_wikidata=wikidata_id(place.get("brand_wikidata")),
     )
 
 
@@ -359,6 +364,8 @@ async def upsert_places(candidates: list[Candidate], *, client: httpx2.AsyncClie
             "lon": c.lon,
             "category_id": c.category,
             "geoapify_categories": c.geoapify_categories,
+            "brand": c.brand,
+            "brand_wikidata": c.brand_wikidata,
             "address": c.address,
             "unresolved": False,
             "updated_at": _now(),

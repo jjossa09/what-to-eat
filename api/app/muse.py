@@ -92,8 +92,11 @@ SYSTEM_PROMPT = (
     "(no familiar, usual, again, back, return, regular, go-to). "
     "times_had_category counts the user's past meals of that food anywhere, not visits to "
     "this place. "
-    "Mention a star rating only from stars_mean, the user's own rating of that place; "
-    "if stars_mean is absent, never mention stars or ratings. "
+    "Chain evidence describes all verified branches together. Say the chain name or 'this "
+    "chain' when citing chain visits or ratings, never 'here' or 'this location'. "
+    "Chain price_scope is past chain price evidence, never a verified price at this branch. "
+    "Mention a star rating only from stars_mean in the matching location or chain scope; "
+    "if that scope has no stars_mean, never mention stars or ratings. "
     "Do not repeat the place name. No health, nutrition, calorie, or diet claims. "
     f"Each reason is one plain sentence of at most {MAX_REASON_CHARS} characters. "
     "Return exactly one entry per pick id given."
@@ -184,7 +187,11 @@ def template_reason(pick: Pick) -> str:
     e = pick.scored.evidence
     label = (CATEGORY_LABELS.get(e.category) if verified_cuisine(
         e.category, pick.scored.place.geoapify_categories, e.category) else None)
-    if ("craving_match" in e.reasons and label
+    if e.chain_visits:
+        name = e.chain_name if e.chain_name and len(e.chain_name) <= 36 else "this chain"
+        count = f"{e.chain_visits} {'time' if e.chain_visits == 1 else 'times'}"
+        lead = f"You've visited {name} {count}"
+    elif ("craving_match" in e.reasons and label
             and verified_cuisine(e.category, pick.scored.place.geoapify_categories, e.craving)):
         lead = f"Matches your {label} craving"
     elif e.visits > 1:
@@ -229,7 +236,13 @@ def pick_evidence(pick: Pick) -> dict:
         "times_had_category": e.category_meals,
         "price": price_note(price),
         "signals": [r for r in e.reasons if r not in RANKING_SIGNALS],
-    } | ({"stars_mean": stars_shown(e.stars_mean)} if e.stars_mean is not None else {})
+    } | ({"stars_mean": stars_shown(e.stars_mean)} if e.stars_mean is not None else {}) | ({
+        "chain": {"id": e.chain_id, "name": e.chain_name, "visits": e.chain_visits,
+                  "stars_mean": stars_shown(e.chain_stars_mean)
+                  if e.chain_stars_mean is not None else None,
+                  "days_since_last_visit": e.chain_last_visit_days},
+        "price_scope": "chain",
+    } if e.chain_id else {})
 
 
 def stars_shown(stars_mean: float) -> float:
@@ -254,8 +267,15 @@ REASON_WORDS = frozenset((
     "before times time visit visits visited last days day ago since often again usual "
     "favorite favorites category food choice pick spot place option different something "
     "rated rating stars star gave fits fit budget price known unknown own matches match "
-    "craving reason fine good back based recorded stored just far but"
+    "craving reason fine good back based recorded stored just far but chain location"
 ).split())
+
+
+def chain_reference(line: str, evidence: dict) -> bool:
+    chain = evidence.get("chain") or {}
+    name = set(re.findall(r"[a-z]+(?:'[a-z]+)?", (chain.get("name") or "").casefold()))
+    words = set(re.findall(r"[a-z]+(?:'[a-z]+)?", line.casefold()))
+    return bool(chain and ("chain" in words or name and name <= words))
 
 
 def grounded_reason(line: str, evidence: dict) -> bool:
@@ -263,8 +283,36 @@ def grounded_reason(line: str, evidence: dict) -> bool:
     category = (evidence.get("category") or "") if evidence.get("cuisine_verified") else ""
     allowed = REASON_WORDS | set(re.findall(r"[a-z]+", category.casefold()))
     allowed |= set(re.findall(r"[a-z]+", evidence["id"].casefold()))
+    chain = evidence.get("chain") or {}
+    allowed |= set(re.findall(r"[a-z]+(?:'[a-z]+)?", (chain.get("name") or "").casefold()))
     if words - allowed:
         return False
+    if evidence.get("price_scope") == "chain" and words & {"price", "budget", "fits"}:
+        if not chain_reference(line, evidence) or words & {"here", "location"}:
+            return False
+    if not evidence.get("visited_before") and re.search(
+            r"\b(?:been here|visited here|visited this location|back here|return here)\b",
+            line, re.IGNORECASE):
+        return False
+    counts = re.findall(r"\b(\d+)\s+times?\b", line, re.IGNORECASE)
+    if chain_reference(line, evidence):
+        expected_count = chain.get("visits", 0)
+        if not chain.get("visits") and PAST_VISIT_TERMS.search(line):
+            return False
+    elif words & {"visit", "visits", "visited", "here", "location", "been", "return"}:
+        expected_count = evidence.get("visits", 0)
+    elif "had" in words and evidence.get("cuisine_verified"):
+        expected_count = evidence.get("times_had_category", 0)
+    else:
+        expected_count = None
+    if counts and any(int(n) != expected_count for n in counts):
+        return False
+    for number, unit in re.findall(r"\b(\d+(?:\.\d+)?)\s+(mi|miles?|m|meters?)\b",
+                                   line, re.IGNORECASE):
+        known_distance = evidence.get("distance", "").split()
+        if (unit.casefold() not in ("mi", "mile", "miles") or len(known_distance) != 2
+                or float(number) != float(known_distance[0])):
+            return False
     if "craving" in words or "matches" in words or "match" in words:
         return bool(evidence.get("cuisine_verified")
                     and "craving_match" in evidence.get("signals", []))
@@ -348,7 +396,10 @@ def check_output(
             raise RejectedOutput("health_term")
         if entry["id"] in never_visited and PAST_VISIT_TERMS.search(line):
             raise RejectedOutput("past_visit_claim")
-        if stars is not None and not star_claims_ok(line, stars.get(entry["id"])):
+        rating = stars.get(entry["id"]) if stars is not None else None
+        if evidence is not None and chain_reference(line, evidence[entry["id"]]):
+            rating = (evidence[entry["id"]].get("chain") or {}).get("stars_mean")
+        if stars is not None and not star_claims_ok(line, rating):
             raise RejectedOutput("rating_claim")
         if evidence is not None and not grounded_reason(line, evidence[entry["id"]]):
             raise RejectedOutput("unsupported_claim")
@@ -455,7 +506,8 @@ async def call(
     """
     settings = get_settings()
     cap = {"reasons": min(12.0, settings.MUSE_TIMEOUT_S),
-           "parse": min(10.0, settings.MUSE_PARSE_TIMEOUT_S),
+           "parse": min(14.0, settings.MUSE_PARSE_TIMEOUT_S,
+                        max(0.0, settings.MUSE_PARSE_DEADLINE_S - 3.0)),
            "takeaway": min(8.0, settings.MUSE_TAKEAWAY_TIMEOUT_S)}[call_type]
     timeout = max(0.0, min(cap, timeout_s)) if timeout_s is not None else max(0.0, cap)
     trace = CallTelemetry(call_type, timeout, body["max_completion_tokens"])
@@ -506,6 +558,20 @@ async def call(
     trace.status = response.status_code
     if response.status_code != 200:
         logger.warning("Muse returned status %s", response.status_code)
+        try:
+            error = response.json().get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+        except (ValueError, AttributeError):
+            code = None
+        if response.status_code == 402 or code in (
+            "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached",
+            "credits_exhausted",
+        ):
+            return failed("QuotaExhausted")
+        if response.status_code == 429:
+            return failed("RateLimit")
+        if response.status_code in (408, 504):
+            return failed("ProviderTimeout")
         return failed("HTTPStatus")
     try:
         data = response.json()

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING
 
+from app.chains import ChainResolver
 from app.cuisine_model import recency_weight
 from app.scoring_rules import FAMILIARITY_SCALE, STAR_FACTOR, STAR_UNKNOWN
 
@@ -62,11 +63,24 @@ def star_factor(stars_mean: float | None) -> float:
 
 
 def place_scores(history: History, as_of: date) -> dict[str, PlaceScore]:
+    """Exact-location model. Its definition is also the primary ML9 metric's model."""
+    return _scores(history, as_of, lambda meal: meal.place.id)
+
+
+def chain_scores(history: History, as_of: date, resolver: ChainResolver) -> dict[str, PlaceScore]:
+    """Same fixed formula, grouping each verified historical meal once by chain identity."""
+    return _scores(history, as_of, lambda meal: resolver.key(meal.place))
+
+
+def _scores(history: History, as_of: date, identity) -> dict[str, PlaceScore]:
     visits: dict[str, list[tuple[PastMeal, float]]] = {}
     for meal in history.meals:
         if is_visit(meal, as_of):
+            key = identity(meal)
+            if key is None:
+                continue
             w = recency_weight((as_of - meal.eaten_on).days)
-            visits.setdefault(meal.place.id, []).append((meal, w))
+            visits.setdefault(key, []).append((meal, w))
 
     scores: dict[str, PlaceScore] = {}
     for pid, items in visits.items():

@@ -13,6 +13,7 @@ from datetime import date
 import httpx2
 
 from app.categories import CATEGORY_IDS
+from app.chains import brand_text, wikidata_id
 from app.config import MissingSettingError, get_settings
 from app.scoring import History, PastMeal, QuizPrior, StoredPlace
 
@@ -24,7 +25,7 @@ MEALS_LIMIT = 1000
 MEALS_SELECT = (
     "source,category_id,eaten_on,meal_slot,is_weekend,dish,ate_at,price_level,went,stars,solo,"
     "distance_m,meal_companions(companion_id),"
-    "places(id,name,lat,lon,geoapify_categories,address,unresolved)"
+    "places(id,name,lat,lon,geoapify_categories,address,unresolved,brand,brand_wikidata)"
 )
 MEAL_SLOTS = frozenset({"breakfast", "lunch", "dinner", "late"})
 PRIOR_SELECT = "favorite_categories,hard_no_categories,budget_level,mostly_solo"
@@ -93,6 +94,8 @@ def parse_place(place: dict) -> StoredPlace | None:
         lon=float(lon),
         geoapify_categories=tuple(t for t in tags or [] if isinstance(t, str)),
         address=place.get("address") or None,
+        brand=brand_text(place.get("brand")),
+        brand_wikidata=wikidata_id(place.get("brand_wikidata")),
     )
 
 

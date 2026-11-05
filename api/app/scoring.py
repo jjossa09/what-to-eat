@@ -12,8 +12,9 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
 from app.categories import OTHER, map_category
+from app.chains import ChainResolver, chain_name, retained_identity
 from app.cuisine_model import CuisinePrediction, predict
-from app.place_model import PlaceScore, place_scores
+from app.place_model import PlaceScore, chain_scores, is_visit, place_scores
 from app.places import Candidate, distance_m, verified_cuisine
 from app.refine import radius_level
 from app.scoring_rules import (
@@ -58,6 +59,8 @@ class StoredPlace:
     lon: float
     geoapify_categories: tuple[str, ...]
     address: str | None
+    brand: str | None = None
+    brand_wikidata: str | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +159,8 @@ def merge_candidates(
             category=map_category(place.geoapify_categories, place.name),
             geoapify_categories=list(place.geoapify_categories),
             address=place.address,
+            brand=place.brand,
+            brand_wikidata=place.brand_wikidata,
         )
         merged_ids.add(place.id)
     candidates = sorted(by_id.values(), key=lambda c: (c.distance_m, c.id))
@@ -230,6 +235,11 @@ class Evidence:
     stars_mean: float | None  # the user's own recency-weighted mean stars; None = no ratings
     from_history: bool  # merged from Supabase, not in this Geoapify response
     reasons: tuple[str, ...]
+    chain_id: str | None = None
+    chain_name: str | None = None
+    chain_visits: int = 0
+    chain_stars_mean: float | None = None
+    chain_last_visit_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +272,8 @@ def score_candidate(
     merged_ids: frozenset[str],
     prediction: CuisinePrediction,
     usual: frozenset[str],
+    chain_id: str | None = None,
+    chain_history: PlaceScore | None = None,
 ) -> Scored:
     """usual is the model's usual categories (not the craving), for the usual_category signal."""
     reasons: list[str] = []
@@ -281,11 +293,14 @@ def score_candidate(
         reasons.append("category_unknown")
 
     visited = places.get(place.id)
-    ret = visited.return_score if visited else 0.0
+    familiarity = chain_history or visited
+    ret = familiarity.return_score if familiarity else 0.0
     if visited:
         reasons.append("visited_before")
+    if chain_history:
+        reasons.append("visited_chain")
 
-    known = visited.known_price_level if visited else None
+    known = familiarity.known_price_level if familiarity else None
     budget = context.budget_level or history.prior.budget_level
     p_fit = price_fit(known, budget)
     if known is None or budget is None:
@@ -329,6 +344,11 @@ def score_candidate(
         stars_mean=visited.stars_mean if visited else None,
         from_history=place.id in merged_ids,
         reasons=tuple(reasons),
+        chain_id=chain_id,
+        chain_name=chain_name(place) if chain_id else None,
+        chain_visits=chain_history.visits if chain_history else 0,
+        chain_stars_mean=chain_history.stars_mean if chain_history else None,
+        chain_last_visit_days=chain_history.last_visit_days if chain_history else None,
     )
     return Scored(place, score, evidence)
 
@@ -336,6 +356,18 @@ def score_candidate(
 def rank_key(s: Scored) -> tuple[float, int, str]:
     # Higher score, then nearer, then id: the same input always gives the same order.
     return (-s.score, s.place.distance_m, s.place.id)
+
+
+def one_per_chain(scored) -> tuple[Scored, ...]:
+    """Closest eligible branch, independently of score; then retain ranking order."""
+    closest: dict[str, Scored] = {}
+    for item in scored:
+        key = item.evidence.chain_id or f"place:{item.place.id}"
+        before = closest.get(key)
+        if before is None or (item.place.distance_m, item.place.id) < (
+                before.place.distance_m, before.place.id):
+            closest[key] = item
+    return tuple(sorted(closest.values(), key=rank_key))
 
 
 @dataclass(frozen=True)
@@ -370,6 +402,16 @@ def rank(
     familiar one. models: precomputed models_for(history, context), else computed here."""
     m = models or models_for(history, context)
     places, prediction, model_usual = m.places, m.prediction, m.usual
+    earlier_places = {meal.place.id: meal.place for meal in history.meals
+                      if is_visit(meal, context.local_date)}
+    candidates = list(candidates)
+    for index, candidate in enumerate(candidates):
+        if before := earlier_places.get(candidate.id):
+            brand, qid = retained_identity(candidate, before)
+            candidates[index] = replace(candidate, brand=brand, brand_wikidata=qid)
+    resolver = ChainResolver([*(c for c in candidates if c.id not in merged_ids),
+                              *earlier_places.values()])
+    chains = chain_scores(history, context.local_date, resolver)
     allowed = [
         c
         for c in candidates
@@ -377,15 +419,14 @@ def rank(
         and c.category not in context.exclude_categories
         and c.id not in context.exclude_ids
         and verified_cuisine(c.category, c.geoapify_categories, context.required_craving)
+        # A chain's shown branch must come from this bounded provider search. History
+        # contributes evidence, never a substitute branch the provider did not return.
+        and not (c.id in merged_ids and resolver.key(c))
     ]
-    ranked = tuple(
-        sorted(
-            (
-                score_candidate(c, history, context, places, merged_ids, prediction, model_usual)
-                for c in allowed
-            ),
-            key=rank_key,
-        )
+    ranked = one_per_chain(
+        score_candidate(c, history, context, places, merged_ids, prediction, model_usual,
+                        resolver.key(c), chains.get(resolver.key(c)))
+        for c in allowed
     )
     usual = frozenset({context.craving}) if context.craving else model_usual
     cold_start = not usual
@@ -401,6 +442,7 @@ def pick_top3(
     known category over Other. Cold start (no usual categories): the two best overall, then
     the best in a category the first two don't have.
     """
+    ranked = one_per_chain(ranked)
     chosen: list[Scored] = []
 
     def best(match) -> Scored | None:

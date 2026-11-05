@@ -46,8 +46,9 @@ import jwt
 
 from app import history as history_api
 from app.categories import map_category
+from app.chains import ChainResolver, brand_text, wikidata_id
 from app.cuisine_model import PREDICTABLE, counts, is_weekend, predict
-from app.place_model import is_visit, place_scores
+from app.place_model import chain_scores, is_visit, place_scores
 from app.scoring import Context, History, PastMeal, QuizPrior, StoredPlace, category_fit
 from app.scoring_rules import (
     FAMILIARITY_SCALE,
@@ -223,6 +224,64 @@ def evaluate_places(history: History, prior: QuizPrior) -> PlaceResult:
     return result
 
 
+@dataclass
+class ChainResult:
+    all: Hits
+    repeat: Hits
+    new_chain: int = 0
+    hard_no_misses: int = 0
+    chain_meals: int = 0  # counted visits including those without a replayable meal slot
+    no_identity: int = 0  # resolved targets excluded from this secondary denominator
+    identity_sources: Counter = field(default_factory=Counter)
+    ambiguous_aliases: set[str] = field(default_factory=set, repr=False)
+
+
+def evaluate_chains(history: History, prior: QuizPrior) -> ChainResult:
+    """Secondary chain-only top-k replay. The exact-place replay above is unchanged.
+
+    Only earlier-day identities establish aliases and candidates. Each chain uses the
+    same return formula over its earlier visits and its best allowed historical category
+    fit. This replay has no current location, so it never chooses a geographical branch.
+    """
+    h = History(prior=prior, meals=history.meals)
+    plain = ChainResolver()
+    result = ChainResult(Hits(), Hits(), chain_meals=sum(
+        bool(plain.key(m.place)) for m in history.meals if is_visit(m, EVER)))
+    for meal in place_targets(history.meals):
+        as_of = meal.eaten_on
+        earlier = [m for m in history.meals if is_visit(m, as_of)]
+        resolver = ChainResolver(m.place for m in earlier)
+        actual = resolver.key(meal.place)
+        if actual is None:
+            result.no_identity += 1
+            continue
+        source = ("wikidata" if wikidata_id(meal.place.brand_wikidata) else
+                  "brand" if brand_text(meal.place.brand) else "approved_name")
+        result.identity_sources[source] += 1
+        result.ambiguous_aliases.update(alias for alias, ids in resolver.wikidata_by_alias.items()
+                                        if len(ids) > 1)
+        returns = chain_scores(h, as_of, resolver)
+        prediction = predict(h, context_of(meal), as_of)
+        visits = Counter(key for m in earlier if (key := resolver.key(m.place)))
+        scores: dict[str, float] = {}
+        for past in earlier:
+            key = resolver.key(past.place)
+            cat = place_category(past.place)
+            if key is None or cat in prior.hard_nos:
+                continue
+            score = (W_CAT * category_fit(cat, prediction)[0]
+                     + W_RET * returns[key].return_score) / (W_CAT + W_RET)
+            scores[key] = max(scores.get(key, -math.inf), score)
+        model = top(scores)
+        frequent = top({key: visits[key] for key in scores})
+        new = actual not in visits
+        result.new_chain += new
+        result.hard_no_misses += not new and actual not in scores
+        for hits in (result.all,) if new else (result.all, result.repeat):
+            hits.add(actual, model, frequent, len(scores), actual in scores)
+    return result
+
+
 @dataclass(frozen=True)
 class Run:
     title: str
@@ -230,11 +289,12 @@ class Run:
     prior: QuizPrior
     cuisine: CuisineResult
     places: PlaceResult
+    chains: ChainResult | None = None
 
 
 def evaluate(history: History, prior: QuizPrior, title: str, note: str) -> Run:
     return Run(title, note, prior, evaluate_cuisine(history, prior),
-               evaluate_places(history, prior))
+               evaluate_places(history, prior), evaluate_chains(history, prior))
 
 
 # Statistics ------------------------------------------------------------------
@@ -325,6 +385,25 @@ def render_run(run: Run) -> list[str]:
         *rate_table(p.repeat),
         "",
     ]
+    if run.chains is not None:
+        chains = run.chains
+        lines += [
+            "### Chain-level place (secondary)", "",
+            f"n = {chains.all.n} meals at identified chains with known meal slots. "
+            f"Resolved-place targets without chain identity: {chains.no_identity} (excluded). "
+            "Historical meals at identified chains, including unknown slots: "
+            f"{chains.chain_meals}.",
+            "",
+            *rate_table(chains.all), "",
+            f"Repeat-chain visits only (n = {chains.repeat.n}):", "",
+            *rate_table(chains.repeat), "",
+            f"New-chain visits (misses): {chains.new_chain}. "
+            f"Repeat-chain hard-no misses: {chains.hard_no_misses}.", "",
+            "Identity coverage in the secondary denominator: "
+            + ", ".join(f"{source} {chains.identity_sources[source]}"
+                        for source in ("wikidata", "brand", "approved_name")) + ". "
+            f"Conflicting earlier brand aliases: {len(chains.ambiguous_aliases)}.", "",
+        ]
     return lines
 
 
@@ -419,6 +498,16 @@ def render_report(history: History, runs: list[Run], source: str, generated: dat
     lines += [
         "## Limitations",
         "",
+        "- Chain-level results are secondary and use only identified-chain targets, so their "
+        "denominator differs from exact-place results. The primary exact-place metric and "
+        "its baselines retain their existing definition.",
+        "- The secondary pool contains unique identified chains seen on earlier days. A hit "
+        "may be at a new branch of a known chain. Scores use aggregate chain return evidence "
+        "and the best allowed historical branch category fit, with the same fixed weights. "
+        "Its most-frequent and analytic-random baselines use that same allowed chain pool.",
+        "- Missing brand evidence is unknown. Only approved chain names provide a name "
+        "fallback; arbitrary equal business names never establish a chain. Aliases require "
+        "unique earlier provider evidence, and conflicting Wikidata identities stay separate.",
         "- Small n: intervals are wide; differences inside overlapping intervals are not "
         "evidence of a real difference.",
         "- One user. Nothing here generalizes to other people.",
@@ -438,7 +527,8 @@ def render_report(history: History, runs: list[Run], source: str, generated: dat
 
 def stored_place(r: Resolved) -> StoredPlace:
     return StoredPlace(id=r.id, name=r.name, lat=r.lat, lon=r.lon,
-                       geoapify_categories=r.geoapify_categories, address=r.address)
+                       geoapify_categories=r.geoapify_categories, address=r.address,
+                       brand=r.brand, brand_wikidata=r.brand_wikidata)
 
 
 def load_csv(csv_path: Path, resolutions_path: Path) -> History:

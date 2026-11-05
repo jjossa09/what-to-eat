@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Linking, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Linking, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
-import { SLOTS, type Intent, type Person, type Slot } from '../lib/companion';
+import { calendarDate, calendarDays, displayMealDate, localMealDate, SLOTS, validMealDate,
+  type Intent, type Person, type Slot } from '../lib/companion';
 import type { HistoryResult, MealDraft, NearbyResult, Pending, ProfileDraft } from '../lib/companionActions';
 import { mapInsights } from '../lib/insights';
 import { directionsUrl } from '../lib/places';
@@ -42,6 +43,60 @@ export function PreferenceFields({ value, onChange, categories, disabled = false
   </View>;
 }
 
+/** Native controls and local calendar arithmetic; no dependency, network or date guessing. */
+export function MealDatePicker({ value, onChange, disabled = false, now = new Date() }: {
+  value: string; onChange: (iso: string) => void; disabled?: boolean; now?: Date;
+}) {
+  const [open, setOpen] = useState(false);
+  const [month, setMonth] = useState(() => validMealDate(value, now) ? localMealDate(value)! : new Date(now));
+  const today = calendarDate(now);
+  const yesterday = new Date(now); yesterday.setDate(yesterday.getDate() - 1);
+  const days = calendarDays(month);
+  function choose(iso: string) {
+    if (disabled || !validMealDate(iso, now)) return;
+    onChange(iso); setOpen(false);
+  }
+  function move(delta: number) {
+    const next = new Date(month); next.setDate(1); next.setMonth(next.getMonth() + delta);
+    if (disabled || next.getFullYear() < 1 || calendarDate(next) > today) return;
+    setMonth(next);
+  }
+  return <View style={styles.body}>
+    <Text style={styles.note}>{displayMealDate(value)}</Text>
+    <View style={styles.chips}>
+      <Chip label="Today" disabled={disabled} selected={value === today} onPress={() => choose(today)} />
+      <Chip label="Yesterday" disabled={disabled} selected={value === calendarDate(yesterday)}
+        onPress={() => choose(calendarDate(yesterday))} />
+      <Chip label={open ? 'Close calendar' : 'Choose date'} disabled={disabled} onPress={() => {
+        setMonth(validMealDate(value, now) ? localMealDate(value)! : new Date(now)); setOpen(!open);
+      }} />
+    </View>
+    {open && <View style={styles.body}>
+      <View style={styles.calendarHeader}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Previous month" disabled={disabled}
+          onPress={() => move(-1)} style={styles.calendarArrow}><Text style={styles.label}>‹</Text></Pressable>
+        <Text style={styles.label}>{month.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel="Next month"
+          accessibilityState={{ disabled: disabled || month.getFullYear() === now.getFullYear() && month.getMonth() >= now.getMonth() }}
+          disabled={disabled || month.getFullYear() === now.getFullYear() && month.getMonth() >= now.getMonth()}
+          onPress={() => move(1)} style={styles.calendarArrow}><Text style={styles.label}>›</Text></Pressable>
+      </View>
+      <View style={styles.calendarRow}>{['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((day, i) =>
+        <View key={i} style={styles.calendarDay}><Text style={styles.note}>{day}</Text></View>)}</View>
+      {Array.from({ length: 6 }, (_, week) => <View key={week} style={styles.calendarRow}>
+        {days.slice(week * 7, week * 7 + 7).map((iso, i) => iso === null
+          ? <View key={`empty-${i}`} style={styles.calendarDay} />
+          : <Pressable key={iso} accessibilityRole="button" accessibilityLabel={displayMealDate(iso)}
+            accessibilityState={{ selected: value === iso, disabled: disabled || iso > today }}
+            disabled={disabled || iso > today} onPress={() => choose(iso)}
+            style={[styles.calendarDay, value === iso && styles.calendarSelected, iso > today && styles.calendarDisabled]}>
+            <Text style={styles.note}>{Number(iso.slice(-2))}</Text>
+          </Pressable>)}
+      </View>)}
+    </View>}
+  </View>;
+}
+
 export function PendingCard({ pending, categories, people, onChange, onConfirm, onCancel,
   onWhere, busy, error, duplicate }: {
   pending: Pending; categories: readonly Category[]; people: readonly Person[];
@@ -56,7 +111,7 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
   const rating = pending.kind === 'rate_meal' ? pending.arguments as { meal_id: string; revision: number; changes: { stars: number | null } } : null;
   const setMeal = (changes: Partial<MealDraft>) => onChange({ ...pending, arguments: { ...meal!, ...changes } });
   const stars = meal?.stars ?? rating?.changes.stars ?? null;
-  const ready = meal ? !!meal.category_id && !!meal.timezone && /^\d{4}-\d{2}-\d{2}$/.test(meal.eaten_on)
+  const ready = meal ? !!meal.category_id && !!meal.timezone && validMealDate(meal.eaten_on)
     : preferences ? preferences.favorites.length >= 1 && preferences.favorites.length <= 5 : stars !== null;
   return <GlassCard><View style={styles.body}>
     <Text style={styles.label}>{meal ? 'Log this meal?' : preferences ? 'Change your taste profile?' : 'Save this rating?'}</Text>
@@ -64,7 +119,9 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
     {meal && <>
       <Text style={styles.note}>{meal.dish || categories.find((c) => c.id === meal.category_id)?.name || 'Food not set'}</Text>
       {!!meal.dish && <Text style={styles.note}>{categories.find((c) => c.id === meal.category_id)?.name ?? 'Food category not set'}</Text>}
-      <Text style={styles.note}>{meal.eaten_on || 'Date not set'} · {meal.meal_slot ?? 'Time not set'}</Text>
+      <Text style={styles.note}>{displayMealDate(meal.eaten_on)} · {meal.meal_slot ?? 'Time not set'}</Text>
+      {!editing && !meal.eaten_on && <MealDatePicker value={meal.eaten_on} disabled={busy}
+        onChange={(eaten_on) => onChange({ ...pending, dateHint: undefined, arguments: { ...meal, eaten_on } })} />}
       <Text style={styles.note}>{meal.place_id && pending.placeName ? pending.placeName : 'Without a restaurant'}</Text>
       {!!meal.companion_ids.length && <Text style={styles.note}>{people.filter((p) => meal.companion_ids.includes(p.id)).map((p) => p.name).join(', ')}</Text>}
       {meal.solo === true && <Text style={styles.note}>Solo</Text>}
@@ -79,9 +136,8 @@ export function PendingCard({ pending, categories, people, onChange, onConfirm, 
         disabled={busy} selected={meal.category_id === c.id} onPress={() => { setMeal({ category_id: c.id }); setShowFood(false); }} />)}</View>}
       <Text style={styles.label}>Date eaten</Text>
       {pending.dateHint && <Text style={styles.note}>{pending.dateHint}</Text>}
-      <TextInput accessibilityLabel="Date eaten" style={styles.input} placeholder="YYYY-MM-DD"
-        placeholderTextColor={colors.textSecondary} value={meal.eaten_on} editable={!busy}
-        onChangeText={(eaten_on) => setMeal({ eaten_on })} />
+      <MealDatePicker value={meal.eaten_on} disabled={busy}
+        onChange={(eaten_on) => onChange({ ...pending, dateHint: undefined, arguments: { ...meal, eaten_on } })} />
       <View style={styles.chips}>{[null, ...SLOTS].map((slot) => <Chip key={slot ?? 'unknown'} label={slot ?? 'Time not set'}
         disabled={busy} selected={meal.meal_slot === slot} onPress={() => setMeal({ meal_slot: slot })} />)}</View>
       <TextInput accessibilityLabel="Dish" style={styles.input} value={meal.dish} maxLength={60}
@@ -145,14 +201,14 @@ export function MealReferenceCard({ reference, categories, onFind, onCancel }: {
 }) {
   const [day, setDay] = useState('');
   const [category, setCategory] = useState(reference.category);
-  const needsDate = reference.reference === 'date' || reference.date?.kind === 'weekday';
+  const needsDate = reference.reference === 'date'
+    || reference.date?.kind === 'weekday' || reference.date?.kind === 'last_weekday';
   return <GlassCard><View style={styles.body}>
     <Text style={styles.label}>Which meal did you mean?</Text>
-    {needsDate && <TextInput accessibilityLabel="Meal reference date" value={day} style={styles.input}
-      placeholder="YYYY-MM-DD" placeholderTextColor={colors.textSecondary} onChangeText={setDay} />}
+    {needsDate && <MealDatePicker value={day} onChange={setDay} />}
     {reference.reference === 'food' && !reference.category && <View style={styles.chips}>{categories.map((c) =>
       <Chip key={c.id} label={c.name} selected={category === c.id} onPress={() => setCategory(c.id)} />)}</View>}
-    <PrimaryButton label="Find meal" disabled={needsDate && !/^\d{4}-\d{2}-\d{2}$/.test(day)
+    <PrimaryButton label="Find meal" disabled={needsDate && !validMealDate(day)
       || reference.reference === 'food' && !category} onPress={() => onFind({ ...reference, category,
         date: needsDate ? { kind: 'iso', value: day } : reference.date })} />
     <SecondaryButton label="Cancel" onPress={onCancel} />
@@ -164,7 +220,7 @@ export function HistoryCard({ data, categories, people }: { data: HistoryResult;
   const [slot, setSlot] = useState<Slot>('lunch');
   const props = { data: mapped.cards[data.chart_id] };
   return <OpeningMotion cards={mapped.cards} selectedSlot={slot}><GlassCard><View style={styles.body}>
-    <Text style={styles.note}>{data.from_date} to {data.to_date}</Text>
+    <Text style={styles.note}>{displayMealDate(data.from_date)} to {displayMealDate(data.to_date)}</Text>
     <Text style={styles.label}>{data.line}</Text>
     {(data.note || mapped.note) && <Text style={styles.note}>{data.note ?? mapped.note}</Text>}
     {data.chart_id === 'top' && <TopCategoriesChart {...props} />}
@@ -176,6 +232,12 @@ export function HistoryCard({ data, categories, people }: { data: HistoryResult;
 }
 
 const styles = StyleSheet.create({
+  calendarHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  calendarArrow: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  calendarRow: { flexDirection: 'row' },
+  calendarDay: { flex: 1, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  calendarSelected: { backgroundColor: colors.glassStrong, borderColor: colors.accent, borderWidth: 1 },
+  calendarDisabled: { opacity: 0.35 },
   body: { gap: spacing.md }, chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   label: { color: colors.text, fontSize: type.body, fontWeight: '600' },
   note: { color: colors.textSecondary, fontSize: type.small }, error: { color: colors.error, fontSize: type.small },

@@ -32,8 +32,9 @@ import {
 } from '../lib/api';
 import { getPosition, type LocationResult, type Position } from '../lib/location';
 import { haptic } from '../lib/haptics';
-import { changedLine, dispatch, emptySurvey, invalidFieldLine, limitationLines, parseFailureLine, privateMessage, resolveDate, validInterpretation,
-  type Intent, type Patch, type Survey, type SurveyKey } from '../lib/companion';
+import { changedLine, dispatch, displayMealDate, emptySurvey, invalidFieldLine, limitationLines, OTIS_INTRO, parseFailureLine, privateMessage,
+  recentContext, recommendationLine, resolveDate, searchRequirements, validInterpretation,
+  type ContextLine, type Intent, type Patch, type Survey, type SurveyKey } from '../lib/companion';
 import { changePreference, draftMeal, enrichMeal, lookupFailureLine, missingMealLine, nearby, persistPending, type HistoryResult,
   type MealRecord, type Output, type Pending, type Profile } from '../lib/companionActions';
 import { withInsightsDeadline } from '../lib/insights';
@@ -75,6 +76,7 @@ type Round = {
   envelope?: ReasonsEnvelope | null;
   generation: number;
   lifecycle: ReasonsObserver;
+  hidden: boolean; // obsolete requirements; retain mounted saves, hide their cards
   final: boolean; // the cap round: None of these ends the session
 };
 type Answers = { craving: string | null; budget: number | null; radius: Radius | null; exclude: string[] };
@@ -200,11 +202,15 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   const nextIsOpen = useRef(false); // the next follow-up answers "What would make it right?"
   const noneOfThese = useRef(false); // sent with the next round: its rejected reason
   const busy = useRef(false); // one answer at a time (a chip tap during a parse is ignored)
+  const roundInFlight = useRef(false); // nested parse/plan work already owns busy
+  const lastRoundError = useRef<{ id: number; text: string } | null>(null);
   const location = useRef<Promise<LocationResult> | null>(null);
   const nextId = useRef(0);
   const scroll = useRef<ScrollViewInstance>(null);
   const survey = useRef<Survey>(emptySurvey());
   const conversation = useRef<string | null>(null);
+  const recentConversation = useRef<ContextLine[]>([]);
+  const requirementsChanged = useRef(false);
   const actionTurn = useRef(0);
   const [pending, setPending] = useState<Pending | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
@@ -234,6 +240,11 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   type SurveyPlan = { state: Survey; next_key: SurveyKey | null; ready: boolean; conversation_id: string };
 
   function syncSurvey(state: Survey) {
+    if (searchRequirements(survey.current) !== searchRequirements(state)) {
+      requirementsChanged.current = true;
+      reasonsCache.invalidate();
+      setRounds((previous) => previous.map((round) => ({ ...round, hidden: true, envelope: null })));
+    }
     survey.current = state;
     answers.current = {
       craving: typeof state.craving.value === 'string' ? state.craving.value : null,
@@ -307,7 +318,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   function selectFeedback(meal: MealRecord) {
     setChoices([]);
     setPending({ key: `turn:${actionTurn.current}`, kind: 'rate_meal',
-      placeName: `${meal.eaten_on} · ${meal.meal_slot ?? 'Time not set'}`,
+      placeName: `${displayMealDate(meal.eaten_on)} · ${meal.meal_slot ?? 'Time not set'}`,
       arguments: { meal_id: meal.id, revision: meal.revision, changes: { stars: ratingStars.current } } });
     if (meal.stars !== null) say('assistant', 'This will update your existing rating.');
   }
@@ -319,13 +330,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     return nearby(name_, here.position, answers.current.radius);
   }
 
-  async function handleAction(intent: Intent) {
+  async function handleAction(intent: Intent, invalidMealDate = false) {
     actionTurn.current++;
     setActionError(null); setDuplicate(false);
     if (intent.type === 'log_meal') {
-      const draft: Pending = pending?.kind === 'log_meal' ? enrichMeal(pending, intent, companions) : { key: `turn:${actionTurn.current}`, kind: 'log_meal',
+      const draft: Pending = pending?.kind === 'log_meal' ? enrichMeal(pending, intent, companions, invalidMealDate) : { key: `turn:${actionTurn.current}`, kind: 'log_meal',
         arguments: draftMeal(intent, companions),
-        ...(intent.date?.kind === 'weekday' ? { dateHint: `Which ${intent.date.value}? Enter the date.` } : {}) };
+        ...(intent.date?.kind === 'weekday' ? { dateHint: `Which ${intent.date.value}? Choose a date.` } : {}) };
       setPending(draft);
       const missing = missingMealLine(draft.arguments as import('../lib/companionActions').MealDraft);
       if (missing) say('assistant', missing);
@@ -425,17 +436,24 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       }
       const response: unknown = await companionCall('/conversation/parse', {
         ...privateMessage(text, companions), asked: isFirst(step) ? step : null,
+        local_time: localTimeIso(), timezone: deviceTimezone(),
+        recent_context: recentContext(recentConversation.current.slice(0, -1), companions),
+        active_craving: survey.current.craving.status === 'confirmed'
+          ? answers.current.craving : null,
         pending_meal: pending?.kind === 'log_meal' });
       if (!mounted.current) return;
       if (!validInterpretation(response, new Set((categories ?? []).map((c) => c.id))) || !response.understood) {
-        say('assistant', parseFailureLine(response)); return;
+        say('assistant', parseFailureLine(response));
+        restoreCards(); return;
       }
       interpreted = true;
+      const selected = dispatch(response.intents);
       const invalid = Array.isArray(response.invalid_fields) ? response.invalid_fields : [];
       const clarification = invalidFieldLine(response.patch.unmatched?.includes('price_range')
         ? invalid.filter((key) => key !== 'budget') : invalid);
-      if (clarification) say('assistant', clarification);
-      const selected = dispatch(response.intents);
+      if (clarification && !(invalid.includes('meal_date') && selected.effect?.type === 'log_meal')) {
+        say('assistant', clarification);
+      }
       const p = response.patch;
       const supported = !!(p.craving || p.budget || p.distance || p.company || p.exclude?.length
         || p.allow?.length || p.budget_step || p.distance_step || p.something_else || selected.recommend);
@@ -461,13 +479,14 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       }
       if (!hasPatch && !selected.effect && !selected.reads.length) {
         if (selected.confirmation?.type === 'cancel') await continueSurvey();
-        else if (!selected.confirmation) say('assistant', 'Could you give me a little more detail?');
+        else if (!selected.confirmation) say('assistant', response.reply ?? 'Could you give me a little more detail?');
+        restoreCards();
         return;
       }
       if (selected.effect) {
         if (!continuesMeal) secondAction.current = response.intents.filter((i) => ['log_meal', 'rate_meal', 'preference_change'].includes(i.type))[1];
         if (secondAction.current) say('assistant', "Let's handle one action at a time.");
-        await handleAction(selected.effect);
+        await handleAction(selected.effect, invalid.includes('meal_date'));
       }
       for (const read of selected.reads) await handleAction(read);
       if (selected.effect || selected.reads.length) return;
@@ -507,7 +526,14 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     nextId.current += 1;
     const id = nextId.current;
     setBubbles((prev) => [...prev, { id, role, text, error }]);
+    recentConversation.current = [...recentConversation.current, { role, content: text }].slice(-7);
     return id;
+  }
+
+  function restoreCards() {
+    const generation = reasonsCache.current();
+    setRounds((previous) => previous.map((round, i) => !round.hidden && i === previous.length - 1
+      ? { ...round, generation, envelope: null } : round));
   }
 
   function ask(key: keyof typeof QUESTIONS) {
@@ -538,7 +564,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     loadStart(userId).then(([rows, quiz, people]) => {
       if (!live) return;
       setCategories(rows); setPrior(quiz); setCompanions(people ?? []); privacyReady.current = people !== null;
-      setBubbles([{ id: ++nextId.current, role: 'assistant', text: 'Hey! What are we eating today?' }]);
+      setBubbles([{ id: ++nextId.current, role: 'assistant', text: OTIS_INTRO }]);
+      recentConversation.current = [{ role: 'assistant', content: OTIS_INTRO }];
       setStep('welcome');
     }).catch(() => { if (live) { setProblem('load'); setStep('error'); } });
     return () => { live = false; };
@@ -612,11 +639,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     pendingChange.current = undefined; nextIsOpen.current = false; firstOfSearch.current = true;
     setNextQuestion(null); setRefining(false); noneOfThese.current = false;
     survey.current = emptySurvey(); conversation.current = null; companyAnswer.current = null;
+    recentConversation.current = []; requirementsChanged.current = false;
+    setRounds((previous) => previous.map((round) => ({ ...round, hidden: true, envelope: null })));
     answers.current = { craving: null, budget: null, radius: null, exclude: [] };
     setCompanyPick(null); setPreset({}); setShowAll(false); setDecided(false); setStep('welcome');
     setPending(null); setChoices([]); setReference(null); secondAction.current = undefined;
     setActionError(null); setDuplicate(false); setOffered(null);
-    say('assistant', 'Hey! What are we eating today?');
+    say('assistant', OTIS_INTRO);
   }
 
   function sendText(text: string) {
@@ -628,17 +657,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
   // Rounds ---------------------------------------------------------------------
 
   function roundLine(result: RoundResponse, first: boolean): string | null {
-    if (result.required_craving) {
-      const food = names.get(result.required_craving) ?? 'that cuisine';
-      if (!result.picks.length) return `No verified ${food} matches in this search.`;
-      if (result.picks.length < 3) return `Found ${result.picks.length} verified ${food} ${result.picks.length === 1 ? 'match' : 'matches'}.`;
-    }
-    if (result.best_so_far) return result.picks.length ? 'Best so far.' : null;
-    if (!result.picks.length) return 'No spots nearby.';
-    return first ? `Here are ${result.picks.length} spots.` : 'Here are a few more.';
+    return recommendationLine(result, first, names);
   }
 
-  async function fetchRound(change?: Partial<Change>, enhance = false) {
+  async function fetchRound(change?: Partial<Change>, enhance = false,
+    source: 'typed' | 'chip' | 'retry' = enhance ? 'typed' : 'chip') {
+    if (roundInFlight.current || !mounted.current) return;
+    roundInFlight.current = true;
     reasonsCache.invalidate();
     const operation = otis.begin();
     pendingChange.current = change;
@@ -646,15 +671,16 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
     busy.current = true;
     setProblem(null);
     setStep('loading');
-    const where = await (location.current ?? getPosition());
-    if (!where.ok) {
-      location.current = null; // the next try asks again
-      busy.current = false;
-      fail(where.reason === 'denied' ? 'denied' : 'nofix', operation);
-      return;
-    }
     try {
+      const where = await (location.current ?? getPosition());
+      if (!mounted.current) return;
+      if (!where.ok) {
+        location.current = null; // the next try asks again
+        fail(where.reason === 'denied' ? 'denied' : 'nofix', operation, undefined, true);
+        return;
+      }
       const result = await getRecommendations({
+        request_source: source,
         lat: where.position.lat,
         lon: where.position.lon,
         local_time: localTimeIso(),
@@ -676,10 +702,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
         exclude_ids: shownIds.current,
         transcript: transcript.current,
         survey: survey.current,
+        requirements_changed: requirementsChanged.current,
       });
+      if (!mounted.current) return;
       if (!result.logged && __DEV__) console.warn('Round not logged');
       transcript.current = [];
       pendingChange.current = undefined;
+      requirementsChanged.current = false;
       noneOfThese.current = false;
       const a = result.answers;
       answers.current = {
@@ -703,7 +732,8 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           result.picks.map((p) => p.id));
         setRounds((prev) => [
           ...prev,
-          { bubbleId: id, picks: result.picks, sessionId: result.session_id, round, final: result.best_so_far,
+          { bubbleId: id, picks: result.picks, sessionId: result.session_id, round,
+            final: result.best_so_far, hidden: false,
             // Deterministic chips keep template reasons and trigger zero Muse calls.
             // Typed recommendation rounds retain #82's optional signed enhancement.
             envelope: enhance ? result.reasons_envelope : null, generation, lifecycle },
@@ -722,23 +752,35 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
       setRefining(result.best_so_far || !result.picks.length);
       setStep('results');
     } catch (e) {
+      if (!mounted.current) return;
       const kind = e instanceof ApiError ? e.kind : 'network';
-      fail(kind === 'conflict' || kind === 'notfound' ? 'server' : kind, operation);
+      fail(kind === 'conflict' || kind === 'notfound' ? 'server' : kind, operation,
+        e instanceof ApiError && e.code === 'places_timeout' ? 'The restaurant search timed out on that attempt; please retry.'
+          : e instanceof ApiError && e.code === 'places_unavailable' ? 'Restaurant search is unavailable; please retry.' : undefined, true);
     } finally {
+      roundInFlight.current = false;
       busy.current = false;
     }
   }
 
   /** A failed step: the error line in the thread, the fix as chips below. */
-  function fail(kind: Problem, operation?: number) {
+  function fail(kind: Problem, operation?: number, line?: string, sameRoundError = false) {
     if (operation === undefined) otis.cancel();
     else otis.finish(operation);
-    say('assistant', PROBLEM_TEXT[kind], true);
+    const text = line ?? PROBLEM_TEXT[kind];
+    // A retry chip adds no dialogue. Keep its same visible failure instead of echoing it;
+    // a changed error or any intervening user message still gets its own response.
+    if (!sameRoundError || lastRoundError.current?.id !== nextId.current
+      || lastRoundError.current.text !== text) {
+      const id = say('assistant', text, true);
+      if (sameRoundError) lastRoundError.current = { id, text };
+    }
     setProblem(kind);
     setStep('error');
   }
 
   function retry() {
+    if (busy.current || roundInFlight.current || !mounted.current) return;
     if (problem === 'auth') {
       onSignOut();
     } else if (problem === 'load') {
@@ -749,11 +791,12 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
           setPrior(quiz);
           setCompanions(people ?? []); privacyReady.current = people !== null;
           setStep('welcome');
-          say('assistant', 'Hey! What are we eating today?');
+          recentConversation.current = [];
+          say('assistant', OTIS_INTRO);
         })
         .catch(() => fail('load'));
     } else {
-      fetchRound(pendingChange.current, pendingEnhancement.current);
+      void fetchRound(pendingChange.current, pendingEnhancement.current, 'retry');
     }
   }
 
@@ -920,12 +963,13 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                     reasonsCache={reasonsCache}
                     generation={r.generation}
                     lifecycle={r.lifecycle}
+                    hidden={r.hidden}
                     active={otisStatus.active}
                     userId={userId}
                     onDecisionStart={() => {
                       // Reject events from before a parse, new round or search reset,
                       // including the interval before the old cards rerender read-only.
-                      if (busy.current || b.id !== latest || sessionId.current !== r.sessionId
+                      if (busy.current || r.hidden || b.id !== latest || sessionId.current !== r.sessionId
                         || r.generation !== decisionGeneration || pending
                         || nextId.current !== conversationId || !reasonsCache.isCurrent(decisionGeneration)) return false;
                       reasonsCache.invalidate();
@@ -936,7 +980,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
                     user={user}
                     sessionId={r.sessionId}
                     round={r.round}
-                    readOnly={b.id !== latest || r.generation !== decisionGeneration || !!pending}
+                    readOnly={r.hidden || b.id !== latest || r.generation !== decisionGeneration || !!pending}
                     onSay={(text) => say('assistant', text)}
                     onPicked={() => remindAfterPick(userId)}
                     onDecided={() => setDecided(true)}
@@ -948,7 +992,7 @@ export default function Chat({ userId, onSignOut, bottom }: ChatProps) {
             );
           })}
           {!!choices.length && <View style={styles.chips}>{choices.map((meal) => <Chip key={meal.id}
-            label={`${meal.eaten_on} · ${meal.meal_slot ?? 'Time not set'} · ${meal.dish
+            label={`${displayMealDate(meal.eaten_on)} · ${meal.meal_slot ?? 'Time not set'} · ${meal.dish
               ?? (meal.source === 'backfill' || meal.ate_at ? names.get(meal.category_id ?? '') : null) ?? 'Meal'}`}
             onPress={() => { if (!busy.current) selectFeedback(meal); }} />)}<Chip label="Cancel" onPress={() => {
               if (busy.current) return;

@@ -1,6 +1,6 @@
 import type { InsightsResponse, Place } from './api';
 import { companionCall, deviceTimezone } from './api';
-import { companionIds, resolveDate, type ChartId, type Intent, type Person, type Slot } from './companion';
+import { companionIds, resolveDate, validMealDate, type ChartId, type Intent, type Person, type Slot } from './companion';
 
 export type Profile = { favorite_categories: string[]; hard_no_categories: string[];
   budget_level: number; mostly_solo: boolean; updated_at: string };
@@ -48,12 +48,12 @@ export function draftMeal(intent: Extract<Intent, { type: 'log_meal' }>, people:
     stars: intent.stars, allow_duplicate: false };
 }
 
-export function enrichMeal(pending: Pending, intent: Extract<Intent, { type: 'log_meal' }>, people: readonly Person[]): Pending {
+export function enrichMeal(pending: Pending, intent: Extract<Intent, { type: 'log_meal' }>, people: readonly Person[], invalidDate = false): Pending {
   const before = pending.arguments as MealDraft;
   const update = draftMeal(intent, people);
   const arguments_ = { ...before, allow_duplicate: false,
     ...(intent.category !== null ? { category_id: update.category_id } : {}),
-    ...(intent.date !== null ? { eaten_on: update.eaten_on } : {}),
+    ...(invalidDate ? { eaten_on: '' } : intent.date !== null ? { eaten_on: update.eaten_on } : {}),
     ...(intent.slot !== null ? { meal_slot: update.meal_slot } : {}),
     ...(intent.dish !== null ? { dish: update.dish } : {}),
     ...(intent.stars !== null ? { stars: update.stars } : {}),
@@ -69,6 +69,7 @@ export function enrichMeal(pending: Pending, intent: Extract<Intent, { type: 'lo
 export function missingMealLine(meal: MealDraft): string | null {
   if (!meal.category_id) return meal.dish ? 'Which food category was it?' : 'Sure! What did you eat?';
   if (!meal.eaten_on) return 'When did you eat it?';
+  if (!validMealDate(meal.eaten_on)) return 'Choose a valid date on or before today.';
   return null;
 }
 

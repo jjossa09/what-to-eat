@@ -9,12 +9,13 @@ import math
 import re
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx2
 
 from app.categories import map_category
 from app.category_rules import CUISINE_TAGS
+from app.chains import brand_text, retained_identity, wikidata_id
 from app.config import MissingSettingError, get_settings
 
 PLACES_URL = "https://api.geoapify.com/v2/places"
@@ -22,6 +23,21 @@ PLACES_URL = "https://api.geoapify.com/v2/places"
 LIMIT = 100
 # Includes pub, bar, biergarten, and taproom, which the ML2 mapper sends to Pubs/Bars.
 CATEGORIES = "catering"
+# The existing cuisine evidence table uses documented Places categories. Reuse it for
+# retrieval as well as validation, so the two cannot drift. No name-only equivalences.
+# https://apidocs.geoapify.com/docs/places/#categories
+CUISINE_CATEGORIES = {
+    cuisine: tuple(tag for tag, mapped in CUISINE_TAGS if mapped == cuisine)
+    for cuisine in dict(CUISINE_TAGS).values()
+}
+
+
+def search_categories(required_craving: str | None) -> str:
+    if required_craving is None:
+        return CATEGORIES
+    return ",".join(CUISINE_CATEGORIES.get(required_craving, ())) or CATEGORIES
+
+
 # 100 nearest places cover only ~2.5 km in a dense area, so wider chips would get the same
 # places as Walk. Above this radius, no proximity bias: the results come from the whole circle
 # (still one call, still sorted by distance here).
@@ -70,6 +86,7 @@ class Candidate:
     geoapify_categories: list[str]
     address: str | None
     brand: str | None = None
+    brand_wikidata: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,7 +137,11 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
         return None
     categories = [c for c in props.get("categories") or [] if isinstance(c, str)]
     name = name.strip()
-    brand = ((props.get("datasource") or {}).get("raw") or {}).get("brand")
+    raw = datasource.get("raw") or {}
+    details = props.get("brand_details")
+    details = details if isinstance(details, dict) else {}
+    brand = brand_text(raw.get("brand")) or brand_text(props.get("brand"))
+    brand_wikidata = wikidata_id(raw.get("brand:wikidata")) or wikidata_id(details.get("wikidata"))
     return Candidate(
         id=key,
         name=name,
@@ -130,21 +151,27 @@ def parse_feature(feature: dict, lat: float, lon: float) -> Candidate | None:
         category=map_category(categories, name),
         geoapify_categories=categories,
         address=props.get("formatted") or None,
-        brand=brand.strip() if isinstance(brand, str) and brand.strip() else None,
+        brand=brand,
+        brand_wikidata=brand_wikidata,
     )
 
 
 def deduplicate(candidates: Iterable[Candidate]) -> list[Candidate]:
     """Keep the first ID or co-located name, sorted by distance then ID."""
     unique: list[Candidate] = []
-    seen_keys: set[str] = set()
-    seen_spots: set[tuple[str, float, float]] = set()
+    by_id: dict[str, Candidate] = {}
     for place in candidates:
+        if previous := by_id.get(place.id):
+            brand, qid = retained_identity(previous, place)
+            by_id[place.id] = replace(previous, brand=brand, brand_wikidata=qid)
+        else:
+            by_id[place.id] = place
+    seen_spots: set[tuple[str, float, float]] = set()
+    for place in by_id.values():
         # Same OSM object twice, or the same name at the same spot (~1 m).
         spot = (place.name.lower(), round(place.lat, 5), round(place.lon, 5))
-        if place.id in seen_keys or spot in seen_spots:
+        if spot in seen_spots:
             continue
-        seen_keys.add(place.id)
         seen_spots.add(spot)
         unique.append(place)
     # Id breaks distance ties so the same results always come back in the same order.
@@ -159,6 +186,8 @@ async def search(
     *,
     bias: bool = False,
     name: str | None = None,
+    required_craving: str | None = None,
+    timeout_s: float | None = None,
     client: httpx2.AsyncClient,
 ) -> SearchResult:
     """Exactly one Geoapify Places call. Returns named places, nearest first, deduped."""
@@ -169,7 +198,7 @@ async def search(
         raise PlacesNotConfigured from None
     radius_m = radius_m or settings.PLACES_RADIUS_M
     params = {
-        "categories": CATEGORIES,
+        "categories": search_categories(required_craving),
         "filter": f"circle:{lon},{lat},{radius_m}",
         "limit": LIMIT,
         "apiKey": api_key,
@@ -183,7 +212,9 @@ async def search(
         params["bias"] = f"proximity:{lon},{lat}"
     # Exceptions are re-raised without their message or cause: both can include the URL.
     try:
-        response = await client.get(PLACES_URL, params=params, timeout=settings.PLACES_TIMEOUT_S)
+        response = await client.get(PLACES_URL, params=params,
+                                    timeout=settings.PLACES_TIMEOUT_S if timeout_s is None
+                                    else timeout_s)
     except httpx2.TimeoutException:
         raise PlacesTimeout from None
     except httpx2.HTTPError:

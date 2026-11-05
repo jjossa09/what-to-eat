@@ -80,6 +80,13 @@ _KEYWORDS = [
 ]
 
 
+def match_chain(name: str | None) -> tuple[str, str] | None:
+    """Approved chain name and category, using the established longest-prefix match."""
+    normalized = normalize(name or "")
+    return next(((original, slug) for chain, original, slug in _CHAINS
+                 if normalized == chain or normalized.startswith(chain + " ")), None)
+
+
 def match_category(categories: Iterable[str], name: str | None) -> CategoryMatch:
     """Maps a Geoapify place to exactly one ML2 category and says which rule decided it."""
     tags = set(categories)
@@ -95,9 +102,9 @@ def match_category(categories: Iterable[str], name: str | None) -> CategoryMatch
 
     # Pass 2: chains, then keywords, then generic tags.
     if normalized:
-        for chain, original, slug in _CHAINS:
-            if normalized == chain or normalized.startswith(chain + " "):
-                return CategoryMatch(slug, "chain", original)
+        chain = match_chain(name)
+        if chain:
+            return CategoryMatch(chain[1], "chain", chain[0])
         for slug, keyword, pattern in _KEYWORDS:
             if pattern.search(normalized):
                 return CategoryMatch(slug, "keyword", keyword)

@@ -15,6 +15,8 @@ const TIMEOUT_MS = 20_000;
 export const PLAN_TIMEOUT_MS = 5_000;
 export const INSIGHTS_TIMEOUT_MS = 5_000;
 export const TAKEAWAY_TIMEOUT_MS = 12_000;
+export const PARSE_TIMEOUT_MS = 20_000;
+export const RECOMMENDATIONS_TIMEOUT_MS = 28_000;
 
 export type TakeawayResponse = {
   source: 'muse' | 'template' | 'none'; line: string | null;
@@ -147,7 +149,9 @@ async function request<T>(
   if (response.status === 401) throw new ApiError('auth');
   if (response.status === 409) throw new ApiError('conflict');
   if (response.status === 404) throw new ApiError('notfound');
-  if (!response.ok) throw new ApiError('server');
+  if (!response.ok) throw new ApiError('server', path === '/recommendations'
+    ? response.status === 504 ? 'places_timeout'
+      : [502, 503].includes(response.status) ? 'places_unavailable' : undefined : undefined);
   try {
     return (await response.json()) as T;
   } catch {
@@ -221,6 +225,8 @@ export type RoundRequest = {
   budget_level: number | null;
   radius_m: 15000 | 35000 | null;
   survey?: import('./companion').Survey;
+  requirements_changed?: boolean;
+  request_source?: 'typed' | 'chip' | 'retry';
   exclude_categories: string[];
   /** A follow-up's change; the server applies it to the answers above. */
   refine?: Partial<Change>;
@@ -269,6 +275,9 @@ export type RoundAnswers = {
 
 export type RoundResponse = {
   required_craving?: string | null;
+  search_status?: 'complete' | 'incomplete' | 'timeout' | 'provider_error' | 'cached' | 'unsupported_category' | 'partial';
+  search_issue?: 'timeout' | 'provider_error' | 'incomplete' | null;
+  using_cached?: boolean;
   reasons_envelope?: ReasonsEnvelope | null;
   session_id: string | null;
   round: number | null;
@@ -318,11 +327,11 @@ export function getReasons(envelope: ReasonsEnvelope): Promise<ReasonsResponse> 
 }
 
 export function getRecommendations(body: RoundRequest): Promise<RoundResponse> {
-  return request<RoundResponse>('POST', '/recommendations', body);
+  return request<RoundResponse>('POST', '/recommendations', body, RECOMMENDATIONS_TIMEOUT_MS);
 }
 
 /** Companion actions include auth and body reading in one deadline, with no automatic retry. */
-export function companionCall<T>(path: string, body?: unknown): Promise<T> {
+export function companionCall<T>(path: string, body?: unknown, timeoutMs?: number): Promise<T> {
   return withInsightsDeadline(async (signal) => {
     if (!API_URL) throw new ApiError('server');
     const { data } = await supabase.auth.getSession();
@@ -343,7 +352,8 @@ export function companionCall<T>(path: string, body?: unknown): Promise<T> {
       throw new ApiError(response.status === 401 ? 'auth' : response.status === 409 ? 'conflict' : 'server', code);
     }
     return await response.json() as T;
-  }, 16_000);
+  }, Math.min(timeoutMs ?? (path === '/conversation/parse' ? PARSE_TIMEOUT_MS : 16_000),
+    path === '/conversation/parse' ? PARSE_TIMEOUT_MS : 16_000));
 }
 
 export type Place = {
