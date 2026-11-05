@@ -48,6 +48,8 @@ type Props = {
   onDecided?: () => void;
   /** An earlier round (P1-14): cards and Directions stay, the decision buttons hide. */
   readOnly?: boolean;
+  /** Obsolete requirements hide cards while an already-started save may still finish. */
+  hidden?: boolean;
   /** The cap round (best so far): None of these ends the session as none. */
   final?: boolean;
   /** Before the cap: None of these asks the chat for a refinement question instead. False
@@ -66,12 +68,13 @@ export default function ResultCards({
   onPicked,
   onDecided,
   readOnly = false,
+  hidden = false,
   final = false,
   onNoneOfThese,
 }: Props) {
   const [enhanced, setEnhanced] = useState<Record<string, string>>({});
   useEffect(() => {
-    if (envelope && sessionId && round !== null && !final && !readOnly
+    if (!hidden && envelope && sessionId && round !== null && !final && !readOnly
       && reasonsCache.isCurrent(generation)) {
       return reasonsCache.watch(`${userId}:${sessionId}:${round}`, picks.map((p) => p.id),
         generation, () => getReasons(envelope), (result) => {
@@ -81,20 +84,20 @@ export default function ResultCards({
             : Object.fromEntries(result.reasons.map((r) => [r.id, r.line])));
         }, () => lifecycle?.fallback());
     }
-    if (!readOnly && reasonsCache.isCurrent(generation)) lifecycle?.fallback();
-  }, [envelope, sessionId, round, final, readOnly, reasonsCache, generation, userId, picks, lifecycle]);
+    if (!hidden && !readOnly && reasonsCache.isCurrent(generation)) lifecycle?.fallback();
+  }, [hidden, envelope, sessionId, round, final, readOnly, reasonsCache, generation, userId, picks, lifecycle]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [decision, setDecision] = useState<Decision>('open');
   const [failed, setFailed] = useState<{ message: string; retry?: () => void } | null>(null);
   const interested = useRef(new Set<string>());
   const interaction = useRef({ mounted: true, active, busy: false, selected: null as string | null });
-  useEffect(() => { interaction.current.active = active && !readOnly; }, [active, readOnly]);
+  useEffect(() => { interaction.current.active = active && !readOnly && !hidden; }, [active, readOnly, hidden]);
   useEffect(() => {
     const current = interaction.current;
     current.mounted = true;
     return () => { current.mounted = false; };
   }, []);
-  const canRecord = !readOnly && sessionId !== null && round !== null;
+  const canRecord = !hidden && !readOnly && sessionId !== null && round !== null;
 
   function logInterest(placeId: string, kind: 'card' | 'directions') {
     if (sessionId === null || round === null) return;
@@ -185,6 +188,8 @@ export default function ResultCards({
   }
 
   const open = decision === 'open';
+
+  if (hidden) return null;
 
   return (
     <View style={styles.wrap}>

@@ -11,7 +11,7 @@ export type Patch = Partial<Record<SurveyKey, Update | null>> & {
   exclude?: string[]; allow?: string[]; budget_step?: 'cheaper' | 'pricier' | null;
   distance_step?: 'closer' | 'farther' | null; something_else?: boolean; unmatched?: string[];
 };
-export type DateToken = { kind: 'today' | 'yesterday' | 'weekday' | 'iso'; value: string | null };
+export type DateToken = { kind: 'today' | 'yesterday' | 'weekday' | 'last_weekday' | 'iso'; value: string | null };
 export type Slot = 'breakfast' | 'lunch' | 'dinner' | 'late';
 export type ChartId = 'top' | 'food' | 'price' | 'distance' | 'companions';
 export type HistoryRange = 'today' | 'yesterday' | 'this_week' | 'last_7_days' | 'last_30_days' | 'this_month';
@@ -25,9 +25,12 @@ export type Intent =
   | { type: 'history_query'; range: HistoryRange; chart_id: ChartId; slot: Slot | null }
   | { type: 'preference_change'; operation: 'add_favorite' | 'remove_favorite' | 'add_hard_no' | 'remove_hard_no'; category: string };
 export type Interpretation = { intents: Intent[]; patch: Patch; understood: boolean;
-  status?: 'ok' | 'partial' | 'unsupported' | 'ambiguous' | 'timeout' | 'truncated' | 'invalid_json' | 'invalid_fields' | 'unavailable';
+  reply?: string | null;
+  status?: 'ok' | 'partial' | 'unsupported' | 'ambiguous' | 'timeout' | 'truncated' | 'invalid_json' | 'invalid_fields' | 'unavailable' | 'rate_limited' | 'quota_exhausted' | 'daily_limit';
   invalid_fields?: string[] };
 export type Person = { id: string; name: string };
+export type ContextLine = { role: 'assistant' | 'user'; content: string };
+export const OTIS_INTRO = "Hey, I'm Otis! I'll help you find food that fits your taste. What sounds good?";
 export const SURVEY_KEYS: SurveyKey[] = ['craving', 'budget', 'distance', 'company'];
 export const CHARTS: ChartId[] = ['top', 'food', 'price', 'distance', 'companions'];
 export const SLOTS: Slot[] = ['breakfast', 'lunch', 'dinner', 'late'];
@@ -55,6 +58,47 @@ export function privateMessage(text: string, people: readonly Person[]) {
   return { text: safe, companion_refs: people.map((_, i) => `companion_${i + 1}`) };
 }
 
+/** Redact again at send time, including names added since an earlier turn. Never persist. */
+export function recentContext(lines: readonly ContextLine[], people: readonly Person[]): ContextLine[] {
+  return lines.slice(-6).map((line) => ({ role: line.role,
+    content: privateMessage(line.content, people).text.slice(0, 200) }));
+}
+
+/** Cache identity only. Eligibility and ranking remain server decisions. */
+export function searchRequirements(state: Survey): string {
+  return JSON.stringify([state.craving.value,
+    state.craving.status === 'confirmed' && ['typed', 'chip'].includes(state.craving.source ?? ''),
+    state.budget.value, state.distance.value, state.company.value, [...state.exclusions].sort()]);
+}
+
+export function recommendationLine(result: { required_craving?: string | null; best_so_far: boolean;
+  search_status?: string; search_issue?: string | null; using_cached?: boolean;
+  picks: readonly unknown[] }, first: boolean,
+  labels: ReadonlyMap<string, string>): string | null {
+  if (!result.picks.length) {
+    if (result.search_status === 'unsupported_category') return 'I can’t verify that food category from place data; try another?';
+    if (result.search_status === 'cached') return 'No earlier picks fit; try another cuisine?';
+    if (result.search_status === 'timeout') return 'The wider search timed out; retry or change cuisine.';
+    if (result.search_status === 'provider_error') return 'The wider search failed; retry or change cuisine.';
+    if (result.search_status === 'incomplete') return 'The search was incomplete; retry or change cuisine.';
+    if (result.required_craving) return `No verified ${labels.get(result.required_craving) ?? 'cuisine'} matches in this search. Try another cuisine?`;
+    return 'No spots matched this search; try a wider area.';
+  }
+  if (result.search_status === 'partial') {
+    const lead = result.using_cached ? 'Using eligible earlier picks' : `Found ${result.picks.length} eligible ${result.picks.length === 1 ? 'place' : 'places'}`;
+    const scope = result.using_cached ? 'current search' : 'wider search';
+    const issue = result.search_issue === 'timeout' ? `${scope} timed out`
+      : result.search_issue === 'provider_error' ? `${scope} was unavailable` : 'coverage is incomplete';
+    return `${lead}; ${issue}.`;
+  }
+  if (result.best_so_far) return 'Best so far.';
+  if (result.required_craving && result.picks.length < 3) {
+    const food = labels.get(result.required_craving) ?? 'cuisine';
+    return `Found ${result.picks.length} verified ${food} ${result.picks.length === 1 ? 'match' : 'matches'}.`;
+  }
+  return first ? `Here are ${result.picks.length} spots.` : 'Here are a few more.';
+}
+
 export function companionIds(refs: readonly string[], people: readonly Person[]): string[] | null {
   const ids = refs.map((ref) => /^companion_[1-9]\d*$/.test(ref)
     ? people[Number(ref.slice(10)) - 1]?.id : undefined);
@@ -62,11 +106,37 @@ export function companionIds(refs: readonly string[], people: readonly Person[])
 }
 
 export function calendarDate(now = new Date()): string {
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  return `${String(now.getFullYear()).padStart(4, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+export function localMealDate(iso: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return null;
+  const [year, month, day] = iso.split('-').map(Number);
+  const parsed = new Date(0);
+  parsed.setFullYear(year, month - 1, day); parsed.setHours(12, 0, 0, 0);
+  return year > 0 && calendarDate(parsed) === iso ? parsed : null;
+}
+export function validMealDate(iso: string, now = new Date()): boolean {
+  return localMealDate(iso) !== null && iso <= calendarDate(now);
+}
+export function displayMealDate(iso: string): string {
+  return localMealDate(iso)?.toLocaleDateString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+  }) ?? 'Date not set';
+}
+export function calendarDays(month: Date): (string | null)[] {
+  const first = new Date(month); first.setDate(1); first.setHours(12, 0, 0, 0);
+  const next = new Date(first); next.setMonth(next.getMonth() + 1);
+  const last = new Date(next); last.setDate(0);
+  const count = last.getDate();
+  return Array.from({ length: 42 }, (_, i) => {
+    const day = i - first.getDay() + 1;
+    if (day < 1 || day > count) return null;
+    const date = new Date(first); date.setDate(day); return calendarDate(date);
+  });
 }
 export function resolveDate(token: DateToken | null, now = new Date()): string | null {
-  if (!token || token.kind === 'weekday') return null;
-  if (token.kind === 'iso') return token.value;
+  if (!token || token.kind === 'weekday' || token.kind === 'last_weekday') return null;
+  if (token.kind === 'iso') return token.value && validMealDate(token.value, now) ? token.value : null;
   const day = new Date(now);
   if (token.kind === 'yesterday') day.setDate(day.getDate() - 1);
   return calendarDate(day);
@@ -97,12 +167,14 @@ export function changedLine(before: Survey, after: Survey, labels: ReadonlyMap<s
 export function validInterpretation(value: unknown, categories?: ReadonlySet<string>): value is Interpretation {
   if (!value || typeof value !== 'object') return false;
   const v = value as Interpretation;
+  if (v.reply != null && (typeof v.reply !== 'string' || !v.reply.trim()
+    || v.reply.length > 200 || /[\r\n]/.test(v.reply) || (v.reply.match(/\?/g) ?? []).length > 1)) return false;
   const allowed = new Set(['survey_patch', 'recommend_now', 'log_meal', 'rate_meal', 'find_place',
     'history_query', 'preference_change', 'confirm', 'cancel', 'unknown']);
   const category = (x: unknown) => typeof x === 'string' && (!categories || categories.has(x));
   const nullableText = (x: unknown, max: number) => x === null || typeof x === 'string' && x.length <= max;
   const date = (x: unknown) => x === null || !!x && typeof x === 'object'
-    && ['today', 'yesterday', 'weekday', 'iso'].includes((x as DateToken).kind)
+    && ['today', 'yesterday', 'weekday', 'last_weekday', 'iso'].includes((x as DateToken).kind)
     && nullableText((x as DateToken).value, 10);
   const slot = (x: unknown) => x === null || SLOTS.includes(x as Slot);
   const stars = (x: unknown) => x === null || Number.isInteger(x) && Number(x) >= 1 && Number(x) <= 5;
@@ -151,11 +223,14 @@ export function validInterpretation(value: unknown, categories?: ReadonlySet<str
 
 export function parseFailureLine(response: unknown): string {
   const status = response && typeof response === 'object' ? (response as Interpretation).status : null;
+  if (status === 'rate_limited') return 'Chat is busy; wait a moment or use a chip.';
+  if (status === 'quota_exhausted') return 'Chat credits are unavailable; food chips still work.';
+  if (status === 'daily_limit') return 'Chat reached its daily limit; food chips still work.';
   if (status === 'timeout') return 'That took too long; try again or use a chip.';
   if (status === 'unavailable') return 'Chat parsing is unavailable; try a chip or retry.';
   if (status === 'truncated') return 'That response was cut short; try one request at a time.';
   if (status === 'invalid_json' || status === 'invalid_fields') return 'I couldn’t validate that; try a chip or rephrase.';
-  return 'Are you looking for food, or logging a meal?';
+  return 'What would you like help with: food picks, a meal, or your history?';
 }
 
 export function limitationLines(unmatched: readonly string[]): string[] {
@@ -170,6 +245,7 @@ export function limitationLines(unmatched: readonly string[]): string[] {
 }
 
 export function invalidFieldLine(fields: readonly string[]): string | null {
+  if (fields.includes('meal_company')) return 'Company is not set; select anyone who actually joined.';
   if (fields.includes('budget') || fields.includes('budget_step')) return 'Which budget level works: $ to $$$$?';
   if (fields.includes('distance') || fields.includes('distance_step')) return 'Stay close, or use a wider search?';
   if (fields.includes('craving') || fields.includes('meal_category')) return 'Which food category did you mean?';

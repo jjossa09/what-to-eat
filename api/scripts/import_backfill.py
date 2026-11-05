@@ -295,6 +295,8 @@ class Resolved:
     lon: float
     address: str | None
     geoapify_categories: tuple[str, ...]
+    brand: str | None = None
+    brand_wikidata: str | None = None
 
     @property
     def category_id(self) -> str:
@@ -302,7 +304,8 @@ class Resolved:
 
     @classmethod
     def from_candidate(cls, c: Candidate) -> Resolved:
-        return cls(c.id, c.name, c.lat, c.lon, c.address, tuple(c.geoapify_categories))
+        return cls(c.id, c.name, c.lat, c.lon, c.address, tuple(c.geoapify_categories),
+                   c.brand, c.brand_wikidata)
 
 
 @dataclass(frozen=True)
@@ -327,6 +330,8 @@ def resolution_to_json(r: Resolution) -> dict:
         "lon": r.lon,
         "address": r.address,
         "geoapify_categories": list(r.geoapify_categories),
+        **({"brand": r.brand} if r.brand is not None else {}),
+        **({"brand_wikidata": r.brand_wikidata} if r.brand_wikidata is not None else {}),
     }
 
 
@@ -347,7 +352,10 @@ def resolution_from_json(data) -> Resolution:
         raise ValueError("bad geoapify_categories")
     if address is not None and not isinstance(address, str):
         raise ValueError("bad address")
-    return Resolved(pid, data["name"], float(lat), float(lon), address, tuple(tags))
+    from app.chains import brand_text, wikidata_id
+
+    return Resolved(pid, data["name"], float(lat), float(lon), address, tuple(tags),
+                    brand_text(data.get("brand")), wikidata_id(data.get("brand_wikidata")))
 
 
 def load_resolutions(path: Path) -> dict[str, Resolution]:
@@ -582,6 +590,8 @@ def place_payload(r: Resolution) -> dict:
         "address": r.address,
         "geoapify_categories": list(r.geoapify_categories),
         "category_id": r.category_id,
+        **({"brand": r.brand} if r.brand is not None else {}),
+        **({"brand_wikidata": r.brand_wikidata} if r.brand_wikidata is not None else {}),
     }
 
 

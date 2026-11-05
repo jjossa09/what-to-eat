@@ -18,12 +18,13 @@ from typing import Literal
 import httpx2
 
 from app import muse
+from app.config import get_settings
 from app.refine import ANYTHING, CRAVINGS, Change
 
 QuestionKey = Literal["craving", "budget", "distance", "refine", "open"]
 FIRST_QUESTIONS = ("craving", "budget", "distance")  # the 3 questions before round 1
 MAX_TEXT = 200
-MAX_COMPLETION_TOKENS = 1000  # a ceiling that includes reasoning tokens
+MAX_COMPLETION_TOKENS = 1000  # smaller legacy answer schema; includes reasoning tokens
 
 OK, NOT_SURE, CHAT = "ok", "not_sure", "chat"
 NONE = "none"  # Muse's "not mentioned" for an enum field
@@ -162,7 +163,7 @@ def request_body(question_key: str, text: str) -> dict:
         ],
         "response_format": RESPONSE_FORMAT,
         "reasoning_effort": muse.REASONING_EFFORT,
-        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        "max_completion_tokens": min(MAX_COMPLETION_TOKENS, get_settings().MUSE_PARSE_MAX_TOKENS),
         "temperature": 0,
     }
 
@@ -250,7 +251,8 @@ def check_parse(content, question_key: str, finish_reason: str | None = None) ->
 
 async def parse(question_key: str, text: str, *, client: httpx2.AsyncClient) -> Parsed:
     """One Muse call. Any failure or unclear answer is not sure, never an error."""
-    reply = await muse.call(request_body(question_key, text), client=client, call_type="parse")
+    reply = await muse.call(request_body(question_key, text), client=client, call_type="parse",
+                            timeout_s=10.0)
     if reply is None:
         return Parsed(NOT_SURE, None, NONE)
     try:

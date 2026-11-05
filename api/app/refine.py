@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.categories import CATEGORY_IDS, OTHER
+from app.chains import ChainResolver
 from app.places import distance_m
 
 if TYPE_CHECKING:
@@ -111,11 +112,13 @@ def step_radius(radius: int | None, delta: int, default: int) -> int:
     return RADII[max(0, min(len(RADII) - 1, i))]
 
 
-def apply(change: Change, current: Answers, default_radius: int) -> Applied:
+def apply(change: Change, current: Answers, default_radius: int, *,
+          preserve_craving: bool = False) -> Applied:
     """Order: something else (on the current craving), then a named craving, then excludes.
 
     Something else with no craving ("anything") keeps the settings: the shown places are
-    skipped anyway, so the next round is new places with the same answers.
+    skipped anyway, so the next round is new places with the same answers. Callers with
+    an explicit craving preserve it; only a soft prediction may be excluded implicitly.
     """
     craving = current.craving
     excludes = list(current.exclude_categories)
@@ -124,7 +127,7 @@ def apply(change: Change, current: Answers, default_radius: int) -> Applied:
 
     if change.something_else:
         tags.append("something_else")
-        if craving is not None:
+        if craving is not None and not preserve_craving:
             excludes.append(craving)
             craving = None
     if change.craving == ANYTHING:
@@ -200,5 +203,11 @@ def best_so_far(
         if price is not None and budget_level is not None and price > budget_level:
             continue
         fits.append((card, meters))
-    fits.sort(key=lambda f: (-f[0].score, f[1], f[0].place_id))
-    return fits[:3]
+    resolver = ChainResolver(card for card, _ in fits)
+    closest = {}
+    for card, meters in fits:
+        key = resolver.key(card) or f"place:{card.place_id}"
+        previous = closest.get(key)
+        if previous is None or (meters, card.place_id) < (previous[1], previous[0].place_id):
+            closest[key] = (card, meters)
+    return sorted(closest.values(), key=lambda f: (-f[0].score, f[1], f[0].place_id))[:3]
